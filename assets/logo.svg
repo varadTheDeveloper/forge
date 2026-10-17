@@ -1,36 +1,44 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <title>Forge</title>
-  <!-- ground shadow -->
-  <ellipse cx="262" cy="446" rx="170" ry="18" fill="#000" opacity="0.12"/>
+  <defs>
+    <radialGradient id="body" cx="0.5" cy="0.68" r="0.62">
+      <stop offset="0" stop-color="#FFD37A"/>
+      <stop offset="0.45" stop-color="#FF9A3A"/>
+      <stop offset="1" stop-color="#F0501C"/>
+    </radialGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FF8A2B" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FF8A2B" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="wide" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="22"/></filter>
+    <filter id="blur"><feGaussianBlur stdDeviation="5"/></filter>
+    <path id="shape" d="M256 452 C164 452 102 392 102 312 C102 250 136 212 166 184 C180 170 184 154 182 138 C181 126 192 120 200 128 C212 142 218 162 228 168 C236 150 238 118 250 94 C258 76 264 64 272 58 C280 52 288 58 288 68 C290 102 306 128 322 144 C330 130 336 118 346 110 C354 104 364 108 362 118 C358 146 368 168 382 188 C402 218 410 260 410 312 C410 392 348 452 256 452 Z"/>
+    <clipPath id="clip"><use href="#shape"/></clipPath>
+  </defs>
 
-  <!-- flame tuft -->
-  <g stroke="#1E2029" stroke-width="12" stroke-linejoin="round">
-    <path d="M296 176 C232 170 222 118 252 84 C258 108 270 112 276 104 C270 72 288 44 318 30 C312 62 346 78 348 116 C352 150 334 174 296 176 Z" fill="#FF7A1A"/>
+  <circle cx="256" cy="290" r="230" fill="url(#halo)"/>
+  <use href="#shape" fill="url(#body)"/>
+  <g clip-path="url(#clip)">
+    <!-- soft bottom shade -->
+    <ellipse cx="256" cy="500" rx="230" ry="90" fill="#C2380F" opacity="0.4" filter="url(#wide)"/>
+    <!-- glossy highlight -->
+    <path d="M146 262 C150 220 176 196 200 186 C210 182 216 192 208 200 C188 218 174 240 168 268 C164 284 144 280 146 262 Z" fill="url(#shine)"/>
   </g>
-  <path d="M298 164 C268 160 262 136 276 118 C282 130 290 130 292 122 C292 104 302 92 316 86 C314 106 330 116 328 136 C328 154 316 164 298 164 Z" fill="#FFC53D"/>
-
-  <!-- anvil body -->
-  <path d="M168 168 H404 Q448 168 448 212 V242 Q448 286 404 286 H360 Q340 286 340 306 V320 Q340 334 356 338 L388 346 Q414 352 414 378 V390 Q414 418 386 418 H138 Q110 418 110 390 V378 Q110 352 136 346 L168 338 Q184 334 184 320 V306 Q184 286 164 286 H150 Q92 286 52 228 Q42 212 60 206 Q110 172 168 168 Z"
-        fill="#7C8AA8" stroke="#1E2029" stroke-width="12" stroke-linejoin="round"/>
-  <!-- top highlight -->
-  <path d="M170 184 H400 Q428 184 432 206 H84 Q118 186 170 184 Z" fill="#A9B6D1"/>
-  <!-- base highlight -->
-  <path d="M138 362 H386 Q398 364 400 376 H124 Q126 364 138 362 Z" fill="#A9B6D1" opacity="0.8"/>
 
   <!-- face -->
-  <ellipse cx="248" cy="246" rx="17" ry="20" fill="#1E2029"/>
-  <ellipse cx="348" cy="246" rx="17" ry="20" fill="#1E2029"/>
-  <circle cx="254" cy="238" r="6.5" fill="#fff"/>
-  <circle cx="354" cy="238" r="6.5" fill="#fff"/>
-  <circle cx="243" cy="254" r="3" fill="#fff"/>
-  <circle cx="343" cy="254" r="3" fill="#fff"/>
-  <ellipse cx="216" cy="270" rx="18" ry="9" fill="#FF8FA3" opacity="0.85"/>
-  <ellipse cx="380" cy="270" rx="18" ry="9" fill="#FF8FA3" opacity="0.85"/>
-  <path d="M284 262 Q298 278 312 262" fill="none" stroke="#1E2029" stroke-width="8" stroke-linecap="round"/>
-
-  <!-- sparks -->
-  <g fill="#FFC53D" stroke="#1E2029" stroke-width="5" stroke-linejoin="round">
-    <path d="M150 104 L158 124 L178 132 L158 140 L150 160 L142 140 L122 132 L142 124 Z"/>
-    <path d="M420 92 L425 106 L439 111 L425 116 L420 130 L415 116 L401 111 L415 106 Z"/>
+  <ellipse cx="212" cy="318" rx="17" ry="22" fill="#2B1610"/>
+  <ellipse cx="300" cy="318" rx="17" ry="22" fill="#2B1610"/>
+  <circle cx="218" cy="309" r="6.5" fill="#fff"/>
+  <circle cx="306" cy="309" r="6.5" fill="#fff"/>
+  <circle cx="207" cy="327" r="2.8" fill="#fff" opacity="0.9"/>
+  <circle cx="295" cy="327" r="2.8" fill="#fff" opacity="0.9"/>
+  <path d="M244 346 Q256 358 268 346" fill="none" stroke="#2B1610" stroke-width="6.5" stroke-linecap="round"/>
+  <g filter="url(#blur)" fill="#FF4F6A" opacity="0.5">
+    <ellipse cx="176" cy="350" rx="18" ry="10"/>
+    <ellipse cx="336" cy="350" rx="18" ry="10"/>
   </g>
 </svg>
