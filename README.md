@@ -54,22 +54,6 @@ forge.exe hello.js
 
 ---
 
-## Roadmap
-
-The next major milestones are:
-
-- Async Filesystem (`fs.readFile`, `fs.writeFile`)
-- Networking API
-- HTTP Server
-- Module System
-- Worker Threads
-- Performance optimization
-- Node.js compatibility
-- Linux support
-- macOS support
-
-See **ROADMAP.md** for the complete roadmap.
-
 ---
 
 ## License
