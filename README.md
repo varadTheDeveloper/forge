@@ -1,4 +1,8 @@
-# Forge
+<p align="center">
+  <img src="assets/logo.svg" alt="Forge mascot" width="200">
+</p>
+
+<h1 align="center">Forge</h1>
 
 Forge is an experimental JavaScript runtime built on Mozilla's SpiderMonkey engine.
 
