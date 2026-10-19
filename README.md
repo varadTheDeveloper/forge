@@ -8,52 +8,6 @@ Forge is an experimental JavaScript runtime built on Mozilla's SpiderMonkey engi
 
 The project focuses on building a modern JavaScript runtime from the ground up with a native, high-performance architecture instead of layering new APIs over existing runtimes.
 
-> **Status:** Early development
-
----
-
-## Current Progress
-
-### ✅ Completed
-
-- SpiderMonkey integration
-- Forge Core foundation
-  - Types
-  - Error
-  - Result / ResultVoid
-  - Assert
-  - Allocator
-  - UniquePtr
-  - Vector
-  - String
-  - StringView
-  - Span
-  - Array
-  - Queue
-  - Stack
-  - HashMap
-  - HashSet
-- Native Windows IOCP Event Loop
-- ThreadPool
-- Timers
-  - `setTimeout()`
-  - `setInterval()`
-  - `clearTimeout()`
-- Microtask queue
-  - `queueMicrotask()`
-- JavaScript Filesystem API
-  - `fs.readFileSync()`
-  - `fs.writeFileSync()`
-  - `fs.appendFileSync()`
-  - `fs.existsSync()`
-  - `fs.mkdirSync()`
-  - `fs.rmSync()`
-  - `fs.statSync()`
-- 29 runtime self-tests
-- Benchmark suite
-
----
-
 ## Current Platform
 
 - ✅ Windows x64
