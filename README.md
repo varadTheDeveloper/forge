@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Forge mascot" width="200">
+  <img src="assets/favicon.ico" alt="Forge mascot" width="200">
 </p>
 
 <h1 align="center">Forge</h1>
