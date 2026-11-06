@@ -18,9 +18,21 @@ Extended again after Phase 7.3 (the `fs.*Sync` JS bindings, now
 real-build-confirmed -- see Fs.md/HISTORY.md) with fs-bench.js, exercising
 readFileSync/writeFileSync/appendFileSync/existsSync/mkdirSync/rmSync/
 statSync -- the first script able to close the "filesystem operations"
-gap the note below used to flag as not-yet-benchmarkable. This one has
-not yet been run end-to-end either — please report back what it prints,
-same as the timer/microtask/promise-chain batch above.
+gap the note below used to flag as not-yet-benchmarkable.
+
+Extended again after Phase 7.5 (the Promise-returning `fs.*` JS bindings,
+now real-build-confirmed through 7.5.5 -- see FsAsync.md/HISTORY.md) with
+fs-async-bench.js, the async counterpart to fs-bench.js: same iteration
+counts and payload, chained through .then() one step at a time (see that
+script's own header comment for why concurrent calls over the same path
+would be a genuine race here, not just a style choice) rather than
+fs-bench.js's plain blocking for-loop. This is the first script in this
+suite whose entire body of work runs after the script itself finishes
+evaluating -- Runtime::run() has to actually drive it to completion --
+so it also exercises the same event-loop-lifetime path Phase 7.5.5's
+self-test harness isolates directly, as a byproduct rather than its main
+purpose. Has not yet been run end-to-end — please report back what it
+prints, same as every other script noted above.
 
 Usage:
     .\run-benchmarks.ps1
@@ -35,13 +47,15 @@ feeling.
 
 Note on scope: this script covers what's actually JS-visible in Forge
 today (print/setTimeout/setInterval/clearTimeout/queueMicrotask, the
-fs.*Sync surface added in Phase 7.3, plus whatever engine-native globals
-SpiderMonkey provides, like JSON and Promise). Forge Core's Socket/Thread
-(Phases 4-5) are still C++-only -- nothing in forge.cpp has wired them up
-as JS-callable functions yet -- so there is deliberately no networking or
-threading benchmark here; Node/Bun have net/worker_threads bindings to
-compare against, Forge doesn't yet have anything to point them at. (File
-was the exception: Phase 7.3 wired it up, so fs-bench.js now covers it.)
+fs.*Sync and Promise-returning fs.* surfaces added in Phase 7.3/7.5,
+plus whatever engine-native globals SpiderMonkey provides, like JSON and
+Promise). Forge Core's Socket/Thread (Phases 4-5) are still C++-only --
+nothing in forge.cpp has wired them up as JS-callable functions yet --
+so there is deliberately no networking or threading benchmark here;
+Node/Bun have net/worker_threads bindings to compare against, Forge
+doesn't yet have anything to point them at. (File was the exception:
+Phase 7.3 wired up the sync surface, Phase 7.5 the async one, so
+fs-bench.js/fs-async-bench.js now cover both.)
 #>
 
 param(
@@ -57,7 +71,8 @@ $Benchmarks = @(
     "timer-bench.js",
     "microtask-bench.js",
     "promise-chain-bench.js",
-    "fs-bench.js"
+    "fs-bench.js",
+    "fs-async-bench.js"
 )
 
 function Resolve-Runtime {
