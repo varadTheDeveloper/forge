@@ -545,6 +545,14 @@ Result<Vector<u8>> File::ReadAllBytes(
         totalRead += readResult.Value();
     }
 
+    // SizeInBytes() is only the initial size estimate. If the file reached
+    // EOF before filling the buffer, discard the zero-initialized tail so the
+    // returned Vector reflects the bytes actually read.
+    while (bytes.Size() > totalRead)
+    {
+        bytes.PopBack();
+    }
+
     return Result<Vector<u8>>(std::move(bytes));
 }
 

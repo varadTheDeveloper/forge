@@ -6,10 +6,12 @@
 // the Linux sandbox this was written in. Not part of the production
 // moz.build build.
 //
-// Build (example): cl /std:c++17 /EHs- /W4 ThreadingSmokeTest.cpp
-// Mutex.cpp ConditionVariable.cpp Thread.cpp ThreadPool.cpp
-// platform\Win32Error.cpp forge-core\memory\DefaultAllocator.cpp
-// forge-core\memory\detail\AllocationBackend.cpp
+// Build (run from this file's own directory, forge-core\, so the
+// unprefixed paths below resolve correctly):
+//   cl /std:c++17 /EHs- /W4 ThreadingSmokeTest.cpp
+//   Mutex.cpp ConditionVariable.cpp Thread.cpp ThreadPool.cpp
+//   platform\Win32Error.cpp memory\DefaultAllocator.cpp
+//   memory\detail\AllocationBackend.cpp
 
 #include "ConditionVariable.h"
 #include "LockGuard.h"
@@ -61,7 +63,7 @@ void RunMutexStressTest()
 
     for (int i = 0; i < kThreadCount; ++i)
     {
-        Result<Thread> spawned = Thread::Create([&mutex, &counter]() {
+        Result<Thread> spawned = Thread::Create([&mutex, &counter, kIterations]() {
             for (int j = 0; j < kIterations; ++j)
             {
                 LockGuard<Mutex> guard(mutex);

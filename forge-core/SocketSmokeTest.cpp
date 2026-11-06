@@ -10,10 +10,20 @@
 // moz.build build (matches every other *SmokeTest.cpp in this
 // codebase).
 //
-// Build (example): cl /std:c++17 /EHs- /W4 SocketSmokeTest.cpp
-// Socket.cpp IpAddress.inl Mutex.cpp ConditionVariable.cpp Thread.cpp
-// platform\Win32Error.cpp forge-core\memory\DefaultAllocator.cpp
-// forge-core\memory\detail\AllocationBackend.cpp /link ws2_32.lib
+// Build (run from this file's own directory, forge-core\, so the
+// unprefixed paths below resolve correctly):
+//   cl /std:c++17 /EHs- /W4 SocketSmokeTest.cpp
+//   Socket.cpp Mutex.cpp ConditionVariable.cpp Thread.cpp
+//   platform\Win32Error.cpp memory\DefaultAllocator.cpp
+//   memory\detail\AllocationBackend.cpp /link ws2_32.lib
+//
+// Note: IpAddress.inl is deliberately NOT listed as a source file here.
+// It's included by IpAddress.h (like every other *.inl in this codebase
+// — Path.inl, Queue.inl, etc.), not meant to be compiled as its own
+// translation unit; its member-function definitions reference IpAddress/
+// Endpoint, which are only declared once IpAddress.h has already been
+// processed. Passing it to cl directly would fail to compile with
+// undeclared-identifier errors, not silently double-include harmlessly.
 
 #include "IpAddress.h"
 #include "Socket.h"
@@ -33,6 +43,21 @@ namespace
 {
 
 int g_failures = 0;
+
+// File-scope, not a local inside RunSocketEchoTest, deliberately: the
+// server-thread lambda below uses this both as an array bound (which
+// must be a real compile-time constant expression) and as a Span byte
+// count. A local constexpr would need to be captured to be visible
+// inside the lambda, but capturing it makes every use inside the lambda
+// refer to the closure's own (non-constexpr) copy of the value instead
+// of the original constant — which breaks the array-bound use with a
+// real MSVC error (C2131, "expression did not evaluate to a constant";
+// see HISTORY.md). GCC/Clang don't even require the capture in the first
+// place for a read-only constexpr, which is why this was never caught
+// outside a real MSVC compile. File scope sidesteps the whole issue:
+// nothing here is a captured local, so it's a genuine constant
+// expression everywhere it's used, capture or no capture.
+constexpr Size kPayloadSize = 5;
 
 #define CHECK(cond)                                                          \
     do                                                                       \
@@ -97,7 +122,6 @@ void RunSocketEchoTest()
                                   // first cut's Endpoint::Parse having
                                   // no ephemeral-port ("127.0.0.1:0")
                                   // support yet.
-    constexpr Size kPayloadSize = 5;
     const u8 payload[kPayloadSize] = { 'f', 'o', 'r', 'g', 'e' };
 
     const Endpoint endpoint(IpAddress::V4(127, 0, 0, 1), kPort);
