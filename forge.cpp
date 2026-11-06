@@ -38,6 +38,7 @@
 #include "jsapi.h"
 
 #include "forge-core/platform/IoLoop.h"
+#include "forge-core/Assert.h"
 #include "forge-core/File.h"
 #include "forge-core/HashMap.h"
 #include "forge-core/Path.h"
@@ -45,6 +46,7 @@
 #include "forge-core/Result.h"
 #include "forge-core/String.h"
 #include "forge-core/StringView.h"
+#include "forge-core/ThreadPool.h"
 #include "forge-core/memory/DefaultAllocator.h"
 #include "forge-core/memory/MakeUnique.h"
 #include "forge-core/memory/UniquePtr.h"
@@ -330,18 +332,141 @@ static void ForgeTimerFired(void* userData) noexcept {
 }
 
 //==============================================================================
+// Async fs (Phase 7.5) -- per-operation bookkeeping
+//
+// See FsAsync.md (frozen design) for the full rationale. Defined here,
+// before Runtime, purely so Runtime's own pendingFsReadOps_ member below
+// can hold AsyncFsReadOp as a complete type directly -- a HashMap<K,
+// UniquePtr<V>> member whose V is only forward-declared would risk
+// needing an out-of-line Runtime destructor to sidestep an
+// incomplete-type-at-instantiation question this project has no real
+// compiler on hand in the sandbox to verify either way; defining the
+// type before it's used as a member avoids the question entirely rather
+// than guessing at MSVC's template instantiation timing.
+//==============================================================================
+
+struct AsyncFsReadOp {
+  // Must be the first member: IocpLoop hands GetQueuedCompletionStatus's
+  // OVERLAPPED* back as-is, and IoCompletion's own doc comment documents
+  // the zero-vtable-call idiom this depends on -- reinterpret_cast'ing
+  // that pointer back to AsyncFsReadOp* (see FsAsyncReadOpCompleted
+  // below) only works if `completion` is this struct's first member, at
+  // offset 0.
+  forge::core::platform::IoCompletion completion{};
+
+  // The JSContext this operation was issued on. Forge only ever has one
+  // JSContext/realm for the whole process today (see main()), so this is
+  // safe the same way JsTimer::cx already is above -- not a
+  // multi-context abstraction, just a convenience so the completion
+  // callback (a free function, not a method, per IoCompletion::
+  // CompletionCallback's plain-function-pointer signature) doesn't need
+  // a second parameter threaded through PostCompletion, which has no
+  // room for one.
+  JSContext* cx{nullptr};
+
+  // GC-rooted independent of whether script keeps a reference to the
+  // Promise this call returned (FsAsync.md's Design Goals: a
+  // fire-and-forget `fs.writeFile(...);` with no `.then()` must still
+  // complete correctly) -- traced by Runtime::TraceRoots, reached via
+  // Runtime's pendingFsReadOps_ map below, for as long as this struct is
+  // registered there.
+  JS::Heap<JSObject*> promise;
+
+  forge::core::Path path;
+  bool wantUtf8{false};
+
+  // Exactly one of these two is meaningful once the worker thread has
+  // run, selected by wantUtf8 -- mirrors FsReadFileSync's own binary-vs-
+  // utf8 branch (Phase 7.3), just executed on a ThreadPool worker
+  // instead of inline. Written by the worker thread; read on the main
+  // thread afterward, inside FsAsyncReadOpCompleted. The
+  // PostCompletion()/GetQueuedCompletionStatus handoff between those two
+  // points is the only synchronization protecting these fields -- no
+  // Mutex guards them -- see FsAsync.md's Thread Safety section.
+  // Placeholder-initialized here (Result<T> has no default constructor)
+  // and overwritten by the worker before it calls PostCompletion.
+  forge::core::Result<forge::core::Vector<forge::core::u8>> bytesResult;
+  forge::core::Result<forge::core::String> textResult;
+
+  explicit AsyncFsReadOp(JSContext* cxIn)
+      : cx(cxIn),
+        bytesResult(forge::core::Failure{forge::core::Error(forge::core::ErrorCode::Unknown)}),
+        textResult(forge::core::Failure{forge::core::Error(forge::core::ErrorCode::Unknown)}) {}
+};
+
+// Phase 7.5.4: the remaining six async fs methods
+// (writeFile/appendFile/mkdir/rm/exists/stat) share one bookkeeping
+// struct rather than getting one each -- unlike fs.readFile's two
+// encodings (a genuinely different shape needing its own struct already
+// built and proven in 7.5.3), these six only ever need one of three
+// possible result shapes (Result<void>, Result<bool>, Result<u64>) and
+// one optional input (write/append's data). A `kind` discriminant
+// selects which of the three placeholder-initialized Result<T> members
+// is authoritative once the worker has run -- the same pattern
+// AsyncFsReadOp's own bytesResult/textResult already established, just
+// generalized across six operations instead of two encodings of one.
+// This keeps four total async-op struct types out of this phase (this
+// one plus AsyncFsReadOp) instead of six, without introducing any new
+// pattern (e.g. inheritance-based reinterpret_cast tricks) beyond what
+// 7.5.3 already proved works.
+enum class AsyncFsMiscOpKind {
+  Write,
+  Append,
+  Mkdir,
+  MkdirRecursive,
+  Rm,
+  Exists,
+  Stat,
+};
+
+struct AsyncFsMiscOp {
+  // Must be the first member -- see AsyncFsReadOp's identical comment
+  // above; same zero-vtable-call reinterpret_cast idiom applies here.
+  forge::core::platform::IoCompletion completion{};
+
+  JSContext* cx{nullptr};
+  JS::Heap<JSObject*> promise;
+  forge::core::Path path;
+  AsyncFsMiscOpKind kind{AsyncFsMiscOpKind::Rm};
+
+  // Only meaningful for Write/Append: the bytes to write, already copied
+  // into an owned buffer on the main thread before dispatch (see
+  // CopySpanToVector below, and FsAsync.md's Design Goals -- the sync
+  // path's ResolveWriteData/AsByteSpan may alias the caller's own JS
+  // buffer or ResolveWriteData's own ownedText storage, neither safe to
+  // hand across the thread boundary to a worker that runs at some later,
+  // arbitrary time).
+  forge::core::Vector<forge::core::u8> data;
+
+  // Exactly one of these three is meaningful once the worker thread has
+  // run, selected by `kind`. Written by the worker thread; read on the
+  // main thread afterward, inside FsAsyncMiscOpCompleted -- same
+  // PostCompletion-handoff-is-the-only-synchronization contract as
+  // AsyncFsReadOp's own bytesResult/textResult. Placeholder-initialized
+  // here (Result<T> has no default constructor).
+  forge::core::Result<void> voidResult;
+  forge::core::Result<bool> existsResult;
+  forge::core::Result<forge::core::u64> statResult;
+
+  explicit AsyncFsMiscOp(JSContext* cxIn)
+      : cx(cxIn),
+        voidResult(forge::core::Failure{forge::core::Error(forge::core::ErrorCode::Unknown)}),
+        existsResult(forge::core::Failure{forge::core::Error(forge::core::ErrorCode::Unknown)}),
+        statResult(forge::core::Failure{forge::core::Error(forge::core::ErrorCode::Unknown)}) {}
+};
+
+// Sized the same as ThreadingSmokeTest.cpp's own real-machine-confirmed
+// 4-worker case -- not tuned against any real workload yet. Benchmarking
+// against a real workload is Phase 7.5.6 (see ROADMAP.md), not this
+// milestone; this is a reasonable, unvalidated starting point, not a
+// claimed-optimal size.
+constexpr forge::core::Size kAsyncWorkerThreadCount = 4;
+
+//==============================================================================
 // Runtime / GC root tracing
 //==============================================================================
 
-static void TraceForgeRoots(JSTracer* trc, void* data) {
-  auto* timers = static_cast<JsTimerRegistry*>(data);
-
-  for (forge::core::Size i = 0; i < microtasks.Size(); ++i) {
-    JS::TraceEdge(trc, &microtasks[i]->callback, "forge-microtask-callback");
-  }
-
-  timers->TraceRoots(trc);
-}
+static void TraceForgeRoots(JSTracer* trc, void* data);
 
 class Runtime {
  public:
@@ -357,7 +482,22 @@ class Runtime {
       return result;
     }
 
-    JS_AddExtraGCRootsTracer(cx_, TraceForgeRoots, &timers_);
+    // Phase 7.5: a small fixed-size pool for async fs (and, later, any
+    // other async I/O) dispatch. See kAsyncWorkerThreadCount's own
+    // comment above for why this size is a starting point, not a tuned
+    // value.
+    if (forge::core::Result<void> poolResult =
+            workerPool_.Initialize(kAsyncWorkerThreadCount);
+        poolResult.HasError()) {
+      return poolResult;
+    }
+
+    // Passes `this` (not `&timers_`, as before Phase 7.5) so
+    // TraceForgeRoots below can reach every GC root this Runtime owns --
+    // both the timer registry and, now, every in-flight async fs
+    // operation's Promise -- through one Runtime::TraceRoots() method,
+    // rather than threading a second pointer through separately.
+    JS_AddExtraGCRootsTracer(cx_, TraceForgeRoots, this);
     return {};
   }
 
@@ -366,11 +506,19 @@ class Runtime {
   // pending — replaces the old EventLoop's busy-poll `while (...) { ...;
   // sleep_for(1ms); }` with the loop actually sleeping until something is
   // due (see ROADMAP.md Phase 2).
+  //
+  // pendingAsyncOps_ (Phase 7.5) is checked alongside the job queue and
+  // the I/O loop's own idle state: IoLoop::Empty()'s own doc comment
+  // already flags that it "does not yet account for pending async I/O
+  // operations" -- without this, a script whose only remaining work is an
+  // in-flight async fs read (no timer pending) would look identical to
+  // "nothing left to do", and the process would exit before that read
+  // ever completes. See FsAsync.md's Design Goals for the full reasoning.
   void run() {
     for (;;) {
       jobQueue_.runJobs(cx_);
 
-      if (jobQueue_.empty() && loop_.Empty()) {
+      if (jobQueue_.empty() && loop_.Empty() && pendingAsyncOps_ == 0) {
         break;
       }
 
@@ -386,17 +534,165 @@ class Runtime {
 
   JsTimerRegistry& timers() { return timers_; }
 
-  // Releases every still-pending timer. Call this once, after run() has
-  // returned (however it returned), and before JS_DestroyContext(cx) — see
-  // JsTimerRegistry::Clear() for exactly why this ordering matters.
-  void Shutdown() { timers_.Clear(); }
+  // Called (via GetRuntime(cx)) by an async operation's dispatch site
+  // (Phase 7.5.3 onward) at the moment work is handed to a ThreadPool
+  // worker, so run() above doesn't treat the loop as idle while that
+  // operation is still in flight. Every call must be paired with exactly
+  // one later OnAsyncOperationFinished() call, once that operation's
+  // completion has been delivered and its Promise settled.
+  void OnAsyncOperationStarted() { ++pendingAsyncOps_; }
+
+  // Mismatched Started()/Finished() calls are a real programmer error,
+  // not a tolerated edge case, so this asserts rather than silently
+  // wrapping/clamping if the count is already zero -- same "loud failure
+  // over silent misbehavior" convention Thread.h's Joinable()/destructor
+  // contract already uses elsewhere in this codebase.
+  void OnAsyncOperationFinished() {
+    FORGE_ASSERT(pendingAsyncOps_ > 0);
+    --pendingAsyncOps_;
+  }
+
+  forge::core::platform::IoLoop& Loop() { return loop_; }
+
+  // The single shared pool async fs dispatch (7.5.3 onward) submits its
+  // worker-thread tasks to. Named generically (not "fs-specific") since
+  // FsAsync.md's Extensibility section expects a future async net.* to
+  // reuse the identical worker/main-thread split -- this pool is meant to
+  // be shared across whatever async I/O features come after this one,
+  // not fs-only.
+  forge::core::ThreadPool& WorkerPool() { return workerPool_; }
+
+  // Registers a newly-allocated async fs read operation, taking
+  // ownership, so (a) TraceRoots below can trace its Promise root for as
+  // long as it's in flight, and (b) it stays alive independent of
+  // whether script retains any reference to the Promise it returned (see
+  // FsAsync.md's "GC-rooted independent of script" Design Goal). Returns
+  // a non-owning pointer for the caller's own dispatch use (e.g. handing
+  // &op->completion to IoLoop::PostCompletion), or nullptr on OOM growing
+  // the registry -- `op` is left untouched in that case (HashMap::Insert
+  // doesn't move from its argument on failure, matching
+  // JsTimerRegistry::Add()'s own documented OOM behavior above), so the
+  // caller's local UniquePtr still owns it and frees it normally when it
+  // goes out of scope.
+  AsyncFsReadOp* RegisterAsyncFsReadOp(
+      forge::core::memory::UniquePtr<AsyncFsReadOp> op) {
+    AsyncFsReadOp* raw = op.Get();
+    forge::core::Result<bool> inserted =
+        pendingFsReadOps_.Insert(raw, std::move(op));
+
+    if (inserted.HasError()) {
+      return nullptr;
+    }
+
+    return raw;
+  }
+
+  // Called from an operation's own completion callback, on the main
+  // thread, once its Promise has been settled -- releases (frees) it.
+  // Must be the last thing done with `op`; nothing may touch it after
+  // this call.
+  void UnregisterAsyncFsReadOp(AsyncFsReadOp* op) {
+    pendingFsReadOps_.Erase(op);
+  }
+
+  // Same Register/Unregister pair as above, for the Phase 7.5.4
+  // AsyncFsMiscOp family (writeFile/appendFile/mkdir/rm/exists/stat) --
+  // see AsyncFsMiscOp's own comment for why these six share one struct
+  // type (and therefore one map) rather than getting one each.
+  AsyncFsMiscOp* RegisterAsyncFsMiscOp(
+      forge::core::memory::UniquePtr<AsyncFsMiscOp> op) {
+    AsyncFsMiscOp* raw = op.Get();
+    forge::core::Result<bool> inserted =
+        pendingFsMiscOps_.Insert(raw, std::move(op));
+
+    if (inserted.HasError()) {
+      return nullptr;
+    }
+
+    return raw;
+  }
+
+  void UnregisterAsyncFsMiscOp(AsyncFsMiscOp* op) {
+    pendingFsMiscOps_.Erase(op);
+  }
+
+  // Traces every GC root this Runtime owns: the timer registry's
+  // callbacks (unchanged from before Phase 7.5) plus every in-flight
+  // async fs operation's Promise, from both pending-op maps -- so a GC
+  // running while any fs.* async call is still in flight cannot collect
+  // a Promise script no longer references (FsAsync.md's Design Goals).
+  void TraceRoots(JSTracer* trc) {
+    timers_.TraceRoots(trc);
+
+    for (auto entry : pendingFsReadOps_) {
+      JS::TraceEdge(trc, &entry.Value()->promise, "forge-async-fs-promise");
+    }
+
+    for (auto entry : pendingFsMiscOps_) {
+      JS::TraceEdge(trc, &entry.Value()->promise, "forge-async-fs-promise");
+    }
+  }
+
+  // Releases every still-pending timer, and stops the worker pool.
+  // Call this once, after run() has returned (however it returned), and
+  // before JS_DestroyContext(cx) -- see JsTimerRegistry::Clear() for
+  // exactly why this ordering matters.
+  //
+  // workerPool_.Shutdown() blocks until every already-running worker
+  // task finishes (joins every thread) -- see ThreadPool::Shutdown's own
+  // contract. That matters here specifically: it guarantees no worker
+  // thread is still writing to any pending op by the time the two
+  // Clear() calls below run, so clearing them here (while cx is still
+  // alive) is safe -- releasing each entry's JS::Heap<promise> in a
+  // context where JS::Heap's own barrier machinery still has a live cx
+  // to work with, rather than deferring that release to Runtime's own
+  // implicit destructor, which runs later in main() -- after
+  // JS_DestroyContext(cx) -- where doing the same thing would not be.
+  //
+  // Known, accepted gap this does NOT solve: if run() exited early (e.g.
+  // a genuine I/O error) while an async fs operation was still in flight,
+  // that operation's Promise is simply dropped here, unresolved and
+  // unrejected, rather than ever being settled -- there is no script left
+  // running to observe it either way once run() has already exited, so
+  // this is a silent-but-harmless loss of that operation's result, not a
+  // crash or UB. Not addressed further by this milestone.
+  void Shutdown() {
+    workerPool_.Shutdown();
+    pendingFsReadOps_.Clear();
+    pendingFsMiscOps_.Clear();
+    timers_.Clear();
+  }
 
  private:
   JSContext* cx_;
   forge::core::platform::IoLoop loop_;
   JsTimerRegistry timers_;
   ForgeJobQueue jobQueue_;
+  forge::core::ThreadPool workerPool_;
+  forge::core::HashMap<AsyncFsReadOp*, forge::core::memory::UniquePtr<AsyncFsReadOp>>
+      pendingFsReadOps_;
+  forge::core::HashMap<AsyncFsMiscOp*, forge::core::memory::UniquePtr<AsyncFsMiscOp>>
+      pendingFsMiscOps_;
+
+  // Phase 7.5: count of in-flight async fs (and, later, any other async
+  // I/O) operations dispatched onto ThreadPool but not yet completed.
+  // Kept here, on Runtime, rather than on IoLoop -- IoLoop::Empty()'s own
+  // doc comment explicitly defers this bookkeeping to the caller instead
+  // of mandating it live inside IoLoop, and IoLoop's public API stays
+  // frozen per FsAsync.md's Dependencies section (nothing here touches
+  // IocpLoop.h/.cpp).
+  forge::core::Size pendingAsyncOps_{ 0 };
 };
+
+static void TraceForgeRoots(JSTracer* trc, void* data) {
+  auto* runtime = static_cast<Runtime*>(data);
+
+  for (forge::core::Size i = 0; i < microtasks.Size(); ++i) {
+    JS::TraceEdge(trc, &microtasks[i]->callback, "forge-microtask-callback");
+  }
+
+  runtime->TraceRoots(trc);
+}
 
 Runtime* GetRuntime(JSContext* cx)
 {
@@ -1549,6 +1845,729 @@ static bool FsReadFileSync(JSContext* cx, unsigned argc, JS::Value* vp) {
   return true;
 }
 
+//==============================================================================
+// fs.readFile (Phase 7.5.3) -- the first Promise-returning fs binding,
+// per FsAsync.md (frozen design). First native use in this codebase of
+// JS::NewPromiseObject/JS::ResolvePromise/JS::RejectPromise
+// (js/public/Promise.h) -- confirmed via a direct fetch of the real
+// header from this same gecko-dev tree (mozilla/gecko-dev on GitHub),
+// mirroring Phase 7.2's JS_NewPlainObject precedent of reading the real
+// declaration rather than reconstructing one from memory:
+//
+//   extern JS_PUBLIC_API JSObject* NewPromiseObject(JSContext* cx,
+//                                                    JS::HandleObject executor);
+//   extern JS_PUBLIC_API bool ResolvePromise(JSContext* cx,
+//                                             JS::HandleObject promiseObj,
+//                                             JS::HandleValue resolutionValue);
+//   extern JS_PUBLIC_API bool RejectPromise(JSContext* cx,
+//                                            JS::HandleObject promiseObj,
+//                                            JS::HandleValue rejectionValue);
+//
+// A null `executor` (used below) means "the only way to resolve or
+// reject the returned promise is via the JS::ResolvePromise and
+// JS::RejectPromise JSAPI functions" -- exactly this binding's shape.
+//==============================================================================
+
+// Rejects `promiseObj` with an Error object carrying the exact same
+// shape ThrowJsError already produces for every synchronous fs.*Sync
+// failure (.code/.syscall/.path/.nativeCode) -- per FsAsync.md's Error
+// Handling Policy ("this phase changes delivery... not the error shape
+// itself"). Reuses ThrowJsError directly: it throws (sets cx's pending
+// exception), and this then retrieves that exception as a value, clears
+// it -- a Promise rejection value must never also be left pending on cx
+// -- and hands it to JS::RejectPromise instead of letting it propagate
+// as a thrown exception.
+static void RejectAsyncFsPromise(JSContext* cx, JS::HandleObject promiseObj,
+                                  const forge::core::Error& error,
+                                  const char* context,
+                                  const forge::core::Path* path = nullptr) {
+  ThrowJsError(cx, error, context, path);
+
+  JS::RootedValue rejection(cx);
+
+  if (JS_GetPendingException(cx, &rejection)) {
+    JS_ClearPendingException(cx);
+  } else {
+    // ThrowJsError itself hit trouble formatting the message (its own
+    // documented fallback) and left nothing pending to retrieve --
+    // reject with undefined rather than leaving the Promise unsettled.
+    rejection.setUndefined();
+  }
+
+  if (!JS::RejectPromise(cx, promiseObj, rejection)) {
+    ReportPendingException(cx, "fs promise rejection");
+  }
+}
+
+// Rejects `promiseObj` with whatever exception is already pending on cx
+// (e.g. FromForgeString/Uint8ArrayFromBytes reporting an OOM or
+// RangeError while marshalling a successful worker-thread result into
+// JS) -- same reasoning as RejectAsyncFsPromise above: clears the
+// pending exception first, since a Promise rejection value must not
+// simultaneously be a pending exception.
+static void RejectAsyncFsPromiseFromPendingException(JSContext* cx,
+                                                       JS::HandleObject promiseObj) {
+  JS::RootedValue rejection(cx);
+
+  if (JS_GetPendingException(cx, &rejection)) {
+    JS_ClearPendingException(cx);
+  } else {
+    rejection.setUndefined();
+  }
+
+  if (!JS::RejectPromise(cx, promiseObj, rejection)) {
+    ReportPendingException(cx, "fs promise rejection");
+  }
+}
+
+// IoCompletion callback for an in-flight fs.readFile() operation,
+// dispatched by IocpLoop::RunOnce() on the main thread once the
+// ThreadPool worker that ran the actual File::ReadAllBytes/ReadAllText
+// call has posted its completion (see FsReadFile below, and 7.5.1's
+// IocpCrossThreadSmokeTest.cpp for real-machine confirmation that a
+// cross-thread PostCompletion actually wakes RunOnce()).
+//
+// `self` is AsyncFsReadOp's own embedded `completion` field --
+// reinterpret_cast back to the containing struct relies on `completion`
+// being AsyncFsReadOp's first member (see its own comment, above,
+// before Runtime).
+static void FsAsyncReadOpCompleted(forge::core::platform::IoCompletion* self,
+                                    DWORD /*bytesTransferred*/,
+                                    ULONG_PTR /*completionKey*/,
+                                    bool /*succeeded*/,
+                                    DWORD /*errorCode*/) noexcept {
+  auto* op = reinterpret_cast<AsyncFsReadOp*>(self);
+  JSContext* cx = op->cx;
+
+  JS::RootedObject promiseObj(cx, op->promise);
+
+  if (op->wantUtf8) {
+    if (op->textResult.HasError()) {
+      RejectAsyncFsPromise(cx, promiseObj, op->textResult.Error(), "readFile", &op->path);
+    } else {
+      JSString* text = FromForgeString(cx, op->textResult.Value().View());
+
+      if (text) {
+        JS::RootedValue value(cx, JS::StringValue(text));
+
+        if (!JS::ResolvePromise(cx, promiseObj, value)) {
+          ReportPendingException(cx, "readFile promise resolution");
+        }
+      } else {
+        RejectAsyncFsPromiseFromPendingException(cx, promiseObj);
+      }
+    }
+  } else {
+    if (op->bytesResult.HasError()) {
+      RejectAsyncFsPromise(cx, promiseObj, op->bytesResult.Error(), "readFile", &op->path);
+    } else {
+      JSObject* array = Uint8ArrayFromBytes(cx, std::move(op->bytesResult.Value()));
+
+      if (array) {
+        JS::RootedValue value(cx, JS::ObjectValue(*array));
+
+        if (!JS::ResolvePromise(cx, promiseObj, value)) {
+          ReportPendingException(cx, "readFile promise resolution");
+        }
+      } else {
+        RejectAsyncFsPromiseFromPendingException(cx, promiseObj);
+      }
+    }
+  }
+
+  Runtime* runtime = GetRuntime(cx);
+  runtime->OnAsyncOperationFinished();
+
+  // Must be last: this frees *op (via Runtime's owning map) -- nothing
+  // above may touch op/self (which aliases the now-freed struct) after
+  // this call. promiseObj is a JS::RootedObject holding its own copy of
+  // the pointer, so it stays valid through the calls above regardless.
+  runtime->UnregisterAsyncFsReadOp(op);
+}
+
+// fs.readFile(path, encoding?) -- Promise-returning counterpart to
+// readFileSync (Phase 7.3), per FsAsync.md (Phase 7.5, frozen design).
+// Argument parsing is identical to readFileSync's above; what differs is
+// everything after that: the actual File::ReadAllBytes/ReadAllText call
+// runs on a ThreadPool worker thread instead of inline, and the result
+// is delivered by resolving/rejecting a Promise from
+// FsAsyncReadOpCompleted (above) once that worker's completion is
+// dispatched back to the main thread.
+static bool FsReadFile(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "readFile", 1)) {
+    return false;
+  }
+
+  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+
+  if (path.HasError()) {
+    ThrowJsError(cx, path.Error(), "readFile");
+    return false;
+  }
+
+  bool wantUtf8 = false;
+
+  if (args.hasDefined(1)) {
+    forge::core::Result<forge::core::String> encoding = ToForgeString(cx, args[1]);
+
+    if (encoding.HasError()) {
+      ThrowJsError(cx, encoding.Error(), "readFile", &path.Value());
+      return false;
+    }
+
+    if (encoding.Value().View() == forge::core::StringView("utf8")) {
+      wantUtf8 = true;
+    } else {
+      ThrowJsError(cx, forge::core::Error(forge::core::ErrorCode::InvalidArgument),
+                   "readFile", &path.Value());
+      return false;
+    }
+  }
+
+  // Create the Promise itself first, with a null executor -- the only
+  // way to settle it from here on is JS::ResolvePromise/RejectPromise,
+  // called later from FsAsyncReadOpCompleted (see this section's header
+  // comment for js/public/Promise.h's exact, real-header-confirmed
+  // contract for a null-executor Promise).
+  JS::RootedObject promise(cx, JS::NewPromiseObject(cx, nullptr));
+
+  if (!promise) {
+    return false;  // NewPromiseObject reports its own failure (OOM).
+  }
+
+  forge::core::Result<forge::core::memory::UniquePtr<AsyncFsReadOp>> made =
+      forge::core::memory::MakeUnique<AsyncFsReadOp>(cx);
+
+  if (made.HasError()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  forge::core::memory::UniquePtr<AsyncFsReadOp> owned = std::move(made.Value());
+  owned->promise = promise;
+  owned->path = std::move(path.Value());
+  owned->wantUtf8 = wantUtf8;
+  owned->completion.callback = &FsAsyncReadOpCompleted;
+
+  Runtime* runtime = GetRuntime(cx);
+
+  AsyncFsReadOp* op = runtime->RegisterAsyncFsReadOp(std::move(owned));
+
+  if (!op) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  forge::core::platform::IoLoop* loop = &runtime->Loop();
+
+  // The worker thread's own callable: touches only op->path/wantUtf8/
+  // bytesResult/textResult (forge-core types) and loop (an IoLoop*, only
+  // ever to call PostCompletion, documented safe to call from another
+  // thread and now real-machine-confirmed -- see 7.5.1/
+  // IocpCrossThreadSmokeTest.cpp). Never touches cx, op->promise, or
+  // anything else JSAPI-typed -- see FsAsync.md's "thread boundary is
+  // absolute" Design Goal.
+  forge::core::Result<void> submitted = runtime->WorkerPool().Submit(
+      [op, loop]() {
+        if (op->wantUtf8) {
+          op->textResult = forge::core::File::ReadAllText(op->path);
+        } else {
+          op->bytesResult = forge::core::File::ReadAllBytes(op->path);
+        }
+
+        // Known, accepted gap (not solved by this milestone): if this
+        // PostCompletion call itself fails (e.g. the completion port is
+        // somehow invalid), there is no way to report that from this
+        // thread, and op's Promise never settles -- op also never gets
+        // unregistered, and pendingAsyncOps_ never decrements. This is
+        // an exceptional, not a routine, failure mode (the same class of
+        // "an OS resource call fails for a reason nothing here can
+        // recover from" as e.g. Thread::Create failing outright) and is
+        // not addressed by this milestone; flagged here rather than
+        // silently assumed away.
+        (void)loop->PostCompletion(&op->completion, 0, 0);
+      });
+
+  if (submitted.HasError()) {
+    // Nothing was armed yet -- dispatch itself failed before any worker
+    // ever ran -- so it's safe to just unregister and free op, then
+    // report synchronously. No Promise has been returned to script in
+    // this path (rval is never set), matching every other OOM-style
+    // failure in this file.
+    runtime->UnregisterAsyncFsReadOp(op);
+    ThrowJsError(cx, submitted.Error(), "readFile");
+    return false;
+  }
+
+  runtime->OnAsyncOperationStarted();
+
+  args.rval().setObject(*promise);
+  return true;
+}
+
+//==============================================================================
+// fs.writeFile / fs.appendFile / fs.mkdir / fs.rm / fs.exists / fs.stat
+// (Phase 7.5.4) -- the remaining six Promise-returning fs bindings, per
+// FsAsync.md. Share one AsyncFsMiscOp bookkeeping struct (defined above,
+// before Runtime) and one dispatch helper (DispatchAsyncFsMiscOp below)
+// rather than repeating fs.readFile's whole struct-plus-dispatch shape
+// six times -- see AsyncFsMiscOp's own comment for why.
+//==============================================================================
+
+// Worker-thread-safe variant of WriteAllBytes (Phase 7.3, above): the
+// identical short-write-retry loop and no-forward-progress guard, but
+// returns a plain Result<void> instead of calling ThrowJsError -- this
+// runs on a ThreadPool worker thread, which must never touch cx (see
+// FsAsync.md's "thread boundary is absolute" Design Goal). The
+// completion callback (main thread) turns a returned error into a
+// rejected Promise via RejectAsyncFsPromise, the same shape ThrowJsError
+// itself would have produced.
+static forge::core::Result<void> WriteAllBytesNoThrow(
+    forge::core::File& file, forge::core::Span<const forge::core::u8> data) {
+  forge::core::Size written = 0;
+
+  while (written < data.Size()) {
+    const forge::core::Span<const forge::core::u8> remaining =
+        data.Subspan(written, data.Size() - written);
+
+    forge::core::Result<forge::core::File::SizeType> result = file.Write(remaining);
+
+    if (result.HasError()) {
+      return forge::core::Result<void>(forge::core::Failure{result.Error()});
+    }
+
+    if (result.Value() == 0) {
+      return forge::core::Result<void>(
+          forge::core::Failure{forge::core::Error(forge::core::ErrorCode::IOError)});
+    }
+
+    written += result.Value();
+  }
+
+  return {};
+}
+
+// Copies `data` into a freshly-constructed, owned Vector<u8> -- used by
+// the async write/append path to make its own copy of the caller's bytes
+// before dispatching to a worker thread. `data` may alias the caller's
+// own JS buffer (the Uint8Array/ArrayBuffer case) or ResolveWriteData's
+// own `ownedText` storage (the string case) -- neither is safe to hand
+// across the thread boundary to a worker that runs at some later,
+// arbitrary time (FsAsync.md's Design Goals). Returns Result<void>
+// (rather than the Vector itself) so an OOM partway through (Reserve or
+// a PushBack) is reported the same way every other allocation failure in
+// this file is, via the caller checking .HasError() on the destination
+// it already owns.
+static forge::core::Result<void> CopySpanToVector(
+    forge::core::Span<const forge::core::u8> data,
+    forge::core::Vector<forge::core::u8>* out) {
+  if (forge::core::Result<void> reserved = out->Reserve(data.Size());
+      reserved.HasError()) {
+    return reserved;
+  }
+
+  for (forge::core::Size i = 0; i < data.Size(); ++i) {
+    if (forge::core::Result<void> pushed = out->PushBack(data[i]);
+        pushed.HasError()) {
+      return pushed;
+    }
+  }
+
+  return {};
+}
+
+// The `context` string ThrowJsError/RejectAsyncFsPromise report for each
+// AsyncFsMiscOpKind -- matches the sync bindings' own function-name
+// strings (Mkdir/MkdirRecursive both report as "mkdir", same as
+// mkdirSync's single reported name regardless of the recursive option).
+static const char* AsyncFsMiscOpContextName(AsyncFsMiscOpKind kind) {
+  switch (kind) {
+    case AsyncFsMiscOpKind::Write:          return "writeFile";
+    case AsyncFsMiscOpKind::Append:         return "appendFile";
+    case AsyncFsMiscOpKind::Mkdir:          return "mkdir";
+    case AsyncFsMiscOpKind::MkdirRecursive: return "mkdir";
+    case AsyncFsMiscOpKind::Rm:             return "rm";
+    case AsyncFsMiscOpKind::Exists:         return "exists";
+    case AsyncFsMiscOpKind::Stat:           return "stat";
+  }
+
+  return "fs";
+}
+
+// IoCompletion callback for an in-flight AsyncFsMiscOp, dispatched by
+// IocpLoop::RunOnce() on the main thread once the ThreadPool worker that
+// ran the actual File call has posted its completion -- same shape as
+// FsAsyncReadOpCompleted above, just switching on `kind` to know which
+// of voidResult/existsResult/statResult is authoritative and how to
+// marshal it into JS.
+static void FsAsyncMiscOpCompleted(forge::core::platform::IoCompletion* self,
+                                    DWORD /*bytesTransferred*/,
+                                    ULONG_PTR /*completionKey*/,
+                                    bool /*succeeded*/,
+                                    DWORD /*errorCode*/) noexcept {
+  auto* op = reinterpret_cast<AsyncFsMiscOp*>(self);
+  JSContext* cx = op->cx;
+
+  JS::RootedObject promiseObj(cx, op->promise);
+  const char* context = AsyncFsMiscOpContextName(op->kind);
+
+  switch (op->kind) {
+    case AsyncFsMiscOpKind::Write:
+    case AsyncFsMiscOpKind::Append:
+    case AsyncFsMiscOpKind::Mkdir:
+    case AsyncFsMiscOpKind::MkdirRecursive:
+    case AsyncFsMiscOpKind::Rm: {
+      if (op->voidResult.HasError()) {
+        RejectAsyncFsPromise(cx, promiseObj, op->voidResult.Error(), context, &op->path);
+      } else {
+        JS::RootedValue value(cx, JS::UndefinedValue());
+
+        if (!JS::ResolvePromise(cx, promiseObj, value)) {
+          ReportPendingException(cx, "fs promise resolution");
+        }
+      }
+
+      break;
+    }
+
+    case AsyncFsMiscOpKind::Exists: {
+      if (op->existsResult.HasError()) {
+        RejectAsyncFsPromise(cx, promiseObj, op->existsResult.Error(), context, &op->path);
+      } else {
+        JS::RootedValue value(cx, JS::BooleanValue(op->existsResult.Value()));
+
+        if (!JS::ResolvePromise(cx, promiseObj, value)) {
+          ReportPendingException(cx, "fs promise resolution");
+        }
+      }
+
+      break;
+    }
+
+    case AsyncFsMiscOpKind::Stat: {
+      if (op->statResult.HasError()) {
+        RejectAsyncFsPromise(cx, promiseObj, op->statResult.Error(), context, &op->path);
+        break;
+      }
+
+      JS::RootedObject stats(cx, JS_NewPlainObject(cx));
+
+      if (!stats) {
+        RejectAsyncFsPromiseFromPendingException(cx, promiseObj);
+        break;
+      }
+
+      // Same 2^53-precision caveat as statSync (Phase 7.3) -- not
+      // addressed here either, per Fs.md's own accepted "size: number"
+      // spec.
+      if (!JS_DefineProperty(cx, stats, "size",
+                             static_cast<double>(op->statResult.Value()),
+                             JSPROP_ENUMERATE)) {
+        RejectAsyncFsPromiseFromPendingException(cx, promiseObj);
+        break;
+      }
+
+      JS::RootedValue value(cx, JS::ObjectValue(*stats));
+
+      if (!JS::ResolvePromise(cx, promiseObj, value)) {
+        ReportPendingException(cx, "fs promise resolution");
+      }
+
+      break;
+    }
+  }
+
+  Runtime* runtime = GetRuntime(cx);
+  runtime->OnAsyncOperationFinished();
+
+  // Must be last -- see FsAsyncReadOpCompleted's identical comment.
+  runtime->UnregisterAsyncFsMiscOp(op);
+}
+
+// Shared creation/dispatch path for all six AsyncFsMiscOp-backed
+// bindings below: creates the Promise, allocates and registers the
+// bookkeeping struct, submits the worker lambda (switching on `kind` to
+// run the right File call -- see AsyncFsMiscOp's own comment for why one
+// worker lambda covers all six rather than one each), and returns the
+// Promise to script. `data` is only meaningful for Write/Append; every
+// other kind passes an empty Vector.
+static bool DispatchAsyncFsMiscOp(JSContext* cx, JS::CallArgs& args,
+                                   forge::core::Path path,
+                                   AsyncFsMiscOpKind kind,
+                                   forge::core::Vector<forge::core::u8> data,
+                                   const char* context) {
+  JS::RootedObject promise(cx, JS::NewPromiseObject(cx, nullptr));
+
+  if (!promise) {
+    return false;  // NewPromiseObject reports its own failure (OOM).
+  }
+
+  forge::core::Result<forge::core::memory::UniquePtr<AsyncFsMiscOp>> made =
+      forge::core::memory::MakeUnique<AsyncFsMiscOp>(cx);
+
+  if (made.HasError()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  forge::core::memory::UniquePtr<AsyncFsMiscOp> owned = std::move(made.Value());
+  owned->promise = promise;
+  owned->path = std::move(path);
+  owned->kind = kind;
+  owned->data = std::move(data);
+  owned->completion.callback = &FsAsyncMiscOpCompleted;
+
+  Runtime* runtime = GetRuntime(cx);
+
+  AsyncFsMiscOp* op = runtime->RegisterAsyncFsMiscOp(std::move(owned));
+
+  if (!op) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  forge::core::platform::IoLoop* loop = &runtime->Loop();
+
+  // Same absolute thread-boundary rule as FsReadFile's own worker lambda
+  // above: touches only op->path/kind/data/voidResult/existsResult/
+  // statResult (forge-core types) and loop (only to call
+  // PostCompletion). Never cx, never op->promise.
+  forge::core::Result<void> submitted = runtime->WorkerPool().Submit(
+      [op, loop]() {
+        switch (op->kind) {
+          case AsyncFsMiscOpKind::Write:
+          case AsyncFsMiscOpKind::Append: {
+            const forge::core::FileMode mode =
+                op->kind == AsyncFsMiscOpKind::Write
+                    ? forge::core::FileMode::Write
+                    : forge::core::FileMode::Append;
+
+            forge::core::Result<forge::core::File> file =
+                forge::core::File::Open(op->path, mode);
+
+            if (file.HasError()) {
+              op->voidResult = forge::core::Result<void>(forge::core::Failure{file.Error()});
+            } else {
+              op->voidResult = WriteAllBytesNoThrow(
+                  file.Value(),
+                  forge::core::Span<const forge::core::u8>(op->data.Data(), op->data.Size()));
+            }
+
+            break;
+          }
+
+          case AsyncFsMiscOpKind::Mkdir:
+            op->voidResult = forge::core::File::MakeDirectory(op->path);
+            break;
+
+          case AsyncFsMiscOpKind::MkdirRecursive:
+            op->voidResult = forge::core::File::CreateDirectories(op->path);
+            break;
+
+          case AsyncFsMiscOpKind::Rm:
+            op->voidResult = forge::core::File::Remove(op->path);
+            break;
+
+          case AsyncFsMiscOpKind::Exists:
+            op->existsResult = forge::core::File::Exists(op->path);
+            break;
+
+          case AsyncFsMiscOpKind::Stat: {
+            forge::core::Result<forge::core::File> file =
+                forge::core::File::Open(op->path, forge::core::FileMode::Read);
+
+            if (file.HasError()) {
+              op->statResult =
+                  forge::core::Result<forge::core::u64>(forge::core::Failure{file.Error()});
+            } else {
+              op->statResult = file.Value().SizeInBytes();
+              file.Value().Close();
+            }
+
+            break;
+          }
+        }
+
+        // Known, accepted gap -- see FsReadFile's identical comment (a
+        // worker-thread PostCompletion failure has no way to be
+        // reported, and this op's Promise would never settle).
+        (void)loop->PostCompletion(&op->completion, 0, 0);
+      });
+
+  if (submitted.HasError()) {
+    // Nothing was armed yet -- see FsReadFile's identical comment.
+    runtime->UnregisterAsyncFsMiscOp(op);
+    ThrowJsError(cx, submitted.Error(), context);
+    return false;
+  }
+
+  runtime->OnAsyncOperationStarted();
+
+  args.rval().setObject(*promise);
+  return true;
+}
+
+// fs.writeFile(path, data) / fs.appendFile(path, data) -- Promise-
+// returning counterparts to writeFileSync/appendFileSync (Phase 7.3).
+// Argument parsing (path, ResolveWriteData) is identical to the sync
+// versions'; what's new is copying the resolved bytes into an owned
+// Vector<u8> (CopySpanToVector above) before dispatch -- see
+// AsyncFsMiscOp's own comment on why the async path cannot alias the
+// way the sync path does.
+static bool FsWriteOrAppend(JSContext* cx, unsigned argc, JS::Value* vp,
+                            AsyncFsMiscOpKind kind, const char* context) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, context, 2)) {
+    return false;
+  }
+
+  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+
+  if (path.HasError()) {
+    ThrowJsError(cx, path.Error(), context);
+    return false;
+  }
+
+  forge::core::String ownedText;
+  forge::core::Result<forge::core::Span<const forge::core::u8>> data =
+      ResolveWriteData(cx, args[1], &ownedText);
+
+  if (data.HasError()) {
+    ThrowJsError(cx, data.Error(), context, &path.Value());
+    return false;
+  }
+
+  forge::core::Vector<forge::core::u8> owned;
+  forge::core::Result<void> copied = CopySpanToVector(data.Value(), &owned);
+
+  if (copied.HasError()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()), kind,
+                                std::move(owned), context);
+}
+
+static bool FsWriteFile(JSContext* cx, unsigned argc, JS::Value* vp) {
+  return FsWriteOrAppend(cx, argc, vp, AsyncFsMiscOpKind::Write, "writeFile");
+}
+
+static bool FsAppendFile(JSContext* cx, unsigned argc, JS::Value* vp) {
+  return FsWriteOrAppend(cx, argc, vp, AsyncFsMiscOpKind::Append, "appendFile");
+}
+
+// fs.exists(path) -- Promise-returning counterpart to existsSync (Phase
+// 7.3). Same semantics/Node-divergence rationale as existsSync above: a
+// genuine File::Exists failure rejects rather than resolving false.
+static bool FsExists(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "exists", 1)) {
+    return false;
+  }
+
+  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+
+  if (path.HasError()) {
+    ThrowJsError(cx, path.Error(), "exists");
+    return false;
+  }
+
+  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()),
+                                AsyncFsMiscOpKind::Exists,
+                                forge::core::Vector<forge::core::u8>(), "exists");
+}
+
+// fs.mkdir(path, options?) -- Promise-returning counterpart to mkdirSync
+// (Phase 7.3). Same options.recursive parsing and File::MakeDirectory
+// vs. File::CreateDirectories split.
+static bool FsMkdir(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "mkdir", 1)) {
+    return false;
+  }
+
+  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+
+  if (path.HasError()) {
+    ThrowJsError(cx, path.Error(), "mkdir");
+    return false;
+  }
+
+  bool recursive = false;
+
+  if (args.hasDefined(1)) {
+    if (!args[1].isObject()) {
+      ThrowJsError(cx, forge::core::Error(forge::core::ErrorCode::InvalidArgument),
+                   "mkdir", &path.Value());
+      return false;
+    }
+
+    JS::RootedObject options(cx, &args[1].toObject());
+    JS::RootedValue recursiveVal(cx);
+
+    if (!JS_GetProperty(cx, options, "recursive", &recursiveVal)) {
+      return false;
+    }
+
+    if (!recursiveVal.isUndefined()) {
+      recursive = JS::ToBoolean(recursiveVal);
+    }
+  }
+
+  return DispatchAsyncFsMiscOp(
+      cx, args, std::move(path.Value()),
+      recursive ? AsyncFsMiscOpKind::MkdirRecursive : AsyncFsMiscOpKind::Mkdir,
+      forge::core::Vector<forge::core::u8>(), "mkdir");
+}
+
+// fs.rm(path) -- Promise-returning counterpart to rmSync (Phase 7.3).
+// File-removal only, same as rmSync, per Fs.md's Non-Goals.
+static bool FsRm(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "rm", 1)) {
+    return false;
+  }
+
+  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+
+  if (path.HasError()) {
+    ThrowJsError(cx, path.Error(), "rm");
+    return false;
+  }
+
+  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()),
+                                AsyncFsMiscOpKind::Rm,
+                                forge::core::Vector<forge::core::u8>(), "rm");
+}
+
+// fs.stat(path) -- Promise-returning counterpart to statSync (Phase
+// 7.3). Same { size } shape.
+static bool FsStat(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!args.requireAtLeast(cx, "stat", 1)) {
+    return false;
+  }
+
+  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+
+  if (path.HasError()) {
+    ThrowJsError(cx, path.Error(), "stat");
+    return false;
+  }
+
+  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()),
+                                AsyncFsMiscOpKind::Stat,
+                                forge::core::Vector<forge::core::u8>(), "stat");
+}
+
 // Shared implementation for writeFileSync/appendFileSync -- identical
 // shape per Fs.md ("Same as writeFileSync but File::Open(path,
 // FileMode::Append)"), differing only in FileMode and the reported
@@ -1788,12 +2807,25 @@ static bool DefineFsNamespace(JSContext* cx, JS::HandleObject global) {
   }
 
   if (!JS_DefineFunction(cx, fs, "readFileSync", FsReadFileSync, 1, 0) ||
+      // fs.readFile (Phase 7.5.3) -- the bare name JsBindings.md reserved
+      // from the start for the Promise-returning counterpart to
+      // readFileSync.
+      !JS_DefineFunction(cx, fs, "readFile", FsReadFile, 1, 0) ||
       !JS_DefineFunction(cx, fs, "writeFileSync", FsWriteFileSync, 2, 0) ||
+      // fs.writeFile/appendFile/exists/mkdir/rm/stat (Phase 7.5.4) -- the
+      // remaining bare Promise-returning names JsBindings.md reserved
+      // from the start.
+      !JS_DefineFunction(cx, fs, "writeFile", FsWriteFile, 2, 0) ||
       !JS_DefineFunction(cx, fs, "appendFileSync", FsAppendFileSync, 2, 0) ||
+      !JS_DefineFunction(cx, fs, "appendFile", FsAppendFile, 2, 0) ||
       !JS_DefineFunction(cx, fs, "existsSync", FsExistsSync, 1, 0) ||
+      !JS_DefineFunction(cx, fs, "exists", FsExists, 1, 0) ||
       !JS_DefineFunction(cx, fs, "mkdirSync", FsMkdirSync, 1, 0) ||
+      !JS_DefineFunction(cx, fs, "mkdir", FsMkdir, 1, 0) ||
       !JS_DefineFunction(cx, fs, "rmSync", FsRmSync, 1, 0) ||
-      !JS_DefineFunction(cx, fs, "statSync", FsStatSync, 1, 0)) {
+      !JS_DefineFunction(cx, fs, "rm", FsRm, 1, 0) ||
+      !JS_DefineFunction(cx, fs, "statSync", FsStatSync, 1, 0) ||
+      !JS_DefineFunction(cx, fs, "stat", FsStat, 1, 0)) {
     return false;
   }
 
@@ -2311,6 +3343,362 @@ static bool RunFsSmokeTests(JSContext* cx) {
   return allOk;
 }
 
+//==============================================================================
+// Phase 7.5.5: async fs.* self-tests -- the formal `forge --self-test`
+// replacement for manual-test-fs-async.js (Phase 7.5.3/7.5.4's interim,
+// non-`--self-test` verification script; see that file's own header
+// comment for why it existed and what it covers). Fulfills FsAsync.md's
+// own Acceptance Criteria: "Promise-based self-tests should be required
+// before considering the phase complete."
+//
+// Structurally new relative to every self-test suite above:
+// RunMarshallingSmokeTests/RunFsSmokeTests never call Runtime::run() --
+// each case calls a binding function directly (or evaluates an
+// expression that completes synchronously) and inspects a Result<T> or a
+// thrown exception immediately afterward. An async fs.* call can only be
+// observed by actually letting the event loop run, so these tests instead
+// (a) evaluate a script that queues one or more Promise chains, (b) call
+// Runtime::run() to actually drive the loop to completion, and only then
+// (c) inspect what happened.
+//
+// Since native code can't itself await a JS Promise, each self-test case
+// ends its .then()/.catch() chain by calling a small native recording
+// function (AsyncSelfTestRecord below, bound to
+// globalThis.__asyncSelfTestRecord only for the duration of this suite --
+// not part of Fs.md's JS-visible surface, and not defined outside the
+// --self-test code path) with (name, passed, message). Results land in
+// g_asyncSelfTestResults, a plain Vector this function points at only
+// for the duration of each Evaluate()+run() cycle below -- same
+// "main-thread-only, no lifetime overlap with any worker thread" rule
+// every other JSAPI touch point in this file already follows, since
+// AsyncSelfTestRecord only ever runs as a Promise reaction callback
+// during jobQueue_.runJobs(cx_), never from a ThreadPool worker.
+//==============================================================================
+
+struct AsyncSelfTestResult {
+  forge::core::String name;
+  bool passed;
+  forge::core::String message;
+};
+
+// Set only around each Evaluate()+run() cycle inside RunFsAsyncSmokeTests
+// below; nullptr the rest of the time. Main-thread only, exactly like
+// every other JSAPI-adjacent piece of global state in this file.
+static forge::core::Vector<AsyncSelfTestResult>* g_asyncSelfTestResults = nullptr;
+
+// globalThis.__asyncSelfTestRecord(name, passed, message) -- called from
+// the JS side's .then()/.catch() handlers below, never directly by this
+// file's C++. Bound with JS_DefineFunction only inside
+// RunFsAsyncSmokeTests, so it's simply absent from any real script's
+// globalThis.
+static bool AsyncSelfTestRecord(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  if (!g_asyncSelfTestResults) {
+    // Only reachable if a script retained a reference to this function
+    // past the Evaluate()+run() cycle that installed it, and called it
+    // later -- not expected in practice, but a silent no-op is safer
+    // here than dereferencing a null pointer.
+    args.rval().setUndefined();
+    return true;
+  }
+
+  forge::core::Result<forge::core::String> name = ToForgeString(cx, args.get(0));
+  if (name.HasError()) {
+    return false;
+  }
+
+  const bool passed = JS::ToBoolean(args.get(1));
+
+  forge::core::Result<forge::core::String> message = ToForgeString(cx, args.get(2));
+  if (message.HasError()) {
+    return false;
+  }
+
+  forge::core::Result<void> pushed = g_asyncSelfTestResults->PushBack(AsyncSelfTestResult{
+      std::move(name.Value()), passed, std::move(message.Value())});
+
+  if (pushed.HasError()) {
+    JS_ReportErrorASCII(cx, "__asyncSelfTestRecord: out of memory recording result");
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+// Fixture for the Runtime::run() lifetime-isolation probe (Group B)
+// below: a file fs.readFile can succeed against, created directly
+// through forge-core (not fs.writeFileSync -- that's Phase 7.3's own
+// surface, deliberately not entangled with this fixture, same reasoning
+// as SelfTest_FsEnsureScratchDir above). Independent of whatever Group A
+// leaves behind, so Group B never depends on Group A having run first.
+static bool SelfTest_FsAsyncEnsureProbeFixture() {
+  forge::core::Result<forge::core::Path> path = forge::core::Path::Create(
+      forge::core::StringView("forge-selftest-fs-scratch/selftest-async-lifetime-probe.txt"));
+
+  if (path.HasError()) {
+    fprintf(stderr, "  FAIL fs async self-test probe fixture: Path::Create failed\n");
+    return false;
+  }
+
+  forge::core::Result<forge::core::File> file =
+      forge::core::File::Open(path.Value(), forge::core::FileMode::Write);
+
+  if (file.HasError()) {
+    fprintf(stderr, "  FAIL fs async self-test probe fixture: File::Open failed\n");
+    return false;
+  }
+
+  const char* contents = "lifetime-probe";
+  const forge::core::Result<void> written = WriteAllBytesNoThrow(
+      file.Value(),
+      forge::core::Span<const forge::core::u8>(
+          reinterpret_cast<const forge::core::u8*>(contents), strlen(contents)));
+
+  if (written.HasError()) {
+    fprintf(stderr, "  FAIL fs async self-test probe fixture: write failed\n");
+    return false;
+  }
+
+  return true;
+}
+
+// Group A: exercises all seven fs.* async methods specified in
+// FsAsync.md's Public API. The three fs.readFile cases are independent
+// of each other (and of everything below), so they fire concurrently,
+// same as manual-test-fs-async.js's own structure; the six Phase 7.5.4
+// methods are chained through .then() since each one's outcome depends
+// on the file state the previous step left behind (see
+// manual-test-fs-async.js's own comment for why concurrent calls over the
+// same path would be flaky here, deliberately out of FsAsync.md's
+// Non-Goals scope).
+static const char* kAsyncSelfTestChainScript = R"JS(
+(() => {
+  const record = (name, passed, message) => {
+    __asyncSelfTestRecord(name, !!passed, message === undefined ? "" : String(message));
+  };
+
+  const readPath = "forge-selftest-fs-scratch/selftest-async-read.txt";
+  const readContents = "phase 7.5.5 self-test";
+  fs.writeFileSync(readPath, readContents);
+
+  fs.readFile(readPath, "utf8").then(
+    (text) => record("fs.readFile(path, \"utf8\") resolves with correct text",
+                      text === readContents,
+                      "got " + JSON.stringify(text)),
+    (err) => record("fs.readFile(path, \"utf8\") resolves with correct text", false,
+                     "unexpectedly rejected: " + JSON.stringify(err))
+  );
+
+  fs.readFile(readPath).then(
+    (bytes) => record("fs.readFile(path) resolves with a Uint8Array of the right length",
+                       bytes instanceof Uint8Array && bytes.length === readContents.length,
+                       "got length " + (bytes && bytes.length)),
+    (err) => record("fs.readFile(path) resolves with a Uint8Array of the right length", false,
+                     "unexpectedly rejected: " + JSON.stringify(err))
+  );
+
+  fs.readFile("forge-selftest-fs-scratch/selftest-async-does-not-exist.txt").then(
+    () => record("fs.readFile rejects with .code === \"NotFound\" for a missing file", false,
+                  "unexpectedly resolved"),
+    (err) => record("fs.readFile rejects with .code === \"NotFound\" for a missing file",
+                     !!err && err.code === "NotFound",
+                     "got " + JSON.stringify(err))
+  );
+
+  const miscPath = "forge-selftest-fs-scratch/selftest-async-misc.txt";
+  const miscDir = "forge-selftest-fs-scratch/selftest-async-mkdir/nested";
+
+  fs.writeFile(miscPath, "first").then(() => {
+    record("fs.writeFile resolves and writes the expected content",
+           fs.existsSync(miscPath) && fs.readFileSync(miscPath, "utf8") === "first");
+    return fs.appendFile(miscPath, "-second");
+  }).then(() => {
+    record("fs.appendFile resolves and appends the expected content",
+           fs.readFileSync(miscPath, "utf8") === "first-second");
+    return fs.stat(miscPath);
+  }).then((stats) => {
+    const expectedSize = "first-second".length;
+    record("fs.stat resolves with the correct size",
+           !!stats && stats.size === expectedSize,
+           "got " + JSON.stringify(stats));
+    return fs.exists(miscPath);
+  }).then((existsResult) => {
+    record("fs.exists resolves true for a file that exists", existsResult === true);
+    return fs.rm(miscPath);
+  }).then(() => {
+    record("fs.rm resolves and the file is actually gone", !fs.existsSync(miscPath));
+    return fs.exists(miscPath);
+  }).then((existsResult) => {
+    record("fs.exists resolves false for a file that no longer exists", existsResult === false);
+    return fs.mkdir(miscDir, { recursive: true });
+  }).then(() => {
+    // Fs.md's Non-Goals rule out isDirectory()/directory-listing, so
+    // existsSync can't directly confirm a *directory* was created --
+    // instead, write a real file inside the new nested directory and
+    // confirm that succeeds, which is only possible if fs.mkdir
+    // (recursive) actually created it.
+    let placeholderWorked = false;
+    try {
+      fs.writeFileSync(miscDir + "/placeholder.txt", "x");
+      placeholderWorked = fs.existsSync(miscDir + "/placeholder.txt");
+    } catch (e) {
+      placeholderWorked = false;
+    }
+    record("fs.mkdir(recursive) resolves and the nested directory actually exists",
+           placeholderWorked);
+
+    // fs.mkdir on an already-existing directory, non-recursive, should
+    // reject with AlreadyExists -- mirrors mkdirSync's own documented
+    // non-idempotent case (Phase 7.3's SelfTest_FsMkdirSyncNonRecursive).
+    return fs.mkdir(miscDir).then(
+      () => record(
+          "fs.mkdir (non-recursive) on an existing directory rejects with AlreadyExists",
+          false, "unexpectedly resolved"),
+      (err) => record(
+          "fs.mkdir (non-recursive) on an existing directory rejects with AlreadyExists",
+          !!err && err.code === "AlreadyExists",
+          "got " + JSON.stringify(err))
+    );
+  }).then(() => {
+    record("fs.* chained misc sequence ran to completion without an uncaught rejection", true);
+  }).catch((err) => {
+    record("fs.* chained misc sequence ran to completion without an uncaught rejection",
+           false, "uncaught rejection: " + JSON.stringify(err));
+  });
+})();
+)JS";
+
+// Group B: the Runtime::run() event-loop-lifetime isolation probe. This
+// script's ONLY statement, once its body finishes running, is a single
+// fs.readFile(...).then(...) call -- no setTimeout/setInterval anywhere,
+// nothing else queued. This is the direct, isolated regression test for
+// the Phase 7.5.2 pendingAsyncOps_ fix: without it, Runtime::run() would
+// see an empty job queue and an empty IoLoop (no timers pending) and
+// return immediately, and this .then() callback would never fire -- so
+// g_asyncSelfTestResults would still be empty by the time
+// RunFsAsyncSmokeTests inspects it below. FsAsync.md's Design Goals
+// call this out explicitly as a required case, not just a byproduct of
+// the Group A chain above (which always has other pending work
+// alongside each individual async call, and so would not by itself catch
+// a regression here).
+static const char* kAsyncSelfTestLifetimeProbeScript = R"JS(
+(() => {
+  const record = (name, passed, message) => {
+    __asyncSelfTestRecord(name, !!passed, message === undefined ? "" : String(message));
+  };
+
+  const probePath = "forge-selftest-fs-scratch/selftest-async-lifetime-probe.txt";
+  fs.readFile(probePath, "utf8").then(
+    (text) => record("Runtime::run() waits for a lone in-flight fs.readFile (no timers)",
+                      text === "lifetime-probe",
+                      "got " + JSON.stringify(text)),
+    (err) => record("Runtime::run() waits for a lone in-flight fs.readFile (no timers)", false,
+                     "unexpectedly rejected: " + JSON.stringify(err))
+  );
+})();
+)JS";
+
+// Runs both groups above, printing each recorded case's PASS/FAIL with
+// the same "[self-test] %-40s %s\n" convention every other suite in this
+// file uses, and returns true only if every recorded case passed *and*
+// both scripts actually produced the number of results expected of them
+// (an uncaught exception during Evaluate(), or a chain that silently
+// stops partway through without ever reaching its own completion
+// record, would otherwise look identical to "zero failures" if this
+// function only checked the recorded cases' own `passed` fields).
+static bool RunFsAsyncSmokeTests(JSContext* cx, Runtime& runtime) {
+  if (!SelfTest_FsEnsureScratchDir()) {
+    printf("[self-test] %-40s %s\n", "fs async self-test scratch dir", "FAIL");
+    return false;
+  }
+
+  if (!SelfTest_FsAsyncEnsureProbeFixture()) {
+    printf("[self-test] %-40s %s\n", "fs async self-test probe fixture", "FAIL");
+    return false;
+  }
+
+  JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
+
+  if (!global || !JS_DefineFunction(cx, global, "__asyncSelfTestRecord",
+                                     AsyncSelfTestRecord, 3, 0)) {
+    printf("[self-test] %-40s %s\n", "fs async self-test setup", "FAIL");
+    return false;
+  }
+
+  bool allOk = true;
+
+  // --- Group A: the full chained sequence across all seven methods ---
+  {
+    forge::core::Vector<AsyncSelfTestResult> results;
+    g_asyncSelfTestResults = &results;
+
+    JS::RootedValue rval(cx);
+    const bool evaluated = EvaluateExpression(cx, kAsyncSelfTestChainScript, &rval);
+
+    if (!evaluated) {
+      ReportPendingException(cx, "fs async self-test (chained sequence)");
+      allOk = false;
+    } else {
+      runtime.run();
+    }
+
+    for (forge::core::Size i = 0; i < results.Size(); ++i) {
+      const AsyncSelfTestResult& r = results[i];
+      printf("[self-test] %-40s %s\n", r.name.CStr(), r.passed ? "PASS" : "FAIL");
+      if (!r.passed && r.message.Size() > 0) {
+        fprintf(stderr, "  detail: %s\n", r.message.CStr());
+      }
+      allOk = allOk && r.passed;
+    }
+
+    // Expect exactly 12 recorded cases (3 concurrent readFile cases + 9
+    // from the chained misc sequence, including its own completion
+    // marker) -- a different count means the chain didn't run the way
+    // this test expects, independent of whether any individual recorded
+    // case passed.
+    if (evaluated && results.Size() != 12) {
+      printf("[self-test] %-40s %s (expected 12 results, got %llu)\n",
+             "fs async self-test (chained sequence) produced all expected results",
+             "FAIL", static_cast<unsigned long long>(results.Size()));
+      allOk = false;
+    }
+
+    g_asyncSelfTestResults = nullptr;
+  }
+
+  // --- Group B: Runtime::run() event-loop-lifetime isolation probe ---
+  {
+    forge::core::Vector<AsyncSelfTestResult> results;
+    g_asyncSelfTestResults = &results;
+
+    JS::RootedValue rval(cx);
+    const bool evaluated = EvaluateExpression(cx, kAsyncSelfTestLifetimeProbeScript, &rval);
+
+    if (!evaluated) {
+      ReportPendingException(cx, "fs async self-test (lifetime probe)");
+      allOk = false;
+    } else {
+      runtime.run();
+    }
+
+    const bool probeRan = evaluated && results.Size() == 1 && results[0].passed;
+    printf("[self-test] %-40s %s\n",
+           "Runtime::run() waits for lone in-flight fs.readFile (no timers)",
+           probeRan ? "PASS" : "FAIL");
+
+    if (!probeRan && evaluated && !results.Empty() && results[0].message.Size() > 0) {
+      fprintf(stderr, "  detail: %s\n", results[0].message.CStr());
+    }
+
+    allOk = allOk && probeRan;
+    g_asyncSelfTestResults = nullptr;
+  }
+
+  return allOk;
+}
+
 int main(int argc, char* argv[]) {
       if (argc == 1) {
         printf("Forge JavaScript Runtime\n");
@@ -2391,10 +3779,10 @@ int main(int argc, char* argv[]) {
     JS::RootedObject global(
         cx, JS_NewGlobalObject(cx, &globalClass, nullptr, JS::FireOnNewGlobalHook,
                                options)); // JavaScript universe is born
-    JS::SetReservedSlot(global, RuntimeSlot, JS::PrivateValue(&runtime));
     if (!global) {
       return 1;
     }
+    JS::SetReservedSlot(global, RuntimeSlot, JS::PrivateValue(&runtime));
 
     {
       JSAutoRealm ar(cx, global); // JSAutoRealm enters that JavaScript world.
@@ -2434,7 +3822,15 @@ int main(int argc, char* argv[]) {
       if (command == "--self-test") {
         const bool marshallingOk = RunMarshallingSmokeTests(cx);
         const bool fsOk = RunFsSmokeTests(cx);
-        const bool ok = marshallingOk && fsOk;
+        // Phase 7.5.5: unlike the two suites above, this one calls
+        // runtime.run() (possibly more than once -- see its own comment)
+        // to actually drive the event loop, since that's the only way to
+        // observe a real async fs.* completion. Must run after fsOk above
+        // (not interleaved with it): both suites share the same scratch
+        // directory and some of RunFsSmokeTests' *Sync cases are not
+        // idempotent across ordering with this suite's own fixture setup.
+        const bool fsAsyncOk = RunFsAsyncSmokeTests(cx, runtime);
+        const bool ok = marshallingOk && fsOk && fsAsyncOk;
         printf("[self-test] %s\n", ok ? "ALL PASSED" : "FAILURES ABOVE");
         runtime.Shutdown();
         return ok ? 0 : 1;

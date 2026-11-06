@@ -13,11 +13,12 @@ SOURCES += [
     "forge.cpp",
 ]
 
-# ws2_32 backs every Winsock call Socket.cpp makes (socket/connect/bind/
-# listen/accept/send/recv/closesocket/WSAStartup/WSACleanup, plus the
-# WSAE*-prefixed error constants platform/Win32Error.cpp's
-# TranslateWinsockError depends on). Nothing before Phase 5 (Networking)
-# needed a networking import library, so this is new this phase.
+# Socket.cpp (Phase 5) links against Winsock's WSAStartup/socket/connect/
+# send/recv/etc. Socket.cpp also carries a `#pragma comment(lib,
+# "ws2_32.lib")` as a belt-and-suspenders convenience for anyone building
+# it in isolation (e.g. a standalone smoke-test project), but this
+# OS_LIBS entry is the actual, authoritative linker input for the real
+# mach build — don't rely on the pragma alone here.
 OS_LIBS += [
     "ws2_32",
 ]

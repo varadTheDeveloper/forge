@@ -23,12 +23,13 @@ surface first.
 
 ## Non-Goals
 
-- **Async I/O.** Deferred to Phase 7.5 (`ROADMAP.md`), gated on
-  `ThreadPool` being real-build-confirmed. Nothing in this spec should be
-  implemented in a way that blocks adding `fs.readFile`
-  (Promise-returning) later without a breaking change — the `*Sync`
-  naming convention from `JsBindings.md` exists specifically to reserve
-  the unsuffixed names for that.
+- **Async I/O.** Out of scope for *this* doc — `fs.readFile`/etc.
+  (Promise-returning) are specified in `FsAsync.md` (Phase 7.5, now
+  real-build-confirmed through 7.5.5; see `ROADMAP.md`/`HISTORY.md`), not
+  here. This doc's own `*Sync` methods are unchanged by that work — the
+  `*Sync` naming convention from `JsBindings.md` existed from the start
+  specifically to reserve the unsuffixed names for it, and no rename was
+  needed when it landed.
 - **Directory removal at all (recursive or not), glob patterns, a
   `force` flag.** `File::Remove`'s Win32 backend is `DeleteFileW` (per
   `File.md`'s Non-Goals list of implemented Win32 calls), which only
@@ -137,10 +138,13 @@ so every thrown `Error` from this module carries `.path` in addition to
 
 ## Thread Safety
 
-N/A — single-threaded event loop, same as every other JS-visible
-function in `forge.cpp` today. (Will need a real thread-safety note once
-Phase 7.5's async variants exist, since those will run their actual I/O
-on a `ThreadPool` worker.)
+N/A — single-threaded event loop, same as every other synchronous
+JS-visible function in `forge.cpp`. The Promise-returning counterparts
+this note used to forward-reference now exist and do run their actual
+I/O on a `ThreadPool` worker thread — see `FsAsync.md`'s own Thread
+Safety / Design Goals sections for that (materially more involved)
+story. Nothing here changed: every method in *this* doc still runs
+entirely on the main thread, start to finish.
 
 ## Dependencies
 
@@ -149,9 +153,10 @@ helpers (Phase 7.2).
 
 ## Extensibility
 
-- `fs.readFile`/`fs.writeFile`/etc. (Promise-returning, Phase 7.5):
-  reserved names per `JsBindings.md`'s `*Sync`-suffix convention: no
-  rename needed when these land.
+- `fs.readFile`/`fs.writeFile`/etc. (Promise-returning): landed as Phase
+  7.5, specified in `FsAsync.md` and now real-build-confirmed through
+  7.5.5. Used the bare names reserved by `JsBindings.md`'s `*Sync`-suffix
+  convention exactly as planned — no rename was needed.
 - `fs.readdirSync`/`fs.statSync`'s fuller shape/symlink support: each
   needs new `forge-core` capability first (see Non-Goals) — natural
   candidates for a later `forge-core` phase, not a rescoping of this doc.

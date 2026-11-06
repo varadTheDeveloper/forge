@@ -33,9 +33,12 @@ each inventing their own error/marshalling convention — see
   ever exist — only the ones a real binding actually surfaces need an
   entry; extend the table in "Error Handling Policy" as new codes are
   actually reached, rather than speculatively filling it in now.
-- Not committing to an async I/O story. Promise-based async is the
-  intended direction whenever `ThreadPool` is real-build-confirmed (see
-  `ROADMAP.md` Phase 7.5), but no async API is specified here.
+- Not committing to an async I/O story *in this doc*. Promise-based
+  async fs.* has since landed as Phase 7.5 (specified in `FsAsync.md`,
+  now real-build-confirmed through 7.5.5) — as a new, additive spec that
+  depends on this one without modifying it, per `FsAsync.md`'s own
+  Purpose section. This doc's own conventions (Error Handling Policy,
+  marshalling helpers, etc.) are unchanged by that work.
 - Not a `Buffer`-compatibility layer (Node's `Buffer` is a userspace
   subclass of `Uint8Array` with extra methods) — plain `Uint8Array`/
   `ArrayBuffer` only. A `Buffer`-like convenience type is future work if
@@ -183,8 +186,10 @@ logic. No new `forge-core` component required for this doc itself.
   applies).
 - Every namespace's synchronous methods use the `*Sync` suffix from the
   start, even before any async counterpart exists — reserves the
-  unsuffixed name (`fs.readFile`) for the future Promise-returning
-  version, avoiding a breaking rename later.
+  unsuffixed name (`fs.readFile`) for the Promise-returning version. This
+  played out exactly as intended for `fs`: Phase 7.5 (`FsAsync.md`) added
+  `fs.readFile`/etc. using the reserved bare names, with no rename of
+  `fs.readFileSync`/etc. needed.
 
 ## Extensibility
 

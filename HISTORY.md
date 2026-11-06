@@ -2039,3 +2039,1089 @@ again.
 **Status: Phase 7.1, 7.2, and 7.3 are all now fully real-build-confirmed.
 Phase 7.4 (benchmarks, starting with `bench/fs-bench.js` run through the
 existing `run-benchmarks.ps1` harness) is next.**
+
+## Phase 4 (Threading) resumed: moz.build fix re-confirmed, two latent smoke-test bugs caught (2026-07-30)
+
+With Phase 7 fully done, the user chose Phase 4 (real-build-confirming
+`Mutex`/`ConditionVariable`/`Thread`/`ThreadPool`) as the next milestone
+over Phase 5 (Networking) — Phase 4 is earlier in `ROADMAP.md`'s own
+ordering, is pure verification debt (no new code needed), and unblocks
+both Phase 7.5 (async `fs`, gated on `ThreadPool`) and any future
+worker-thread JS bindings, more than Phase 5 would unblock on its own.
+
+Before asking for another real `mach build`, re-checked what was
+actually already true on disk rather than trusting the existing
+`ROADMAP.md` prose at face value:
+
+- Re-read the live `moz.build` directly off the device and confirmed
+  programmatically (`sorted(sources, key=str.lower)` in a throwaway
+  script, not by eye) that its current `SOURCES` list already matches
+  case-insensitive sorted order — the fix recorded in the "`moz.build`
+  SOURCES ordering bug" entry above is genuinely in place, not merely
+  described. This is a different situation from the
+  `Forge_Benchmark_Report.md` discrepancy found in Phase 7.4 — here, the
+  doc's claim checked out.
+- Listed `forge-core/` recursively off the device and confirmed
+  `ThreadingSmokeTest.cpp`, `Mutex.cpp`/`.h`, `ConditionVariable.cpp`/
+  `.h`, `Thread.cpp`/`.h`/`.inl`, `ThreadPool.cpp`/`.h`/`.inl`, and
+  `platform/Win32Error.cpp`/`.h` all exist as described.
+
+While reading `ThreadingSmokeTest.cpp` and (for comparison)
+`FileSmokeTest.cpp` to confirm the exact build command to hand back to
+the user, found a real latent bug in both files' own header-comment `cl`
+build commands, never previously exercised (neither smoke test has
+actually been built on the real machine yet): each command mixes
+unprefixed paths (e.g. `Mutex.cpp`, `File.cpp`, `platform\Win32Error.cpp`
+— correct only if invoked from within `forge-core\`, where both smoke
+test files themselves live) with a redundant `forge-core\`-prefixed path
+for `memory\DefaultAllocator.cpp`/`memory\detail\AllocationBackend.cpp`
+in that same command line. Run verbatim from `forge-core\` — the natural
+reading, since every other path in the same line has no directory
+prefix — the two `DefaultAllocator`/`AllocationBackend` paths would
+have resolved to `forge-core\forge-core\memory\...`, a file-not-found
+error. Fixed both comments to drop the redundant prefix, matching every
+other path in the same command. `SocketSmokeTest.cpp`'s build comment
+has the identical bug; left untouched since Phase 5 isn't in scope this
+round, but noted in `ROADMAP.md` so it isn't a surprise whenever that
+phase is picked up.
+
+No production code changed in this entry — `Mutex.cpp`/
+`ConditionVariable.cpp`/`Thread.cpp`/`ThreadPool.cpp`/`Win32Error.cpp`/
+`moz.build` are exactly as they were when Phase 4 was last touched. Only
+`ThreadingSmokeTest.cpp`'s and `FileSmokeTest.cpp`'s header comments
+changed.
+
+**Status: nothing here is real-build-confirmed yet — this entry is
+re-verification-of-claims plus a doc-comment fix, not new evidence about
+`Mutex`/`ConditionVariable`/`Thread`/`ThreadPool` themselves.** Two real
+steps remain, both on the user's real machine: (1) `python mach build`,
+the first real attempt against the now-believed-correct `moz.build`
+order; (2) build and run `ThreadingSmokeTest.cpp` per its corrected
+comment, from within `forge-core\`. See `ROADMAP.md`'s Phase 4 entry for
+the exact commands and expected output. Phase 4 stays open until both
+are reported back.
+
+## Phase 4: real MSVC compile of production sources succeeds; a real MSVC-specific bug in ThreadingSmokeTest.cpp caught and fixed (2026-07-30)
+
+The user ran the corrected `cl` command from the previous entry, from
+`forge-core\` in a Visual Studio Developer PowerShell. All seven
+production sources it references — `Mutex.cpp`, `ConditionVariable.cpp`,
+`Thread.cpp`, `ThreadPool.cpp`, `platform\Win32Error.cpp`,
+`memory\DefaultAllocator.cpp`, `memory\detail\AllocationBackend.cpp` —
+compiled clean under `/std:c++17 /EHs- /W4` against the real
+`<windows.h>`. This is genuinely new evidence, distinct from anything
+recorded earlier in this file: every prior verification pass for these
+five Win32-backed files (`Mutex`/`ConditionVariable`/`Thread`/
+`ThreadPool`/`Win32Error`) used a hand-written mock `<windows.h>`,
+which can catch typos and signature mismatches but proves nothing about
+whether the code is actually correct against the real SDK. This compile
+is the first time that's been checked for real.
+
+Only `ThreadingSmokeTest.cpp` itself failed:
+
+```
+ThreadingSmokeTest.cpp(67): error C3493:
+'kIterations' cannot be implicitly captured because no default capture mode has been specified
+```
+
+Root cause: `RunMutexStressTest`'s worker lambda —
+`[&mutex, &counter]() { for (int j = 0; j < kIterations; ++j) ... }` —
+reads the enclosing `constexpr int kIterations` without capturing it.
+Per the C++17 standard, a `constexpr` local that's only read (never
+odr-used — no reference or address taken) doesn't need to appear in a
+lambda's capture list, and that's exactly why this compiled clean under
+g++ and clang++ in every sandbox pass this session. MSVC's frontend
+doesn't extend that exemption the same way and requires the capture
+regardless — a real, compiler-specific portability gap, not a logic bug
+in the test itself. Fixed by adding `kIterations` to the capture list:
+`[&mutex, &counter, kIterations]`. Reviewed every other lambda in the
+file for the same pattern (`RunConditionVariableProducerConsumerTest`'s
+`[&]()`, `RunThreadPoolTest`'s `[&mutex, &completed]()` and `[]() {}`) —
+none of the others reference an uncaptured local, so this was the only
+instance.
+
+Since the smoke test failed to compile, linking never completed and
+`ThreadingSmokeTest.exe` was never produced — none of the real-thread
+behavior (`Mutex` mutual exclusion, `ConditionVariable` handoff/timeout,
+`ThreadPool` task racing) has been exercised yet. That's still the
+single biggest remaining unknown for this phase.
+
+**Status:** production Win32 threading code compiling clean against the
+real `<windows.h>` under a real compiler is real progress, but it is not
+the same claim as "`python mach build` succeeded" — the manual `cl`
+invocation bypasses `moz.build` entirely, so it says nothing about
+whether the case-insensitive `SOURCES` sort fix actually lets `mach
+build`'s own frontend parse the file and proceed to compilation, which
+is what this project has consistently meant by "real-build-confirmed"
+for every other phase. The user's message describing this round didn't
+mention running `python mach build` itself, so that is being treated as
+still open, not assumed — asked directly rather than guessed at. Two
+things remain: rebuild and run `ThreadingSmokeTest.cpp` with the capture
+fix (same command as before), and run `python mach build`. Phase 4 stays
+open until both are reported.
+
+## `ThreadingSmokeTest.cpp` passes against real OS threads (2026-07-30)
+
+The user rebuilt `ThreadingSmokeTest.cpp` with the `kIterations`-capture
+fix from the previous entry — clean compile, no errors this time — and
+ran the resulting `.exe`. Output:
+
+```
+RunMutexStressTest...
+RunConditionVariableProducerConsumerTest...
+RunConditionVariableTimeoutTest...
+RunThreadPoolTest...
+ThreadingSmokeTest: all checks passed
+```
+
+All four scenarios passed against real OS threads:
+
+- `RunMutexStressTest`: 8 threads × 20,000 increments each under a
+  single `Mutex`, final count came out exactly `160000` — real mutual
+  exclusion under actual OS scheduling, not a lucky race (this test is
+  specifically designed to reliably fail without correct locking).
+- `RunConditionVariableProducerConsumerTest`: the producer/consumer
+  handoff completed correctly (`payload == 42`, `ready == true` after
+  the consumer thread woke from `Wait()`).
+- `RunConditionVariableTimeoutTest`: `WaitFor` correctly returned
+  `false` after actually timing out with nobody notifying.
+- `RunThreadPoolTest`: all 500 submitted tasks across 4 real worker
+  threads completed exactly once each, and `Submit()` after `Shutdown()`
+  correctly failed rather than crashing or silently succeeding.
+
+This is the real-thread evidence that no sandbox verification could ever
+provide (the mock `CreateThread` used throughout this project's earlier
+sandbox passes is a dumb stub that can't exercise real scheduling,
+blocking, or waking). Combined with the previous entry's real MSVC
+compile of the production sources against the real `<windows.h>`, every
+piece of Phase 4's Win32-backed code now has real evidence behind it
+except one: `python mach build` itself, through Gecko's own build
+integration, still hasn't been run. The user has said they'll run it
+next.
+
+**Status: not yet marking Phase 4 real-build-confirmed.** Per this
+project's own consistent standard (every other phase's
+"real-build-confirmed" label has specifically meant `mach build`
+succeeded, not a standalone `cl` compile), this label is being held
+until that result is reported — even though the smoke test result above
+is itself very strong evidence the underlying implementation is
+correct. Will update `ROADMAP.md`/`HISTORY.md`/`PROJECT_CONTEXT.md` to
+close this out the moment `mach build`'s result comes back.
+
+## Phase 4 fully real-build-confirmed: `python mach build` succeeds (2026-07-30)
+
+The user ran `python mach build` after the `ThreadingSmokeTest.cpp`
+capture fix, and it completed successfully. This is the piece that had
+been deliberately held open across the last three entries: the manual
+`cl` compile and the smoke test run both bypass `moz.build`, so neither
+one could confirm the case-insensitive `SOURCES` sort fix (from the
+"`moz.build` SOURCES ordering bug" entry) actually resolves the parse
+failure and lets `mach build`'s own frontend proceed to compiling
+`Mutex.cpp`/`ConditionVariable.cpp`/`Thread.cpp`/`ThreadPool.cpp`/
+`platform/Win32Error.cpp` for real. It now has.
+
+Phase 4 is complete across all three legs of verification, together:
+
+1. `python mach build` — real Gecko/`moz.build` toolchain integration,
+   now confirmed.
+2. A standalone MSVC `cl` compile of the same five files against the
+   real `<windows.h>` (not a mock) — confirms the Win32 API usage
+   itself.
+3. `ThreadingSmokeTest.cpp` (rebuilt, run) — confirms real-thread
+   behavior: mutual exclusion under real contention, condition-variable
+   wait/notify/timeout, and a thread pool running every task exactly
+   once and correctly rejecting work post-shutdown.
+
+No design deviation was needed anywhere in this phase. The two real bugs
+this phase's rewind uncovered — the friend-access mistake in an early
+`ConditionVariable.cpp` draft, and the rollback-path deadlock risk in
+`ThreadPool::Initialize` (both from the original Phase 4 implementation
+entry) — are both confirmed fixed by the smoke test passing cleanly
+(the mutex/condition-variable/thread-pool logic those fixes touch is
+exactly what `ThreadingSmokeTest.cpp` exercises). The `moz.build`
+sort-order bug and the `ThreadingSmokeTest.cpp` MSVC capture bug are
+also both confirmed fixed, now that the commands that originally failed
+on each have both succeeded.
+
+**Status: Phase 4 — `Mutex`, `ConditionVariable`, `Thread`, `ThreadPool`,
+`ErasedCallable`, `LockGuard<T>` — is fully real-build-confirmed. No
+sandbox-only claim remains anywhere in this phase.** Per the user's own
+stated priority this round (real-build debt before new feature work),
+the two oldest pieces of unresolved verification debt in the project are
+now both addressed: Phase 3 (`File`) and Phase 4 (`Threading`) are both
+fully real-build-confirmed, alongside Phase 6 and Phase 7 from earlier
+this session. Only Phase 5 (Networking — `Socket.cpp` still not even in
+`moz.build`) remains as real-build debt from before Phase 6.
+
+## Phase 5 (Networking) resumed: `moz.build` wiring completed, two more real bugs caught in `SocketSmokeTest.cpp` (2026-07-30)
+
+With Phase 4 fully closed, the user asked to continue finishing real-
+build verification debt (over starting new feature work) — Phase 5 is
+the only phase left with any. Before touching anything, re-confirmed
+what was actually true on disk rather than trusting `ROADMAP.md`'s prior
+"not started" note at face value: `Socket.cpp`/`Socket.h`,
+`IpAddress.h`/`.inl`, `Socket.md`/`IpAddress.md`, and `SocketSmokeTest.cpp`
+all exist and were read in full. The implementation itself held up under
+review — `Socket.cpp`'s Winsock usage (`WSAStartup`/`socket`/`connect`/
+`bind`/`listen`/`accept`/`send`/`recv`/`closesocket`, all through
+`TranslateWinsockError`) matches `Socket.md`'s frozen spec exactly, and
+`platform/Win32Error.h`/`.cpp` already had `TranslateWinsockError`
+implemented (added alongside `Socket.cpp` originally, per its own doc
+comment), so no dependency was missing there.
+
+Two concrete gaps found and fixed:
+
+1. **`Socket.cpp` was never in `moz.build`'s `SOURCES`.** Added it, in
+   the correct case-insensitive sorted position (verified
+   programmatically, same as the Phase 4 sort fix): between
+   `platform/Win32Error.cpp` and `Thread.cpp`.
+2. **No `OS_LIBS` entry for `ws2_32` existed either**, even though
+   `Socket.cpp`'s own comment already assumed one would be added
+   "alongside this file" — it never was. Without it, the real `mach
+   build`'s link step could plausibly fail with unresolved externals for
+   `WSAStartup`/`socket`/etc., a different and later failure mode than
+   the missing-`SOURCES`-entry problem, and not something the file's own
+   `#pragma comment(lib, "ws2_32.lib")` could be relied on alone to fix
+   inside Gecko's own build wrapper. Added `OS_LIBS += ["ws2_32"]`.
+
+While preparing `SocketSmokeTest.cpp`'s build instructions (it has never
+been run, same situation `ThreadingSmokeTest.cpp` was in before this
+session), found two more real, previously-uncaught bugs:
+
+- **The identical MSVC lambda-capture bug just fixed in
+  `ThreadingSmokeTest.cpp`.** `RunSocketEchoTest`'s server-thread lambda
+  reads `constexpr Size kPayloadSize` (an array bound, and a `Span`
+  argument passed by value — confirmed by reading `Span`'s constructor
+  signature, which takes `SizeType` by value, so this is a pure read, not
+  an odr-use) without capturing it. Same GCC/Clang-exempts-it,
+  MSVC-doesn't situation as before. Fixed by adding `kPayloadSize` to the
+  capture list.
+- **A real bug in the file's own example build command**: it listed
+  `IpAddress.inl` as a source file to compile directly, alongside
+  `Socket.cpp`. Every other `.inl` in this codebase (`Path.inl`,
+  `Queue.inl`, etc.) is `#include`d by its own header — `IpAddress.h`
+  does this at its own end — not compiled as an independent translation
+  unit; `IpAddress.inl`'s member-function definitions reference
+  `IpAddress`/`Endpoint`, which don't exist yet at that point unless
+  `IpAddress.h` has already been processed. Compiling it standalone would
+  have failed with undeclared-identifier errors, wasting the user's time
+  on a spurious compile failure unrelated to `Socket`/`Mutex`/`Thread`
+  themselves. Removed it from the command — `Socket.cpp`'s own
+  `#include "IpAddress.h"` already provides everything needed. Also fixed
+  the same redundant `forge-core\`-prefix path bug found in
+  `ThreadingSmokeTest.cpp`/`FileSmokeTest.cpp` in the same pass.
+
+No production `Socket.cpp`/`Socket.h`/`IpAddress.h`/`IpAddress.inl` code
+changed in this entry — only `moz.build` and `SocketSmokeTest.cpp`'s
+header comment and one lambda's capture list.
+
+**Status: Phase 5 is not yet real-build-confirmed — this entry is
+wiring plus bug-fixing, not new evidence that `Socket` itself works
+against a real TCP stack.** Two real steps remain, both on the user's
+machine: (1) `python mach build`, the first real attempt at compiling
+`Socket.cpp` through the now-corrected `moz.build`; (2) build and run
+`SocketSmokeTest.cpp` per its corrected comment, from `forge-core\`. See
+`ROADMAP.md`'s Phase 5 entry for exact commands and expected output.
+
+## Real MSVC compile of Socket.cpp succeeds; the `kPayloadSize` fix from the previous entry was itself wrong, now corrected (2026-07-30)
+
+The user ran the corrected `cl` command. All seven production sources —
+`Socket.cpp`, `Mutex.cpp`, `ConditionVariable.cpp`, `Thread.cpp`,
+`platform/Win32Error.cpp`, `memory/DefaultAllocator.cpp`,
+`memory/detail/AllocationBackend.cpp` — compiled clean, including
+`Socket.cpp` against the real `<winsock2.h>`/`<ws2tcpip.h>` for the first
+time ever (every prior pass used a hand-written mock). Real, new
+evidence, same category as the equivalent Phase 4 milestone.
+
+`SocketSmokeTest.cpp` itself failed:
+
+```
+SocketSmokeTest.cpp(142): error C2131: expression did not evaluate to a constant
+note: failure was caused by reading a value that is unknown during constant evaluation
+```
+
+This is a direct consequence of the previous entry's own fix being
+incomplete — actually wrong in a subtler way. Adding `kPayloadSize` to
+the lambda's capture list *did* satisfy MSVC's stricter odr-use rule
+(matching `ThreadingSmokeTest.cpp`'s `kIterations` fix), but it also
+changed what the name `kPayloadSize` refers to *inside* the lambda body:
+once a variable is captured, every use of its name inside the lambda
+denotes the closure type's own copied data member, not the original
+enclosing `constexpr`. That member is an ordinary runtime value, not a
+compile-time constant — so `u8 received[kPayloadSize]{}` (line 142, an
+array bound, which must be a real constant expression) stopped
+compiling, even though the exact same name compiled fine as a loop bound
+in `ThreadingSmokeTest.cpp` (a for-loop condition doesn't require a
+constant expression at all, only a value). Reading a value copied from a
+constexpr is not the same as reading the constexpr itself once a
+capture is involved — a real, subtle distinction neither GCC nor Clang's
+sandbox pass could have surfaced (they don't even require capturing a
+read-only `constexpr` in the first place, so the question of what its
+name resolves to *after* capturing never came up there).
+
+**Fix:** stopped treating this as a capture problem at all. Moved
+`kPayloadSize` out of `RunSocketEchoTest` (a local) to file scope inside
+the anonymous namespace (a `constexpr Size kPayloadSize = 5;` alongside
+`g_failures`). A file-scope constant is never a "local variable of an
+enclosing function" in the first place, so no lambda anywhere in the
+file needs to capture it, and every use — array bound or plain value —
+refers to the same genuine constant expression, with no capture-vs-
+original-entity ambiguity possible. Removed `kPayloadSize` from the
+lambda's capture list (now just `[listenerSocket = ..., &serverOk]`) and
+removed the now-redundant local declaration.
+
+No other lambda or lambda-adjacent constant use in this file follows the
+same pattern (verified by re-reading the whole file end to end again).
+
+**Status: still not real-build-confirmed.** Two real steps remain,
+unchanged from the previous entry: rebuild `SocketSmokeTest.cpp` with
+this fix and run the resulting `.exe`, and run `python mach build`. The
+user has not yet reported either succeeding with this fix in place.
+
+## Phase 5 fully real-build-confirmed: `SocketSmokeTest.cpp` passes, `python mach build` succeeds (2026-07-30)
+
+The user rebuilt `SocketSmokeTest.cpp` with the file-scope
+`kPayloadSize` fix — clean compile, no errors — and ran the resulting
+`.exe`:
+
+```
+RunSocketEchoTest...
+RunSocketConnectRefusedTest...
+SocketSmokeTest: all checks passed
+```
+
+`RunSocketEchoTest` exercised a real loopback TCP connection end to end:
+`Socket::Listen` on `127.0.0.1:53421`, a background `Thread` calling
+`Accept()`, the main thread as client calling `Connect()`, a 5-byte
+payload sent and echoed back, and the echoed bytes verified byte-for-
+byte against the original — real `Connect`/`Listen`/`Accept`/`Send`/
+`Receive`/`Close` behavior against an actual OS TCP stack, not a mock.
+`RunSocketConnectRefusedTest` confirmed `Connect()` to a port nothing is
+listening on fails cleanly as a `Result` error rather than crashing or
+hanging.
+
+Separately, the user ran `python mach build` and it completed
+successfully — the first time `Socket.cpp` has been compiled and linked
+through Gecko's own toolchain integration, confirming both the
+`SOURCES` addition and the new `ws2_32` `OS_LIBS` entry from earlier in
+this phase actually resolve correctly at link time (the concern that
+entry was specifically added to address).
+
+Phase 5 is complete across all three legs of verification, together:
+
+1. `python mach build` — real Gecko/`moz.build` toolchain integration,
+   including linking against `ws2_32`, now confirmed.
+2. A standalone MSVC `cl` compile of the same production sources against
+   the real `<winsock2.h>`/`<ws2tcpip.h>` (not a mock).
+3. `SocketSmokeTest.cpp` (rebuilt, run) — confirms real network
+   behavior: an actual loopback TCP connection, byte-accurate echo, and
+   a real connection-refused failure path.
+
+No design deviation was needed anywhere in this phase — `Socket.cpp`'s
+implementation matched `Socket.md`'s frozen spec exactly on first real
+compile. The three real issues this phase's resumption surfaced (the
+missing `SOURCES` entry, the missing `OS_LIBS` entry, and
+`SocketSmokeTest.cpp`'s two bugs — the `IpAddress.inl` build-command
+error and the `kPayloadSize` capture/file-scope issue) are all confirmed
+fixed by this pass succeeding cleanly.
+
+**Status: Phase 5 — `Socket`, `IpAddress` — is fully real-build-
+confirmed. No sandbox-only claim remains anywhere in this phase.** With
+Phase 3, 4, and 5 now all fully real-build-confirmed alongside Phase 6
+and 7 from earlier this session, every phase in this project's history
+has real-build evidence behind it — no outstanding real-build debt
+remains anywhere in `ROADMAP.md` as of this entry.
+
+## Phase 7.5 (Async fs) chosen as next milestone; design frozen (2026-08-02)
+
+With Phases 1-7 all fully real-build-confirmed, the user asked to move
+to new functionality and requested a review of roadmap options before
+committing to one, explicitly deferring the `promise-chain-bench.js`
+performance gap as a separate profiling task for later (real profiling
+data, not guessing). Four candidates were presented: async `fs` (Phase
+7.5), `net.*` JS bindings, worker-thread bindings, and a minimal module
+system. The user chose async `fs`, then explicitly reiterated the
+project's established per-phase workflow for it: freeze the design,
+implement incrementally, verify each milestone with `python mach build`,
+add self-tests, benchmark and update docs — the same shape Phase 7 itself
+followed (7.1 design freeze, 7.2/7.3 implementation, 7.4 benchmarks).
+
+`FsAsync.md` was written as the frozen-candidate design spec, following
+`JsBindings.md`/`Fs.md`'s established section shape, grounded in direct
+reads of `IocpLoop.h`, `ThreadPool.h`, `forge.cpp`'s `Runtime` class, and
+`IocpSmokeTest.cpp` rather than assumption. Three previously-unflagged
+risks came directly out of that grounding, not out of the abstract spec
+shape:
+
+1. **`Runtime::run()`'s event-loop exit condition
+   (`jobQueue_.empty() && loop_.Empty()`) has a real, pre-existing gap.**
+   A script whose only pending work is an in-flight
+   `fs.readFile(...).then(...)`, with no timer also pending, would see the
+   process exit before the read ever completes — `IocpLoop::Empty()`'s
+   own doc comment had already predicted exactly this ("a future async
+   ... variant... will need to add an active-operation count"). The fix
+   is scoped to `Runtime` itself (a pending-operation counter,
+   `forge.cpp`), not `IocpLoop` (frozen, real-build-confirmed).
+2. **Cross-thread `PostCompletion` has never actually been tested.**
+   `IocpSmokeTest.cpp`'s only real-machine evidence for `PostCompletion`
+   is a same-thread post-then-immediately-`RunOnce()` pattern. Nothing has
+   ever exercised the genuine cross-thread case (one thread blocked inside
+   `RunOnce()`'s wait while a different thread posts) that this phase
+   fundamentally depends on. Flagged as the single biggest open technical
+   risk, with a dedicated real-machine smoke test required before
+   anything else in this phase is built on top of the assumption that it
+   works — this project's established bar (`File`, `Mutex`/
+   `ConditionVariable`, `Socket` all needed their own real-machine smoke
+   test despite being equally well-documented Win32 APIs) doesn't get
+   quietly lowered here just because Microsoft's own docs say it should
+   work.
+3. **Native `JS::Promise` construction/resolution is new binding
+   surface.** Confirmed via grep that no `JS::NewPromiseObject`/
+   `ResolvePromise`/`RejectPromise` call exists anywhere in this codebase
+   yet — every existing use of `Promise` (e.g. `promise-chain-bench.js`)
+   is pure script calling the engine's own built-in `Promise`.
+
+Also settled: write/append data must be **copied** into an owned buffer
+before dispatch, never aliased across the thread boundary (the existing
+sync-path `AsByteSpan`/`ResolveWriteData` contract is only valid "for the
+duration of the call"); the returned `Promise` must be GC-rooted
+independent of whether script retains a reference to it; and the existing
+self-test harness (Phase 7.2/7.3's `RunFsSmokeTests`, which calls binding
+functions directly and inspects a `Result<T>` synchronously) cannot cover
+this phase as-is — Promise-based self-tests need `Runtime::run()` to
+actually drive the event loop to completion, flagged as an
+implementation-stage question rather than assumed solvable by reusing the
+existing harness unchanged.
+
+The user reviewed `FsAsync.md` and explicitly confirmed all of the above
+as the phase's committed design, with no remaining unresolved questions.
+**Design frozen 2026-08-02.** Nothing was implemented before the freeze.
+
+## Phase 7.5.1: cross-thread `PostCompletion` smoke test written (2026-08-02)
+
+Per the frozen design's own call-out that the cross-thread `PostCompletion`
+pattern is this phase's single biggest open risk, that risk is addressed
+first, before any of the actual worker-dispatch/`Promise`-settlement
+machinery is built on top of the assumption that it works.
+`IocpCrossThreadSmokeTest.cpp` (new file, same "separate console-app
+project, not part of `moz.build`" pattern as every other `*SmokeTest.cpp`
+in this codebase): initializes a real `IocpLoop`, schedules a 5-second
+non-repeating safety-net timer (so a genuine failure of the cross-thread
+pattern produces a bounded-time, clearly-reported FAILURE rather than an
+indefinite hang if it doesn't work), spawns a real `Thread` (Phase 4) that
+sleeps 200ms and then calls `PostCompletion` from that thread, while the
+main thread calls `RunOnce()` with nothing already posted — so it
+genuinely blocks inside `GetQueuedCompletionStatus`'s wait, the exact
+cross-thread pattern `IocpSmokeTest.cpp` never covered.
+
+One subtlety worth recording: the worker thread's `PostCompletion` call is
+followed, in the lambda, by a check of its own result — but that check
+must not touch the shared, non-atomic `g_failures` the `CHECK` macro
+mutates, since nothing synchronizes "worker calls `PostCompletion`" with
+"worker's very next statement" the way IOCP's own completion handoff
+synchronizes the `PostCompletion` call itself with `RunOnce()` waking up
+on the main thread — only `Thread::Join()` afterward provides that
+synchronization. The test instead records the outcome in a plain
+`workerPostFailed` bool, read on the main thread only after `Join()`.
+
+**Not yet real-machine-confirmed.** This needs to be built and run on the
+real machine, same as every other smoke test in this codebase, before
+7.5.2 (the `Runtime` pending-operation counter) or 7.5.3 (the actual
+per-operation dispatch/`Promise` machinery) can start.
+
+## Phase 7.5.1 real-machine-confirmed: cross-thread `PostCompletion` works (2026-08-02)
+
+The user built `IocpCrossThreadSmokeTest.cpp` on the real machine. The
+first attempt, using this file's own documented `cl` command verbatim,
+failed at link time with unresolved `IocpLoop::*`/`TimerScheduler::*`
+symbols — a real gap in the build comment, not a code bug: `IoLoop.h`
+only pulls in `IocpLoop`'s (and transitively `TimerScheduler`'s)
+declarations, the same way every other header in this codebase separates
+declaration from definition, so the two `.cpp` files providing those
+definitions (`forge-core/platform/IocpLoop.cpp` and
+`forge-core/platform/TimerScheduler.cpp`) needed to be listed alongside
+`Thread.cpp` and the rest — they weren't. Fixed by adding both to the
+documented build command.
+
+With that fix, the build succeeded and the test passed:
+
+```
+IocpCrossThreadSmokeTest: loop initialized
+IocpCrossThreadSmokeTest: worker thread posting completion after delay...
+IocpCrossThreadSmokeTest: RunOnce() woke up (bytes=99, key=7, ok=1)
+IocpCrossThreadSmokeTest: all checks passed
+```
+
+The 5-second safety-net timer did not fire — `RunOnce()` was woken
+directly by the worker thread's cross-thread `PostCompletion` call, the
+exact pattern under test. This is real, on-the-metal confirmation that
+IOCP's documented cross-thread wakeup behavior holds on this machine, not
+just Microsoft's own documentation being taken on faith — matching the
+bar this project has held every other well-documented Win32 API to
+(`File`, `Mutex`/`ConditionVariable`, `Socket`).
+
+**Status: Phase 7.5's single biggest open technical risk, as identified
+in `FsAsync.md`'s Design Goals, is now closed.** 7.5.2 (the `Runtime`
+pending-operation counter and event-loop lifetime fix) can begin.
+
+## Phase 7.5.2: `Runtime` pending-operation counter + event-loop lifetime fix implemented (2026-08-02)
+
+Adds the `pendingAsyncOps_` counter and `OnAsyncOperationStarted()`/
+`OnAsyncOperationFinished()` methods to `Runtime` (`forge.cpp`), and
+extends `run()`'s exit condition from `jobQueue_.empty() &&
+loop_.Empty()` to `jobQueue_.empty() && loop_.Empty() &&
+pendingAsyncOps_ == 0` — the fix `FsAsync.md`'s Design Goals called for,
+closing the gap `IocpLoop::Empty()`'s own doc comment had already
+predicted ("a future async... variant... will need to add an
+active-operation count"). `IocpLoop.h`/`.cpp` are untouched, matching the
+design's Dependencies section (`IocpLoop`'s public API stays frozen; the
+bookkeeping lives on `Runtime` instead, which `Empty()`'s own comment
+already deferred to the caller).
+
+`OnAsyncOperationFinished()` asserts (via `FORGE_ASSERT`, newly included
+from `forge-core/Assert.h`) that the counter is nonzero before
+decrementing, rather than silently wrapping/clamping on a mismatched
+Started()/Finished() pair — matching the same "loud failure over silent
+misbehavior" convention `Thread.h`'s `Joinable()`/destructor contract
+already uses elsewhere in this codebase.
+
+Worth being explicit about: **this change cannot alter any existing
+behavior yet, by construction.** Nothing in the codebase calls
+`OnAsyncOperationStarted()` anywhere until 7.5.3 gives it a real caller,
+so `pendingAsyncOps_` is provably always `0` today, and the new
+`&& pendingAsyncOps_ == 0` term in `run()`'s exit condition is therefore
+always true — every existing script's behavior, and the full
+`forge --self-test` suite, should be bit-for-bit unchanged. This is
+deliberately used as the milestone's own verification story instead of
+writing a synthetic "manually toggle the counter" test that would just
+have to be deleted again the moment 7.5.3 gives the counter a genuine
+caller: a real `python mach build` succeeding, plus `forge --self-test`
+still printing `[self-test] ALL PASSED` across all 29 cases unchanged,
+is sufficient to confirm this addition compiles cleanly and introduces
+no regression.
+
+## Phase 7.5.2 real-build-confirmed (2026-08-02)
+
+The user ran `python mach build` (successful) and `forge --self-test`
+(`[self-test] ALL PASSED`, all 29 cases, unchanged from before this
+milestone) — exactly the "provably inert" outcome this milestone's own
+entry predicted, since nothing calls `OnAsyncOperationStarted()` yet.
+
+**Status: Phase 7.5.2 — the `Runtime` pending-operation counter and
+`run()`'s event-loop lifetime fix — is real-build-confirmed.** 7.5.3 (the
+per-operation bookkeeping struct, the first native `JS::Promise`
+creation/resolution, and `fs.readFile` implemented end to end as the
+first proof-of-concept method) can start.
+
+## Phase 7.5.3: `fs.readFile` implemented, first native `JS::Promise` use in this codebase (2026-08-02)
+
+Since nothing in this codebase had ever called `JS::NewPromiseObject`/
+`ResolvePromise`/`RejectPromise` before, and this project's own standard
+(set by Phase 7.2's `JS_NewPlainObject` precedent) is to read the real
+declaration rather than reconstruct one from memory or training data,
+the actual `js/public/Promise.h` was fetched directly from
+`mozilla/gecko-dev` on GitHub — the same upstream repository
+`C:\spidermonkey-dev\gecko-dev` is cloned from — before writing any code
+against it. Confirmed signatures:
+
+```
+extern JS_PUBLIC_API JSObject* NewPromiseObject(JSContext* cx,
+                                                 JS::HandleObject executor);
+extern JS_PUBLIC_API bool ResolvePromise(JSContext* cx,
+                                          JS::HandleObject promiseObj,
+                                          JS::HandleValue resolutionValue);
+extern JS_PUBLIC_API bool RejectPromise(JSContext* cx,
+                                         JS::HandleObject promiseObj,
+                                         JS::HandleValue rejectionValue);
+```
+
+A null `executor` (used here) means the Promise can only be settled via
+`JS::ResolvePromise`/`RejectPromise` — exactly this binding's shape, and
+exactly what `FsAsync.md`'s design called for.
+
+**Implementation, following the frozen design closely:**
+
+- `AsyncFsReadOp` (the per-operation bookkeeping struct) is defined in
+  `forge.cpp` *before* `Runtime`, specifically so `Runtime`'s own
+  `pendingFsReadOps_` member can hold it as a complete type directly.
+  Forward-declaring it instead and having `Runtime` hold a
+  `HashMap<AsyncFsReadOp*, UniquePtr<AsyncFsReadOp>>` member of an
+  incomplete type would raise a real question about exactly when
+  `UniquePtr<AsyncFsReadOp>`'s destructor gets instantiated relative to
+  `Runtime`'s own implicit destructor (the classic "pImpl needs an
+  out-of-line destructor" C++ subtlety) — answerable with a real
+  compiler, but not with certainty in this sandbox, so the whole question
+  was sidestepped by simply not forward-declaring in the first place.
+- `Runtime` gains a shared `ThreadPool workerPool_` (4 workers — sized
+  the same as `ThreadingSmokeTest.cpp`'s own real-machine-confirmed case,
+  an unvalidated starting point, not a tuned value; real tuning is
+  7.5.6), the `pendingFsReadOps_` map (keyed by the op's own address —
+  `FsAsync.md` explicitly noted no ID-based lookup is needed here, unlike
+  `JsTimerRegistry`'s int-keyed map for `clearTimeout`), and a
+  `TraceRoots(trc)` method. `JS_AddExtraGCRootsTracer` now passes `this`
+  instead of `&timers_`, so one method traces both the timer registry's
+  callbacks and every in-flight read's `Promise` — closing exactly the
+  "GC-rooted independent of script" Design Goal `FsAsync.md` called for.
+- `fs.readFile(path, encoding?)` parses arguments identically to
+  `readFileSync` (Phase 7.3), creates the Promise, registers the
+  bookkeeping struct, then submits a worker lambda that captures *only* a
+  raw `AsyncFsReadOp*` (touching just its `path`/`wantUtf8`/
+  `bytesResult`/`textResult` fields — all forge-core types) and a raw
+  `IoLoop*` (only to call `PostCompletion`, real-machine-confirmed by
+  7.5.1) — never `cx`, never `op->promise`, never anything JSAPI-typed.
+  This is the "thread boundary is absolute" Design Goal, enforced by
+  construction rather than by convention alone: the worker's closure
+  simply has no way to reach anything JSAPI-typed even by mistake.
+- `FsAsyncReadOpCompleted` (the `IoCompletion` callback, dispatched by
+  `RunOnce()` on the main thread once the worker's `PostCompletion` fires)
+  resolves or rejects the Promise from the worker's stored `Result<T>`.
+  Rejection reuses `ThrowJsError` directly rather than duplicating its
+  `.code`/`.syscall`/`.path`/`.nativeCode` shape-construction logic: a new
+  small `RejectAsyncFsPromise` helper calls `ThrowJsError` (which throws,
+  setting cx's pending exception), retrieves that exception as a value,
+  clears it (a Promise rejection value must never simultaneously be a
+  pending exception on `cx`), and hands it to `JS::RejectPromise`.
+
+**Two known, accepted gaps, disclosed rather than silently assumed
+away** (per this project's own "Be Honest" standard):
+
+1. If the worker's own `PostCompletion` call itself fails (the
+   completion port somehow invalid), there is no way to report that from
+   the worker thread — the op's Promise simply never settles. An
+   exceptional, not routine, failure mode; not solved by this milestone.
+2. If `run()` exits early (a genuine I/O error elsewhere) while a read is
+   still in flight, `Runtime::Shutdown()` was extended to safely drop
+   that op's unsettled Promise (via `pendingFsReadOps_.Clear()`, called
+   right after `workerPool_.Shutdown()` blocks until every in-flight
+   worker has actually finished running — guaranteeing no worker thread
+   is still writing to the struct when it's freed — and, critically,
+   while `cx` is still alive, so releasing each op's `JS::Heap<promise>`
+   happens in a context where its own GC-barrier machinery still has a
+   live context to work with, rather than deferring that release to
+   `Runtime`'s own implicit destructor, which runs later in `main()`,
+   after `JS_DestroyContext(cx)` has already run). This avoids a real
+   use-after-cx-destroyed risk, but the dropped operation's actual result
+   (if it ever would have completed) is simply lost — harmless, since no
+   script is left running to observe it either way, but lossy, and not
+   fixed further here.
+
+`manual-test-fs-async.js` (new file) exercises both encodings' success
+paths and the `NotFound` rejection path, and — since its only pending
+work once its body finishes running is these three `fs.readFile()`
+calls, with no timer anywhere in the script — also directly exercises
+the Phase 7.5.2 event-loop lifetime fix: without `pendingAsyncOps_`,
+`run()` would exit before any of these reads completed. This is
+explicitly a stand-in for Phase 7.5.5's real self-test harness (today's
+`--self-test` suites call binding functions directly and never let
+`Runtime::run()` actually drive the event loop, so they structurally
+cannot exercise a real async completion yet), not a replacement for it.
+
+**Status: implemented, pending the user's real `python mach build` and a
+real run of `manual-test-fs-async.js`.**
+
+## Phase 7.5.3 real-build-confirmed: `fs.readFile` works end to end (2026-08-02)
+
+The user ran `python mach build` (successful) and
+`manual-test-fs-async.js`:
+
+```
+Script body finished. If the Phase 7.5.2 event-loop lifetime fix
+works, the process now waits for the three reads above to
+complete (and prints their PASS/FAIL lines) instead of exiting
+immediately.
+
+PASS: fs.readFile rejected with .code === "NotFound" for a missing file
+PASS: fs.readFile(path, "utf8") resolved with the correct text
+PASS: fs.readFile(path) resolved with a Uint8Array of the right length
+```
+
+All three assertions passed, and — notably — the "Script body finished"
+line printed *before* the three PASS lines, confirming the process
+genuinely kept running after the synchronous script body completed,
+waiting for the three in-flight `fs.readFile()` Promises to settle,
+instead of exiting immediately. That's real, positive confirmation of
+the Phase 7.5.2 event-loop lifetime fix actually doing its job against a
+genuine async operation, not just the "provably inert" argument that
+milestone's own verification rested on at the time.
+
+This also confirms, together: the first native `JS::NewPromiseObject`/
+`ResolvePromise`/`RejectPromise` calls in this codebase work correctly
+on both the resolve and reject paths; both `readFile` encodings marshal
+correctly from a worker-thread `Result<T>` into the right JS value
+(`utf8` string via `FromForgeString`, default `Uint8Array` via
+`Uint8ArrayFromBytes`); the rejection shape (`.code === "NotFound"`)
+round-trips correctly through `RejectAsyncFsPromise`'s reuse of
+`ThrowJsError`; and the worker-thread dispatch via the new shared
+`ThreadPool`, the cross-thread `PostCompletion` handoff (7.5.1), and the
+`Runtime`-owned `pendingFsReadOps_` GC-rooting all worked together
+without incident on first real build -- no bugs surfaced in this pass,
+unlike Phase 4/5's resumption, which is a reasonable outcome given how
+much more sandbox-side reasoning (real header fetch for `Promise.h`,
+careful tracing through `HashMap`/`Result<T>`/`UniquePtr` conventions
+already established elsewhere in this file) went into this milestone
+before ever reaching the user.
+
+**Status: Phase 7.5.3 -- worker dispatch, native `Promise` settlement,
+and `fs.readFile` end to end -- is real-build-confirmed.** 7.5.4 (the
+remaining six methods: `writeFile`/`appendFile`/`exists`/`mkdir`/`rm`/
+`stat`) can start.
+
+## Phase 7.5.4: remaining six async fs methods implemented (2026-08-02)
+
+Rather than repeating `AsyncFsReadOp`'s whole struct-plus-dispatch shape
+six more times, `writeFile`/`appendFile`/`mkdir`/`rm`/`exists`/`stat`
+share one new struct, `AsyncFsMiscOp`, discriminated by a `kind` enum --
+generalizing the exact pattern `AsyncFsReadOp`'s own
+`bytesResult`/`textResult` already established (multiple
+placeholder-initialized `Result<T>` fields, exactly one authoritative per
+instance, selected by a discriminant) rather than introducing a new
+pattern (e.g. an inheritance-based reinterpret_cast trick, which would
+have worked but adds a kind of risk this project has no real compiler on
+hand to verify, and which nothing else in this codebase does). `Runtime`
+gained a second pending-op `HashMap` (`pendingFsMiscOps_`) alongside
+7.5.3's read-op map; `TraceRoots`/`Shutdown` were extended to walk both.
+
+Two new small helpers: `WriteAllBytesNoThrow` (a worker-safe twin of the
+existing `WriteAllBytes` -- same short-write-retry loop, returns
+`Result<void>` instead of calling `ThrowJsError`, since the worker thread
+must never touch `cx`) and `CopySpanToVector` (copies `ResolveWriteData`'s
+resolved span into an owned `Vector<u8>` before dispatch -- the async
+write/append path's first real exercise of `FsAsync.md`'s
+copy-before-dispatch rule: the sync path's span may alias the caller's
+JS buffer or `ResolveWriteData`'s own `ownedText` storage, neither safe
+to hand across the thread boundary to a worker running at some later,
+arbitrary time).
+
+`mkdir`/`rm`/`exists`/`stat` each reuse their sync counterpart's exact
+`File::*` call, argument parsing, and semantics verbatim (including
+`mkdir`'s `options.recursive` split and `exists`'s documented Node
+divergence -- a genuine `File::Exists` failure still rejects rather than
+resolving `false`), just dispatched through the shared worker path
+(`DispatchAsyncFsMiscOp`) instead of running inline.
+
+`manual-test-fs-async.js` (extended from 7.5.3's version, not a new
+file) now chains all six new methods sequentially through `.then()` --
+`writeFile → appendFile → stat → exists → rm → exists → mkdir
+(recursive) → mkdir (non-recursive, expects AlreadyExists rejection)` --
+rather than firing them concurrently. This is a deliberate test-design
+choice, not an oversight: two of these calls racing over the same path
+is explicitly out of scope by `FsAsync.md`'s own Non-Goals (no ordering
+guarantee across concurrent calls), so a sequential chain is what makes
+this a meaningful, repeatable check rather than exercising undefined
+interleaving that could pass or fail depending on which worker thread
+happens to finish first.
+
+**Status: implemented, pending the user's real `python mach build` and a
+real run of the extended `manual-test-fs-async.js`.**
+
+## Phase 7.5.4 real-build-confirmed: all seven async fs methods work end to end (2026-08-02)
+
+The user ran `python mach build` (successful) and the extended
+`manual-test-fs-async.js` -- all eleven checks passed, ending in
+`ALL CHECKS PASSED`, with the chained write→append→stat→exists→rm→
+exists→mkdir(recursive)→mkdir(non-recursive, `AlreadyExists`) sequence
+completing without an uncaught rejection stopping it partway through.
+
+This is the first real-machine confirmation of: the `AsyncFsMiscOp`
+shared-struct-plus-`kind`-discriminant design working correctly across
+six different operations and three different result shapes
+(`Result<void>`/`Result<bool>`/`Result<u64>`); `CopySpanToVector` and
+`WriteAllBytesNoThrow` correctly moving write/append's data across the
+thread boundary and performing the short-write retry loop on a worker;
+`mkdir`'s `options.recursive` parsing and non-recursive `AlreadyExists`
+rejection working identically to `mkdirSync`'s own already-confirmed
+behavior, just through the async path; and two pending-op `HashMap`s
+(`pendingFsReadOps_` and `pendingFsMiscOps_`) being traced and shut down
+correctly together, with operations from both in flight simultaneously
+during the test run (the three independent `fs.readFile` calls from
+7.5.3 ran concurrently with the 7.5.4 chain).
+
+No bugs surfaced in this pass, matching 7.5.3's outcome -- reasonable
+given how much of this milestone was a direct, deliberate generalization
+of 7.5.3's already-proven pattern rather than new, untested territory.
+
+**Status: Phase 7.5.4 is real-build-confirmed. All seven `fs.*` async
+bindings specified in `FsAsync.md`'s Public API
+(`readFile`/`writeFile`/`appendFile`/`exists`/`mkdir`/`rm`/`stat`) now
+exist, work correctly, and are confirmed on the real machine.** 7.5.5
+(the formal Promise-based self-test harness, replacing
+`manual-test-fs-async.js` as this feature's ongoing regression check) is
+next.
+
+## Phase 7.5.5: formal Promise-based self-test harness implemented (2026-08-02)
+
+Added `RunFsAsyncSmokeTests(cx, runtime)` to `forge.cpp`, called from
+`main()`'s `--self-test` dispatch after `RunMarshallingSmokeTests` and
+`RunFsSmokeTests`. This is the first self-test suite in this file that
+calls `Runtime::run()` at all -- every prior suite (Phase 7.2/7.3) calls
+a binding function directly and inspects a `Result<T>`/thrown exception
+synchronously, since nothing before Phase 7.5 had anything asynchronous
+to wait on.
+
+Two groups, matching FsAsync.md's own Acceptance Criteria:
+
+- Group A evaluates one script exercising all seven `fs.*` async
+  methods (the three `fs.readFile` cases concurrently, the six Phase
+  7.5.4 methods chained through `.then()`, identical structure to
+  `manual-test-fs-async.js`), then calls `runtime.run()` once to drive
+  every chain to completion. Each of the 12 expected cases records its
+  own pass/fail via a new native `globalThis.__asyncSelfTestRecord(name,
+  passed, message)` callback (bound only for this suite's duration, not
+  part of `Fs.md`'s JS-visible surface) into a `Vector<AsyncSelfTestResult>`
+  -- the only way to observe an async completion from native code, since
+  it can't itself await a JS `Promise`. The harness also checks that
+  exactly 12 results were recorded, not just that none of them failed,
+  so a chain that throws partway through and silently stops doesn't look
+  identical to "zero failures."
+- Group B evaluates a second, separate script whose *only* statement is
+  one `fs.readFile(...).then(...)` call -- no timers, nothing else
+  queued -- and calls `runtime.run()` a second time on the same
+  `Runtime` instance. This is the direct, isolated regression test
+  FsAsync.md's Acceptance Criteria specifically calls for: confirming
+  the Phase 7.5.2 `pendingAsyncOps_` fix, in a script shaped so that
+  without it, `run()` would see an empty job queue and an empty `IoLoop`
+  and return immediately, and the `.then()` callback would never fire.
+  Group A's chain always has other pending work alongside each
+  individual async call, so it would not by itself catch a regression
+  here -- this probe exists specifically because Group A can't cover it.
+
+Calling `runtime.run()` twice in sequence on the same `Runtime` (once
+per group) is a new usage pattern -- every prior caller (`main()`'s own
+script-running path) calls it exactly once per process. Reasoned through
+rather than assumed safe: Group A's own `run()` loop only returns once
+`jobQueue_.empty() && loop_.Empty() && pendingAsyncOps_ == 0`, so by the
+time Group B's script is evaluated, the `Runtime` is back in the same
+idle state it was in right after `Initialize()` -- nothing carries over
+except the still-alive `IoLoop`/`ThreadPool`, which is exactly what
+Group B's probe needs alive to dispatch its own single read. No change
+was made to `run()`, `Initialize()`, or `Shutdown()` themselves for this.
+
+**Status: implemented, not yet real-build-confirmed.** This sandbox has
+no real compiler available -- only a brace/paren-balance check was
+possible here (see AGENTS.md's "Be Honest" principle: this is explicitly
+not claimed as verified). Needs a `python mach build` and a
+`forge --self-test` run on the real machine, expected to print 13 new
+`[self-test]` lines on success (12 from Group A plus 1 from Group B --
+the result-count check only prints its own line if the count is *not*
+12) in addition to the existing Phase 7.2/7.3 suites' output,
+before this milestone can be marked done.
+
+## Phase 7.5.5 real-build-confirmed: Promise-based self-test harness works end to end (2026-08-02)
+
+The user ran `python mach build` (successful) and `forge --self-test`:
+all 13 expected new lines appeared, all passing, ending in
+`ALL PASSED`:
+
+```
+[self-test] fs.readFile rejects with .code === "NotFound" for a missing file PASS
+[self-test] fs.readFile(path, "utf8") resolves with correct text PASS
+[self-test] fs.readFile(path) resolves with a Uint8Array of the right length PASS
+[self-test] fs.writeFile resolves and writes the expected content PASS
+[self-test] fs.appendFile resolves and appends the expected content PASS
+[self-test] fs.stat resolves with the correct size PASS
+[self-test] fs.exists resolves true for a file that exists PASS
+[self-test] fs.rm resolves and the file is actually gone PASS
+[self-test] fs.exists resolves false for a file that no longer exists PASS
+[self-test] fs.mkdir(recursive) resolves and the nested directory actually exists PASS
+[self-test] fs.mkdir(non-recursive) on an existing directory rejects with AlreadyExists PASS
+[self-test] fs.* chained misc sequence ran to completion without an uncaught rejection PASS
+[self-test] Runtime::run() waits for lone in-flight fs.readFile (no timers) PASS
+```
+
+No count-mismatch line appeared, confirming Group A's chain recorded
+exactly the 12 cases expected rather than silently stopping partway
+through. This is the first real-machine confirmation of: calling
+`Runtime::run()` a second time on the same `Runtime` instance (Group A's
+cycle, then Group B's) working correctly -- the loop genuinely returned
+to an idle state after Group A and then correctly blocked again for
+Group B's lone in-flight read, rather than misbehaving on a second
+entry; the native `globalThis.__asyncSelfTestRecord` recording callback
+round-tripping name/passed/message correctly across all 13 calls; and,
+specifically via Group B, the Phase 7.5.2 `pendingAsyncOps_` fix holding
+under the exact isolated shape (one in-flight async fs call, zero
+timers, zero other queued work) FsAsync.md's own Acceptance Criteria
+called out as a required, dedicated regression case -- not merely
+inferred from Group A's busier chain, which always has other pending
+work alongside each individual call and so could not have caught a
+regression here on its own.
+
+No bugs surfaced in this pass -- the fourth consecutive Phase 7.5
+milestone (after 7.5.2, 7.5.3, 7.5.4) to pass real-build verification on
+the first attempt.
+
+**Status: Phase 7.5.5 is real-build-confirmed. `forge --self-test` now
+has a genuine Promise-based self-test harness that drives
+`Runtime::run()` to completion and inspects real async fs.* outcomes
+afterward, replacing `manual-test-fs-async.js` as this feature's ongoing
+regression check going forward.** Only 7.5.6 (benchmarks + docs) remains
+before Phase 7.5 (async fs) is complete end to end.
+
+## Phase 7.5.6: async fs benchmark drafted (2026-08-02)
+
+Added `bench/fs-async-bench.js`, the Promise-returning counterpart to
+`fs-bench.js` (Phase 7.4) -- same iteration counts (2000 round-trips, 100
+"touch every remaining method" passes) and payload, for a direct,
+apples-to-apples comparison, but chained through `.then()` one step at a
+time rather than `fs-bench.js`'s blocking for-loop, since FsAsync.md's
+own Non-Goals rules out any ordering guarantee across concurrent async fs
+calls and this benchmark's round-trip pass reuses one shared file across
+every iteration -- firing all 2000 writes/reads at that path concurrently
+would be a genuine race, not a fair throughput measurement. Also updated
+`run-benchmarks.ps1` to include it in `$Benchmarks` and documented the
+addition in that script's own header comment, matching the convention
+every prior benchmark addition (Phase 6, Phase 7.4) followed.
+
+This sandbox has no real compiler to build Forge itself, so the script
+obviously couldn't be run against a real `forge.exe` here -- but unlike
+every prior benchmark script added in this project, this one *could* be,
+and was, actually executed against the two other runtimes it's meant to
+compare against: both `node` (v22.22.2) and `bun` (v1.3.13) are present
+in this sandbox. Running it caught a real, genuine bug before delivery:
+Node's (and Bun's) `fs.promises` has no `.exists` method at all -- Node
+deprecated the callback-based `fs.exists` outright and never added a
+Promise-based replacement, keeping only the synchronous
+`fs.existsSync` -- so the script's first draft failed immediately with
+`fs.exists is not a function`. Fixed by shimming `fs.exists` on top of
+`fs.promises.access()` (resolves on success, rejects on failure) when
+running under Node/Bun, normalized to the same resolves-true/
+resolves-false shape Forge's own `fs.exists` uses. After the fix, both
+`node fs-async-bench.js` and `bun fs-async-bench.js` ran to completion
+and printed matching output:
+`fs-async-bench done, iterations=2000, extraIterations=100, checksum=721300`
+-- the identical checksum across both runtimes is itself a useful
+cross-check that the shim makes both do exactly the same work, not just
+"run without crashing."
+
+Also updated `FsAsync.md`'s own `Implementation Status` section (stale
+since design-freeze -- it still said "Design only. Nothing in this
+document is implemented yet." despite 7.5.1-7.5.5 all being
+real-build-confirmed by this point) with a full milestone-by-milestone
+breakdown, and made light-touch updates to `Fs.md` and `JsBindings.md`'s
+few forward-references to "Phase 7.5" (Non-Goals, Thread Safety,
+Extensibility, the `*Sync`-suffix-reservation note) to point at
+`FsAsync.md`'s now-real-build-confirmed status instead of describing it
+as future work -- neither doc's own frozen content (its actual specified
+behavior) was changed, only these pointers.
+
+**Status: `fs-async-bench.js` is written and confirmed runnable (via
+Node/Bun, both matching) but not yet run against a real `forge.exe` --
+that requires the user's real machine.** Once real numbers come back,
+`Forge_Benchmark_Report.md` gets a new results section/analysis (same
+format as its existing `fs-bench.js` entry) and `PROJECT_CONTEXT.md`'s
+Phase 7.5 bullet gets updated to mark 7.5.6, and therefore the whole of
+Phase 7.5, done.
+
+## Phase 7.5.6 benchmark run: six scripts reconfirmed, fs-async-bench.js failed on Forge (2026-08-02)
+
+The user ran `run-benchmarks.ps1` for real. The seven pre-existing
+scripts (`startup.js` through `fs-bench.js`) all landed within a few
+percent of the 2026-07-30 baseline in `Forge_Benchmark_Report.md` --
+noise, not a real change, consistent with nothing in Phase 7.5 touching
+any of those code paths.
+
+`fs-async-bench.js` itself did not produce a usable Forge number.
+Bun (median 1,237.52 ms) and Node (median 1,394.69 ms) both ran it to
+completion. Forge failed outright:
+
+```
+fs-async-bench.js        forge  FAILED (exit 1): C:\spidermonkey-dev\gecko-dev\js\src\forge\bench\fs-async-bench.js:138:4 fs.mkdir is not a function
+```
+
+Line 138 is this script's very first async fs.* call -- the top-level
+`fs.mkdir(SCRATCH_DIR, { recursive: true })` that kicks off the whole
+chain, before any `fs.readFile`/`fs.writeFile`/etc. ever runs. Being a
+synchronous `TypeError` on a top-level (non-callback) call, this failed
+`JS::Evaluate` itself rather than surfacing as a rejected Promise --
+consistent with `run-benchmarks.ps1` reporting a hard exit code 1, not a
+script that ran and printed a FAILED line of its own.
+
+**This is a genuinely puzzling result, not a straightforward "the
+feature is broken" -- flagged as an open, unresolved discrepancy rather
+than guessed at.** The very same real machine's `forge --self-test` run,
+reported in this same conversation just before this benchmark run,
+explicitly showed `fs.mkdir` passing twice (`fs.mkdir(recursive)
+resolves and the nested directory actually exists` and `fs.mkdir
+(non-recursive) on an existing directory rejects with AlreadyExists`,
+both `PASS`, among all 13 Phase 7.5.5 self-test lines). `forge.cpp`'s
+`DefineFsNamespace` registers `mkdir` (and every other async method)
+unconditionally -- the exact same call handles both `--self-test` and
+any ordinary script; there is no code path where one gets `fs.mkdir` and
+the other doesn't. That symmetry, plus the self-test having *just*
+passed, points away from a code regression in `forge.cpp` and toward an
+environment/binary discrepancy: **the leading hypothesis is that
+`C:\Forge\bin\forge.exe` -- the path `run-benchmarks.ps1` defaults to,
+and the only Forge binary this run used -- is a different, older copy
+than whatever binary the `--self-test` run actually executed.** Not
+confirmed -- this depends on the user's own build/deploy workflow
+(whether `mach build`'s output gets copied to `C:\Forge\bin\forge.exe`
+every time, or only sometimes), which is outside what this project's
+own files can answer on their own.
+
+Since only `mkdir` was ever reached before the failure, whether the
+*other* six async methods would also be missing from whatever binary
+`run-benchmarks.ps1` used is genuinely unknown -- not assumed either
+way.
+
+**Status: Phase 7.5.6 is NOT done.** `Forge_Benchmark_Report.md` has been
+updated with the six reconfirmed scripts' numbers and `fs-async-bench.js`'s
+partial (Bun/Node only) results, with this discrepancy flagged prominently
+rather than papered over. `ROADMAP.md`/`PROJECT_CONTEXT.md` are not being
+marked done for 7.5.6 or Phase 7.5 as a whole until this is resolved --
+either the binary gets refreshed and the benchmark reruns cleanly, or a
+real bug is found and fixed.
+
+## Phase 7.5.6 resolved: stale binary confirmed, clean benchmark run, Phase 7.5 complete (2026-08-02)
+
+The stale-binary hypothesis from the entry above was correct, confirmed
+within minutes by the user:
+
+```
+Copy-Item "C:\spidermonkey-dev\gecko-dev\obj-spider\dist\bin\forge.exe" "C:\Forge\bin\forge.exe" -Force
+```
+
+`C:\Forge\bin\forge.exe` had not been refreshed from `mach build`'s
+actual output since before Phase 7.5's async `fs.*` work landed --
+whatever binary `forge --self-test` ran against (presumably `mach
+build`'s own output directory, run directly) was current; the separate,
+manually-copied `C:\Forge\bin\forge.exe` `run-benchmarks.ps1` defaults to
+was not. No code in `forge.cpp` needed to change. This is a real, useful
+process finding for this project going forward, not just a one-off
+annoyance: **refresh `C:\Forge\bin\forge.exe` from the `mach build`
+output before every benchmark run**, not only after a build that just
+added a feature.
+
+After the copy, a clean rerun of `run-benchmarks.ps1` produced real
+Forge numbers for `fs-async-bench.js` for the first time:
+
+```
+fs-async-bench.js        forge  avg=    944.99 ms   median=    935.39 ms   min=    913.91 ms
+fs-async-bench.js        bun    avg=  1,236.58 ms   median=  1,239.99 ms   min=  1,181.34 ms
+fs-async-bench.js        node   avg=  1,482.14 ms   median=  1,413.65 ms   min=  1,392.17 ms
+fs-async-bench.js        forge/bun  ratio = 0.75x
+fs-async-bench.js        forge/node ratio = 0.66x
+```
+
+Forge is faster than both Bun and Node on the async fs.* round-trip
+benchmark, directionally consistent with `fs-bench.js`'s own sync-path
+result (0.76x/0.86x) rather than reversing which runtime wins. All three
+runtimes are slower on the async version than the sync one for the same
+amount of I/O work, as expected -- Promise creation/settlement overhead,
+and for Forge specifically a real cross-thread `ThreadPool` hop per
+operation, on top of the underlying I/O. The other seven scripts all
+landed within a few percent of the 2026-07-30 baseline, confirming
+nothing in Phase 7.5 regressed anything measured before it.
+
+`Forge_Benchmark_Report.md` has been updated with the full results table
+(all eight scripts), a `fs-async-bench.js`-specific analysis paragraph,
+and the stale-binary discrepancy's resolution -- the earlier "flagged as
+open, unresolved" language is marked resolved rather than deleted, so the
+report's own history stays honest about what actually happened.
+`ROADMAP.md`'s 7.5.6 entry and `PROJECT_CONTEXT.md`'s Phase 7.5 bullet
+are both updated to reflect the whole phase as done.
+
+**Status: Phase 7.5.6 is done. Phase 7.5 (async `fs`) is complete
+end to end** -- all seven `fs.*` async methods implemented,
+real-build-confirmed individually (7.5.1-7.5.4), covered by a formal
+Promise-based self-test harness (7.5.5), and now benchmarked against
+Bun/Node with real numbers (7.5.6). No known open items remain for this
+phase.
