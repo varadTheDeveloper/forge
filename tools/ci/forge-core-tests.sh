@@ -11,8 +11,10 @@ cd "$(dirname "$0")/../../forge-core"
 out="${TMPDIR:-/tmp}/forge-core-tests"
 mkdir -p "$out"
 
-flags=(-std=c++17 -fno-exceptions -g -O1 -Wall -Wextra
-       -fsanitize=address,undefined -fno-sanitize-recover=all)
+# Built twice: C++17 (the current 142 engine build) and C++20 (what the
+# ESR 153 engine requires of embedders, Phase 7.95). Code must pass both.
+common=(-fno-exceptions -g -O1 -Wall -Wextra
+        -fsanitize=address,undefined -fno-sanitize-recover=all)
 mem=(memory/DefaultAllocator.cpp memory/detail/AllocationBackend.cpp)
 
 # OverflowTest deliberately asks for impossible allocations; ASan must
@@ -21,15 +23,18 @@ export ASAN_OPTIONS=allocator_may_return_null=1
 
 failures=0
 
-for t in ArrayTest ErasedCallableTest HashMapTest HashSetTest IpAddressTest \
-         OverflowTest PathTest QueueTest StackTest StringTest; do
-  if g++ "${flags[@]}" "$t.cpp" "${mem[@]}" -o "$out/$t" && "$out/$t" > "$out/$t.log" 2>&1; then
-    echo "[forge-core] $t PASS"
-  else
-    echo "[forge-core] $t FAIL"
-    cat "$out/$t.log" 2>/dev/null || true
-    failures=$((failures + 1))
-  fi
+for std in c++17 c++20; do
+  for t in ArrayTest ErasedCallableTest HashMapTest HashSetTest IpAddressTest \
+           OverflowTest PathTest QueueTest StackTest StringTest; do
+    exe="$out/$t-$std"
+    if g++ -std=$std "${common[@]}" "$t.cpp" "${mem[@]}" -o "$exe" && "$exe" > "$exe.log" 2>&1; then
+      echo "[forge-core] $t ($std) PASS"
+    else
+      echo "[forge-core] $t ($std) FAIL"
+      cat "$exe.log" 2>/dev/null || true
+      failures=$((failures + 1))
+    fi
+  done
 done
 
 if [ "$failures" -ne 0 ]; then
