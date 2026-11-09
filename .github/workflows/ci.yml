@@ -1,0 +1,44 @@
+# Forge CI (Phase 7.9).
+#
+# What this runs today:
+#   * forge-core unit tests on Linux under ASan + UBSan (g++);
+#   * forge-core unit and smoke tests on Windows with MSVC, including the
+#     Windows-only File, Socket, thread, timer and IOCP tests.
+#
+# Not yet: building forge.exe itself and running `forge --self-test` and
+# tests/run-runtime-tests.ps1. forge.exe is still built inside the
+# SpiderMonkey source tree with `mach`; that job is added in Phase 7.95,
+# when Forge moves to its own repository built against a pinned ESR engine.
+#
+# Third-party actions are pinned to a full commit SHA (supply chain).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  forge-core-linux-sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: forge-core tests (ASan + UBSan)
+        run: bash tools/ci/forge-core-tests.sh
+
+  forge-core-windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: forge-core tests (MSVC, C++17, no exceptions)
+        shell: pwsh
+        run: ./tools/ci/forge-core-tests.ps1
