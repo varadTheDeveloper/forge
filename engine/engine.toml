@@ -1,0 +1,16 @@
+# The SpiderMonkey engine Forge is built against (Phase 7.95, rule R12).
+#
+# tools/setup-engine.ps1 reads this file, fetches exactly this commit and
+# refuses to continue if the checkout does not match. Change it only in a
+# commit of its own that says why (security release, ESR rebase), and run
+# the full test suite on the new engine before merging.
+
+repository = "https://github.com/mozilla-firefox/firefox.git"
+branch     = "esr153"
+commit     = "c318e3511672a445f5e218f7c6360189de329924"
+version    = "153.8.0esr"
+
+# Mozilla's support window for this ESR, and the next ESR to move to.
+supported_until  = "2027-09-21"
+next_esr         = "175"
+next_esr_branch  = "2027-06-29"
