@@ -200,6 +200,74 @@ void Test_Path_NormalizeAbsolute()
     CHECK(driveRoot.View() == StringView("C:/"));
 }
 
+// Phase 7.9 regression table (study 13 found these with ASan+UBSan): a
+// root must survive Normalize() unchanged, absoluteness must be
+// preserved, and ".." must never climb above a UNC share or a device
+// volume.
+void Test_Path_NormalizeWindowsRoots()
+{
+    std::printf("Test_Path_NormalizeWindowsRoots...\n");
+
+    struct Case
+    {
+        const char* input;
+        const char* expected;
+    };
+
+    const Case cases[] = {
+        { "//server/share/x", "//server/share/x" },
+        { "\\\\server\\share\\..\\..\\x", "//server/share/x" },
+        { "//server/share", "//server/share" },
+        { "//server/share/", "//server/share/" },
+        { "//server/share/a/..", "//server/share/" },
+        { "\\\\?\\C:\\a\\..\\b", "//?/C:/b" },
+        { "//?/C:/../../x", "//?/C:/x" },
+        { "//?/UNC/server/share/a/../../..", "//?/UNC/server/share/" },
+        { "//./PIPE/name", "//./PIPE/name" },
+        { "C:/a/../../..", "C:/" },
+        { "C:foo/../..", "C:.." },
+        { "C:foo/./bar", "C:foo/bar" },
+        { "C:", "C:" },
+        { "/a/../..", "/" },
+        { "a/../..", ".." },
+        { "./C:/x", "./C:/x" },
+        { "b/../C:x", "./C:x" },
+    };
+
+    for (const Case& c : cases)
+    {
+        Path p = MakePath(c.input);
+        const bool wasAbsolute = p.IsAbsolute();
+
+        CHECK(!p.Normalize().HasError());
+
+        if (p.View() != StringView(c.expected))
+        {
+            std::fprintf(stderr, "  Normalize(%s): got '%.*s', expected '%s'\n", c.input,
+                         static_cast<int>(p.View().Size()), p.View().Data(), c.expected);
+        }
+
+        CHECK(p.View() == StringView(c.expected));
+        CHECK(p.IsAbsolute() == wasAbsolute);
+
+        // Idempotent.
+        Path again = MakePath(c.expected);
+        CHECK(!again.Normalize().HasError());
+        CHECK(again.View() == StringView(c.expected));
+    }
+
+    // Parent() stops at the full UNC / device root.
+    Path unc = MakePath("//server/share/x");
+    CHECK(unc.Parent() == StringView("//server/share/"));
+
+    Path uncRoot = MakePath("//server/share");
+    CHECK(uncRoot.Parent() == StringView("//server/share"));
+    CHECK(uncRoot.FileName().Empty());
+
+    Path device = MakePath("//?/C:/x");
+    CHECK(device.Parent() == StringView("//?/C:/"));
+}
+
 void Test_Path_Comparison()
 {
     std::printf("Test_Path_Comparison...\n");
@@ -286,6 +354,7 @@ int main()
     Test_Path_AppendAndJoin();
     Test_Path_NormalizeRelative();
     Test_Path_NormalizeAbsolute();
+    Test_Path_NormalizeWindowsRoots();
     Test_Path_Comparison();
     Test_Path_CopyAndMove();
     Test_Path_CreateReportsOomWithoutCorruption();

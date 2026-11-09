@@ -254,6 +254,12 @@ private:
         return 8;
     }
 
+    /// Largest power-of-two slot count whose keys, values and slot-state
+    /// arrays all have byte sizes that fit (Phase 7.9: capacity math used
+    /// to wrap silently).
+    [[nodiscard]]
+    static constexpr SizeType MaxCapacity() noexcept;
+
     /// Slot count grows in powers of two so the table index can be
     /// computed with `hash & (capacity_ - 1)` instead of a modulo.
     [[nodiscard]]

@@ -11,6 +11,7 @@
 
 #include "File.h"
 
+#include <climits>
 #include <utility>
 
 #include <windows.h>
@@ -29,6 +30,18 @@ namespace
 // platform::TranslateWin32Error (platform/Win32Error.h/.cpp) instead of
 // becoming a third independent copy — see HISTORY.md's Phase 4 entry.
 using platform::TranslateWin32Error;
+
+/// Largest single ReadFile/WriteFile request (Phase 7.9). ReadFile and
+/// WriteFile take a DWORD length, so a buffer above 4 GiB used to be
+/// silently truncated by static_cast<DWORD>. Read() and Write() already
+/// report how many bytes they transferred, and every caller loops, so a
+/// large buffer is now simply processed in chunks of at most 1 GiB.
+constexpr DWORD kMaxIoChunk = DWORD{ 1 } << 30;
+
+[[nodiscard]] DWORD ClampIoSize(Size size) noexcept
+{
+    return size > kMaxIoChunk ? kMaxIoChunk : static_cast<DWORD>(size);
+}
 
 /// UTF-8 (Path's internal encoding) -> UTF-16, null-terminated — the
 /// only string form every Win32 API used below accepts. Vector<T> has no
@@ -49,6 +62,15 @@ Result<Vector<wchar_t>> Utf8ToWide(
         }
 
         return Result<Vector<wchar_t>>(std::move(wide));
+    }
+
+    // Phase 7.9: MultiByteToWideChar takes an int length. A longer input
+    // used to be truncated by static_cast<int>, silently converting only a
+    // prefix of the path. Reject it instead.
+    if (text.Size() > static_cast<Size>(INT_MAX))
+    {
+        return Result<Vector<wchar_t>>(
+            Failure{ Error(ErrorCode::InvalidArgument) });
     }
 
     const int required = MultiByteToWideChar(
@@ -73,8 +95,14 @@ Result<Vector<wchar_t>> Utf8ToWide(
         }
     }
 
-    MultiByteToWideChar(
+    const int converted = MultiByteToWideChar(
         CP_UTF8, 0, text.Data(), static_cast<int>(text.Size()), wide.Data(), required);
+
+    if (converted != required)
+    {
+        return Result<Vector<wchar_t>>(
+            Failure{ Error(ErrorCode::InvalidData, static_cast<i32>(GetLastError())) });
+    }
 
     if (Result<void> appended = wide.PushBack(L'\0'); appended.HasError()) // null terminator
     {
@@ -251,7 +279,7 @@ Result<File::SizeType> File::Read(
     if (!ReadFile(
             static_cast<HANDLE>(handle_),
             buffer.Data(),
-            static_cast<DWORD>(buffer.Size()),
+            ClampIoSize(buffer.Size()),
             &bytesRead,
             nullptr))
     {
@@ -279,7 +307,7 @@ Result<File::SizeType> File::Write(
     if (!WriteFile(
             static_cast<HANDLE>(handle_),
             buffer.Data(),
-            static_cast<DWORD>(buffer.Size()),
+            ClampIoSize(buffer.Size()),
             &bytesWritten,
             nullptr))
     {

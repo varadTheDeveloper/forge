@@ -3,6 +3,8 @@
 #include <memory>
 #include <utility>
 
+#include "Assert.h"
+#include "CheckedMath.h"
 #include "Construct.h"
 
 namespace forge::core
@@ -24,7 +26,8 @@ template<typename T>
 typename Queue<T>::SizeType
 Queue<T>::NextCapacity() const noexcept
 {
-    return capacity_ == 0 ? 1 : capacity_ * 2;
+    // Saturates at MaxElementCount<T>() instead of wrapping (Phase 7.9).
+    return GrowCapacity(capacity_, MaxElementCount<T>());
 }
 
 template<typename T>
@@ -109,6 +112,13 @@ Result<void> Queue<T>::Reserve(
         return {};
     }
 
+    // Phase 7.9: reject capacities whose byte size would overflow.
+    if (capacity > MaxElementCount<T>())
+    {
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
+    }
+
     void* memory = allocator_->Allocate(
         AllocationSize(capacity),
         alignof(T));
@@ -159,8 +169,15 @@ Result<void> Queue<T>::GrowIfNeeded()
         return {};
     }
 
-    return Reserve(
-        NextCapacity());
+    const SizeType next = NextCapacity();
+
+    if (next <= capacity_)
+    {
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
+    }
+
+    return Reserve(next);
 }
 
 template<typename T>
@@ -182,24 +199,28 @@ void Queue<T>::Clear() noexcept
 template<typename T>
 T& Queue<T>::Front() noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[head_];
 }
 
 template<typename T>
 const T& Queue<T>::Front() const noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[head_];
 }
 
 template<typename T>
 T& Queue<T>::Back() noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[PhysicalIndex(size_ - 1)];
 }
 
 template<typename T>
 const T& Queue<T>::Back() const noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[PhysicalIndex(size_ - 1)];
 }
 
@@ -207,6 +228,7 @@ template<typename T>
 T& Queue<T>::operator[](
     SizeType offset) noexcept
 {
+    FORGE_RELEASE_ASSERT(offset < size_);
     return data_[PhysicalIndex(offset)];
 }
 
@@ -214,6 +236,7 @@ template<typename T>
 const T& Queue<T>::operator[](
     SizeType offset) const noexcept
 {
+    FORGE_RELEASE_ASSERT(offset < size_);
     return data_[PhysicalIndex(offset)];
 }
 

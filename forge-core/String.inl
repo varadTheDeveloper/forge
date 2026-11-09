@@ -3,8 +3,15 @@
 #include <cstring>
 #include <utility>
 
+#include "Assert.h"
+#include "CheckedMath.h"
+
 namespace forge::core
 {
+
+// Largest character count a String may hold: one byte is always reserved
+// for the null terminator (Phase 7.9).
+constexpr Size kStringMaxCapacity = MaxElementCount<char>() - 1;
 
 //==============================================================================
 // Helpers
@@ -22,7 +29,8 @@ String::AllocationSize(
 inline String::SizeType
 String::NextCapacity() const noexcept
 {
-    return capacity_ == 0 ? 1 : capacity_ * 2;
+    // Saturates instead of wrapping (Phase 7.9).
+    return GrowCapacity(capacity_, kStringMaxCapacity);
 }
 
 //==============================================================================
@@ -110,6 +118,13 @@ inline Result<void> String::Reserve(
         return {};
     }
 
+    // Phase 7.9: AllocationSize() adds 1, which would wrap at SIZE_MAX.
+    if (capacity > kStringMaxCapacity)
+    {
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
+    }
+
     void* memory = allocator_->Allocate(
         AllocationSize(capacity),
         alignof(char));
@@ -152,8 +167,15 @@ inline Result<void> String::GrowIfNeeded()
         return {};
     }
 
-    return Reserve(
-        NextCapacity());
+    const SizeType next = NextCapacity();
+
+    if (next <= capacity_)
+    {
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
+    }
+
+    return Reserve(next);
 }
 
 inline void String::Clear() noexcept
@@ -173,12 +195,14 @@ inline void String::Clear() noexcept
 inline char& String::operator[](
     SizeType index) noexcept
 {
+    FORGE_RELEASE_ASSERT(index < size_);
     return data_[index];
 }
 
 inline const char& String::operator[](
     SizeType index) const noexcept
 {
+    FORGE_RELEASE_ASSERT(index < size_);
     return data_[index];
 }
 
@@ -239,7 +263,14 @@ inline Result<void> String::Append(
         return {};
     }
 
-    const SizeType required = size_ + text.Size();
+    // Phase 7.9: both the sum and the doubling loop used to wrap silently.
+    SizeType required = 0;
+
+    if (!CheckedAdd(size_, text.Size(), &required) || required > kStringMaxCapacity)
+    {
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
+    }
 
     if (required > capacity_)
     {
@@ -247,7 +278,7 @@ inline Result<void> String::Append(
 
         while (newCapacity < required)
         {
-            newCapacity = newCapacity == 0 ? 1 : newCapacity * 2;
+            newCapacity = GrowCapacity(newCapacity, kStringMaxCapacity);
         }
 
         if (Result<void> result = Reserve(newCapacity); result.HasError())

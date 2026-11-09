@@ -15,25 +15,110 @@ inline bool Path::IsAsciiAlpha(
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
+inline Path::SizeType Path::SplitRoot(
+    StringView text,
+    StringView* prefix,
+    bool* rooted) noexcept
+{
+    const SizeType size = text.Size();
+
+    // Index just past the component starting at `from` (stops at '/' or
+    // the end of the text).
+    auto componentEnd = [&text, size](SizeType from) noexcept -> SizeType
+    {
+        SizeType end = from;
+
+        while (end < size && text[end] != '/')
+        {
+            ++end;
+        }
+
+        return end;
+    };
+
+    // Consumes one separator after a prefix that ends at `end`, if any.
+    auto finish = [&text, size, prefix](SizeType end) noexcept -> SizeType
+    {
+        *prefix = text.Substr(0, end);
+        return (end < size && text[end] == '/') ? end + 1 : end;
+    };
+
+    if (size >= 2 && text[0] == '/' && text[1] == '/')
+    {
+        *rooted = true;
+
+        // Device paths: "//?/..." (Win32 \\?\) and "//./..." (\\.\).
+        if (size >= 4 && (text[2] == '?' || text[2] == '.') && text[3] == '/')
+        {
+            SizeType end = componentEnd(4); // volume or device: "C:", "PIPE", "UNC"
+            const StringView first = text.Substr(4, end - 4);
+
+            const bool isUnc = first.Size() == 3 &&
+                               (first[0] == 'U' || first[0] == 'u') &&
+                               (first[1] == 'N' || first[1] == 'n') &&
+                               (first[2] == 'C' || first[2] == 'c');
+
+            if (isUnc && end < size)
+            {
+                end = componentEnd(end + 1); // server
+
+                if (end < size)
+                {
+                    end = componentEnd(end + 1); // share
+                }
+            }
+
+            return finish(end);
+        }
+
+        // UNC: "//server/share". A bare "//" (no server) is its own root.
+        if (size == 2 || text[2] == '/')
+        {
+            *prefix = text.Substr(0, 2);
+            return 2;
+        }
+
+        SizeType end = componentEnd(2); // server
+
+        if (end < size)
+        {
+            end = componentEnd(end + 1); // share
+        }
+
+        return finish(end);
+    }
+
+    if (size >= 2 && IsAsciiAlpha(text[0]) && text[1] == ':')
+    {
+        *rooted = size >= 3 && text[2] == '/';
+        return finish(2);
+    }
+
+    *prefix = StringView();
+
+    if (size >= 1 && text[0] == '/')
+    {
+        *rooted = true;
+        return 1;
+    }
+
+    *rooted = false;
+    return 0;
+}
+
 inline bool Path::IsRootPath(
     StringView text) noexcept
 {
-    if (text.Size() == 1 && text[0] == '/')
+    if (text.Empty())
     {
-        return true;
+        return false;
     }
 
-    if (text.Size() == 3 && IsAsciiAlpha(text[0]) && text[1] == ':' && text[2] == '/')
-    {
-        return true;
-    }
+    StringView prefix;
+    bool rooted = false;
+    const SizeType consumed = SplitRoot(text, &prefix, &rooted);
 
-    if (text.Size() == 2 && text[0] == '/' && text[1] == '/')
-    {
-        return true;
-    }
-
-    return false;
+    return rooted && consumed == text.Size();
 }
 
 //==============================================================================
@@ -299,26 +384,16 @@ inline Result<void> Path::Normalize()
         return {};
     }
 
-    StringView root;
-    StringView rest = v;
-
-    if (IsRootPath(v))
-    {
-        root = v;
-        rest = StringView();
-    }
-    else if (v.Size() >= 3 && IsAsciiAlpha(v[0]) && v[1] == ':' && v[2] == '/')
-    {
-        root = v.Substr(0, 3);
-        rest = v.Substr(3);
-    }
-    else if (v[0] == '/')
-    {
-        root = v.Substr(0, 1);
-        rest = v.Substr(1);
-    }
-
-    const bool isAbsolute = !root.Empty();
+    // Phase 7.9: the root is split off first and copied through
+    // unchanged, so ".." can never climb above a UNC share or a device
+    // volume, and a drive-relative path keeps its drive letter. Before
+    // this, "//server/share/x" lost a slash (becoming "/server/share/x",
+    // no longer absolute) and "//server/share/../../x" became "/x".
+    StringView prefix;
+    bool rooted = false;
+    const SizeType consumed = SplitRoot(v, &prefix, &rooted);
+    const bool separatorAfterPrefix = consumed > prefix.Size();
+    StringView rest = v.Substr(consumed);
 
     Vector<StringView> stack; // resolved segments, aliasing the ORIGINAL
                                // buffer — safe as long as nothing mutates
@@ -349,14 +424,14 @@ inline Result<void> Path::Normalize()
                 {
                     stack.PopBack();
                 }
-                else if (!isAbsolute)
+                else if (!rooted)
                 {
                     if (Result<void> result = stack.PushBack(segment); result.HasError())
                     {
                         return result;
                     }
                 }
-                // else: absolute path, ".." above root is simply dropped.
+                // else: rooted path, ".." above the root is dropped.
             }
             else
             {
@@ -382,9 +457,42 @@ inline Result<void> Path::Normalize()
     // default one.
     String rebuilt;
 
-    if (Result<void> result = rebuilt.Append(root); result.HasError())
+    if (Result<void> result = rebuilt.Append(prefix); result.HasError())
     {
         return result;
+    }
+
+    // One separator between the root and the first segment. "/" and
+    // "C:/" always keep theirs; a UNC or device root keeps its trailing
+    // separator only if the input had one or segments follow. The bare
+    // "//" prefix already ends in a separator.
+    const bool prefixEndsInSeparator = !prefix.Empty() && prefix[prefix.Size() - 1] == '/';
+    const bool needSeparator = rooted && !prefixEndsInSeparator &&
+                               (prefix.Empty() || separatorAfterPrefix || !stack.Empty());
+
+    if (needSeparator)
+    {
+        if (Result<void> result = rebuilt.Append('/'); result.HasError())
+        {
+            return result;
+        }
+    }
+
+    // A relative path whose first remaining segment looks like a drive
+    // ("./C:/x", or "b/../C:x") must keep a leading "./", or dropping the
+    // "." / ".." would turn it into a drive path (Phase 7.9, found by the
+    // "Normalize preserves IsAbsolute()" property).
+    if (prefix.Empty() && !rooted && !stack.Empty())
+    {
+        const StringView first = stack[0];
+
+        if (first.Size() >= 2 && IsAsciiAlpha(first[0]) && first[1] == ':')
+        {
+            if (Result<void> result = rebuilt.Append(StringView("./")); result.HasError())
+            {
+                return result;
+            }
+        }
     }
 
     for (Size i = 0; i < stack.Size(); ++i)

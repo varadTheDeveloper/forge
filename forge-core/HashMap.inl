@@ -3,6 +3,8 @@
 #include <memory>
 #include <utility>
 
+#include "Assert.h"
+#include "CheckedMath.h"
 #include "Construct.h"
 
 namespace forge::core
@@ -85,10 +87,43 @@ bool HashMap<K, V>::Empty() const noexcept
 }
 
 template<typename K, typename V>
+constexpr typename HashMap<K, V>::SizeType
+HashMap<K, V>::MaxCapacity() noexcept
+{
+    SizeType limit = MaxElementCount<K>();
+
+    if (MaxElementCount<V>() < limit)
+    {
+        limit = MaxElementCount<V>();
+    }
+
+    if (MaxElementCount<SlotState>() < limit)
+    {
+        limit = MaxElementCount<SlotState>();
+    }
+
+    SizeType capacity = MinCapacity();
+
+    while (capacity <= limit / 2)
+    {
+        capacity *= 2;
+    }
+
+    return capacity;
+}
+
+template<typename K, typename V>
 typename HashMap<K, V>::SizeType
 HashMap<K, V>::NextCapacity(
     SizeType atLeast) noexcept
 {
+    // Returns 0 when no allowed capacity is large enough; callers treat
+    // that as an overflow error.
+    if (atLeast > MaxCapacity())
+    {
+        return 0;
+    }
+
     SizeType capacity = MinCapacity();
 
     while (capacity < atLeast)
@@ -109,7 +144,10 @@ bool HashMap<K, V>::NeedsGrowth() const noexcept
 
     // Keep load factor (including tombstones, which cost probe length
     // just as much as real entries do) under 75%.
-    return (size_ + tombstones_ + 1) * 4 > capacity_ * 3;
+    // used > 3/4 of capacity_, written so it cannot overflow (capacity_
+    // is a power of two >= MinCapacity(), so this is exact).
+    const SizeType used = size_ + tombstones_ + 1;
+    return used > capacity_ - capacity_ / 4;
 }
 
 template<typename K, typename V>
@@ -118,6 +156,11 @@ Result<void> HashMap<K, V>::GrowIfNeeded()
     if (!NeedsGrowth())
     {
         return {};
+    }
+
+    if (capacity_ >= MaxCapacity())
+    {
+        return Result<void>(Failure{ Error(ErrorCode::Overflow) });
     }
 
     return RehashTo(
@@ -134,8 +177,20 @@ Result<void> HashMap<K, V>::Reserve(
     }
 
     // ceil(minSize / 0.75) == ceil(minSize * 4 / 3).
-    const SizeType required = (minSize * 4 + 2) / 3;
+    SizeType scaled = 0;
+
+    if (!CheckedMul(minSize, 4, &scaled) || !CheckedAdd(scaled, 2, &scaled))
+    {
+        return Result<void>(Failure{ Error(ErrorCode::Overflow) });
+    }
+
+    const SizeType required = scaled / 3;
     const SizeType newCapacity = NextCapacity(required);
+
+    if (newCapacity == 0)
+    {
+        return Result<void>(Failure{ Error(ErrorCode::Overflow) });
+    }
 
     if (newCapacity <= capacity_)
     {
@@ -149,6 +204,9 @@ template<typename K, typename V>
 Result<void> HashMap<K, V>::RehashTo(
     SizeType newCapacity)
 {
+    // Every caller computes newCapacity through NextCapacity() or a
+    // MaxCapacity()-checked doubling, so the byte sizes below fit.
+    FORGE_RELEASE_ASSERT(newCapacity >= MinCapacity() && newCapacity <= MaxCapacity());
     void* statesMemory = allocator_->Allocate(
         newCapacity * sizeof(SlotState),
         alignof(SlotState));

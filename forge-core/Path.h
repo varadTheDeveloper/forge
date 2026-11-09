@@ -95,9 +95,15 @@ public:
     /// Rewrites the path in place: collapses "." segments and repeated/
     /// mixed separators, and resolves ".." against a preceding real
     /// segment where possible (never escaping above a leading ".." in a
-    /// relative path, or above an absolute root). Purely textual — does
-    /// not touch the filesystem, so it can't know whether a ".." crosses
-    /// a symlink. A relative path that normalizes to nothing becomes ".".
+    /// relative path, or above a root). Roots are preserved exactly
+    /// (Phase 7.9): a UNC share ("//server/share") and a device path's
+    /// volume ("//?/C:", "//?/UNC/server/share") are part of the root, so
+    /// ".." can't cross them, and a drive-relative path keeps its drive
+    /// ("C:foo/../.." becomes "C:.."). Purely textual — does not touch the
+    /// filesystem, so it can't know whether a ".." crosses a symlink, and
+    /// it does not flag alternate data streams or DOS device names (that
+    /// is the job of Kavach's canonicalizer). A relative path that
+    /// normalizes to nothing becomes ".".
     Result<void> Normalize();
 
     void Swap(
@@ -128,10 +134,29 @@ private:
     static bool IsAsciiAlpha(
         char c) noexcept;
 
-    /// True for "/", "C:/"-style drive roots, or "//" (bare UNC root).
+    /// True when `text` is nothing but a rooted root: "/", "C:/", a UNC
+    /// root ("//server/share", with or without a trailing "/"), a device
+    /// root ("//?/C:/", "//./PIPE", "//?/UNC/server/share"), or the bare
+    /// "//". A drive-relative "C:" is not a root.
     [[nodiscard]]
     static bool IsRootPath(
         StringView text) noexcept;
+
+    /// Splits the root off a '/'-separated path (Phase 7.9).
+    ///
+    /// `prefix` receives the root text without its trailing separator:
+    /// "" for "/" and for relative paths, "C:" for "C:/" and "C:foo",
+    /// "//server/share" for UNC, "//?/C:" or "//?/UNC/server/share" for
+    /// device paths. `rooted` is true when ".." can never climb above the
+    /// root ("/", "C:/", UNC, device); it is false for relative and
+    /// drive-relative ("C:foo") paths. Returns how many characters of
+    /// `text` the root consumed, including one separator after `prefix`
+    /// if there was one.
+    [[nodiscard]]
+    static SizeType SplitRoot(
+        StringView text,
+        StringView* prefix,
+        bool* rooted) noexcept;
 
 private:
 

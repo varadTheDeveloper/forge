@@ -48,6 +48,7 @@ namespace forge::core
 namespace
 {
 
+using platform::TranslateWin32Error;
 using platform::TranslateWinsockError;
 
 //==============================================================================
@@ -168,6 +169,64 @@ int FillSockaddr(
     return static_cast<int>(sizeof(sockaddr_in6));
 }
 
+/// Creates a TCP socket that child processes can never inherit (Phase
+/// 7.9). socket() creates an inheritable handle by default; once Forge
+/// spawns child processes, an inheritable listening or connected socket
+/// would leak into them. WSA_FLAG_OVERLAPPED matches what socket() sets.
+SOCKET CreateNonInheritableSocket(
+    int family) noexcept
+{
+    return WSASocketW(
+        family,
+        SOCK_STREAM,
+        IPPROTO_TCP,
+        nullptr,
+        0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+}
+
+/// Converts a peer sockaddr into an Endpoint, unwrapping IPv4-mapped
+/// IPv6 addresses. Returns false for an unexpected address family.
+bool EndpointFromSockaddr(
+    const sockaddr_storage& storage,
+    Endpoint& out) noexcept
+{
+    if (storage.ss_family == AF_INET)
+    {
+        const sockaddr_in* v4 = reinterpret_cast<const sockaddr_in*>(&storage);
+        const u8* b = reinterpret_cast<const u8*>(&v4->sin_addr);
+        out = Endpoint(IpAddress::V4(b[0], b[1], b[2], b[3]), ntohs(v4->sin_port));
+        return true;
+    }
+
+    if (storage.ss_family == AF_INET6)
+    {
+        const sockaddr_in6* v6 = reinterpret_cast<const sockaddr_in6*>(&storage);
+        const u8* b = reinterpret_cast<const u8*>(&v6->sin6_addr);
+        const u16 port = ntohs(v6->sin6_port);
+
+        bool mapped = b[10] == 0xFF && b[11] == 0xFF;
+
+        for (int i = 0; i < 10 && mapped; ++i)
+        {
+            mapped = b[i] == 0;
+        }
+
+        if (mapped)
+        {
+            out = Endpoint(IpAddress::V4(b[12], b[13], b[14], b[15]), port);
+        }
+        else
+        {
+            out = Endpoint(IpAddress::V6(Span<const u8>(b, 16)), port);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace
 
 //==============================================================================
@@ -237,7 +296,7 @@ Result<Socket> Socket::Connect(
 
     const int family = remote.Address().IsV4() ? AF_INET : AF_INET6;
 
-    const SOCKET native = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    const SOCKET native = CreateNonInheritableSocket(family);
 
     if (native == INVALID_SOCKET)
     {
@@ -268,25 +327,27 @@ Result<Socket> Socket::Listen(
 
     const int family = local.Address().IsV4() ? AF_INET : AF_INET6;
 
-    const SOCKET native = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    const SOCKET native = CreateNonInheritableSocket(family);
 
     if (native == INVALID_SOCKET)
     {
         return Result<Socket>(Failure{ TranslateWinsockError(WSAGetLastError()) });
     }
 
-    // SO_REUSEADDR so restarting a listener immediately after it closes
-    // doesn't spuriously fail with WSAEADDRINUSE while the OS still has
-    // the port in TIME_WAIT — the one socket option Socket.md's
-    // Non-Goals explicitly calls out as needed internally by Listen().
-    const int reuse = 1;
+    // Phase 7.9: this used to set SO_REUSEADDR. On Windows that option
+    // does not mean what it means on POSIX: it lets ANOTHER socket, even
+    // in another process, bind the same port and steal connections
+    // (study 09; libuv deliberately never sets it). SO_EXCLUSIVEADDRUSE
+    // forbids that instead. Windows' TIME_WAIT handling already lets a
+    // listener restart on the same port in the common case.
+    const int exclusive = 1;
 
     if (setsockopt(
             native,
             SOL_SOCKET,
-            SO_REUSEADDR,
-            reinterpret_cast<const char*>(&reuse),
-            static_cast<int>(sizeof(reuse))) == SOCKET_ERROR)
+            SO_EXCLUSIVEADDRUSE,
+            reinterpret_cast<const char*>(&exclusive),
+            static_cast<int>(sizeof(exclusive))) == SOCKET_ERROR)
     {
         const Error error = TranslateWinsockError(WSAGetLastError());
         closesocket(native);
@@ -322,19 +383,48 @@ Result<Socket> Socket::Listen(
 
 Result<Socket> Socket::Accept()
 {
+    Endpoint ignored;
+    return Accept(ignored);
+}
+
+Result<Socket> Socket::Accept(
+    Endpoint& peer)
+{
     if (handle_ == nullptr || !isListening_)
     {
         return Result<Socket>(Failure{ Error(ErrorCode::InvalidOperation) });
     }
 
-    const SOCKET accepted = accept(NativeSocket(handle_), nullptr, nullptr);
+    sockaddr_storage address{};
+    int addressLength = static_cast<int>(sizeof(address));
+
+    const SOCKET accepted = accept(
+        NativeSocket(handle_),
+        reinterpret_cast<sockaddr*>(&address),
+        &addressLength);
 
     if (accepted == INVALID_SOCKET)
     {
         return Result<Socket>(Failure{ TranslateWinsockError(WSAGetLastError()) });
     }
 
-    return Result<Socket>(Socket(ToHandle(accepted)));
+    // Wrap first, so every failure path below closes the socket.
+    Socket result(ToHandle(accepted));
+
+    // The listening socket is already non-inheritable, but clear the flag
+    // on the accepted handle explicitly rather than rely on inheritance of
+    // that property (Phase 7.9).
+    if (!SetHandleInformation(reinterpret_cast<HANDLE>(accepted), HANDLE_FLAG_INHERIT, 0))
+    {
+        return Result<Socket>(Failure{ TranslateWin32Error(GetLastError()) });
+    }
+
+    if (!EndpointFromSockaddr(address, peer))
+    {
+        return Result<Socket>(Failure{ Error(ErrorCode::NotSupported) });
+    }
+
+    return Result<Socket>(std::move(result));
 }
 
 //==============================================================================

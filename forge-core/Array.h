@@ -3,6 +3,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "Assert.h"
 #include "Types.h"
 
 namespace forge::core
@@ -43,6 +44,7 @@ public:
     constexpr T& operator[](
         SizeType index) noexcept
     {
+        FORGE_RELEASE_ASSERT(index < N);
         return data_[index];
     }
 
@@ -50,6 +52,7 @@ public:
     constexpr const T& operator[](
         SizeType index) const noexcept
     {
+        FORGE_RELEASE_ASSERT(index < N);
         return data_[index];
     }
 

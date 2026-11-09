@@ -67,6 +67,15 @@ public:
     [[nodiscard]]
     Result<Socket> Accept();
 
+    /// Same as Accept(), and also reports the connecting peer's address
+    /// in `peer` (Phase 7.9: the plain Accept() discards it). An
+    /// IPv4-mapped IPv6 peer ("::ffff:a.b.c.d", reported by dual-stack
+    /// listeners) is returned as the plain IPv4 address, so callers
+    /// comparing peers against allow-lists see one form only.
+    [[nodiscard]]
+    Result<Socket> Accept(
+        Endpoint& peer);
+
     [[nodiscard]]
     bool IsOpen() const noexcept;
 

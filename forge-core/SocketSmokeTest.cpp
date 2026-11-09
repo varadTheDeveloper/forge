@@ -140,16 +140,21 @@ void RunSocketEchoTest()
     // ThreadingSmokeTest.cpp's producer/consumer test uses for shared
     // state, just via move instead of by-reference capture.
     bool serverOk = true;
+    bool peerIsLoopback = false;
 
     Result<Thread> server = Thread::Create(
-        [listenerSocket = std::move(listener.Value()), &serverOk]() mutable {
-            Result<Socket> accepted = listenerSocket.Accept();
+        [listenerSocket = std::move(listener.Value()), &serverOk, &peerIsLoopback]() mutable {
+            // Phase 7.9: Accept(peer) reports the client's address.
+            Endpoint peer;
+            Result<Socket> accepted = listenerSocket.Accept(peer);
 
             if (!accepted.HasValue())
             {
                 serverOk = false;
                 return;
             }
+
+            peerIsLoopback = peer.Address() == IpAddress::V4(127, 0, 0, 1) && peer.Port() != 0;
 
             Socket connection = std::move(accepted.Value());
 
@@ -207,6 +212,29 @@ void RunSocketEchoTest()
 
     CHECK(!server.Value().Join().HasError());
     CHECK(serverOk);
+    CHECK(peerIsLoopback);
+}
+
+/// Phase 7.9: Listen() used to set SO_REUSEADDR, which on Windows lets a
+/// second socket bind the same port and steal connections. With
+/// SO_EXCLUSIVEADDRUSE a second Listen() on a port already in use must
+/// fail.
+void RunSocketExclusiveBindTest()
+{
+    std::printf("RunSocketExclusiveBindTest...\n");
+
+    const Endpoint endpoint(IpAddress::V4(127, 0, 0, 1), 53423);
+
+    Result<Socket> first = Socket::Listen(endpoint, /*backlog=*/1);
+    CHECK(first.HasValue());
+
+    if (!first.HasValue())
+    {
+        return;
+    }
+
+    Result<Socket> second = Socket::Listen(endpoint, /*backlog=*/1);
+    CHECK(second.HasError());
 }
 
 /// Connect() to a port nothing is listening on must fail with a
@@ -229,6 +257,7 @@ int main()
 {
     RunSocketEchoTest();
     RunSocketConnectRefusedTest();
+    RunSocketExclusiveBindTest();
 
     if (g_failures == 0)
     {

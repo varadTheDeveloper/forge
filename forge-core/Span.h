@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Assert.h"
 #include "Types.h"
 
 namespace forge::core
@@ -54,18 +55,21 @@ public:
     constexpr T& operator[](
         SizeType index) const noexcept
     {
+        FORGE_RELEASE_ASSERT(index < size_);
         return data_[index];
     }
 
     [[nodiscard]]
     constexpr T& Front() const noexcept
     {
+        FORGE_RELEASE_ASSERT(size_ > 0);
         return data_[0];
     }
 
     [[nodiscard]]
     constexpr T& Back() const noexcept
     {
+        FORGE_RELEASE_ASSERT(size_ > 0);
         return data_[size_ - 1];
     }
 
