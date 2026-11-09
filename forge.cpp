@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "js/CallAndConstruct.h"
 #include "js/String.h"
@@ -28,6 +29,18 @@
 #include "js/experimental/TypedData.h"
 #include "js/PropertyDescriptor.h"  // JSPROP_ENUMERATE (Phase 7.3, fs.statSync)
 
+// Phase 7.9 (all confirmed by reading the headers in this tree):
+//   js/ContextOptions.h      -- ContextOptions::setAsyncStack*()
+//   js/GCVector.h            -- JS::StackGCVector, named by JSCSPEvalChecker
+//   js/Principals.h          -- JSSecurityCallbacks / JSCSPEvalChecker
+//   js/Stack.h               -- JS::BuildStackString (stack traces)
+//   js/friend/ErrorMessages.h -- js::GetErrorMessage / JSMSG_NOT_FUNCTION
+#include "js/ContextOptions.h"
+#include "js/GCVector.h"
+#include "js/Principals.h"
+#include "js/Stack.h"
+#include "js/friend/ErrorMessages.h"
+
 // JS_NewPlainObject (Phase 7.3, fs's namespace object and statSync's
 // returned {size} object) is not exposed under js/public -- confirmed by
 // reading js/public/Object.h directly, which has no object-construction
@@ -38,6 +51,7 @@
 #include "jsapi.h"
 
 #include "forge-core/platform/IoLoop.h"
+#include "forge-core/platform/Process.h"
 #include "forge-core/Assert.h"
 #include "forge-core/File.h"
 #include "forge-core/HashMap.h"
@@ -70,31 +84,141 @@ static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback);
 class JsTimerRegistry;
 static JsTimerRegistry& GetRuntimeTimers(JSContext* cx);
 
+//==============================================================================
+// Process state (Phase 7.9)
+//
+// Forge follows Node's rules for fatal errors: an uncaught exception (in
+// the main script, a timer callback or a microtask) or an unhandled
+// Promise rejection prints the error with its stack trace and ends the
+// process with exit code 1. Before Phase 7.9 a throwing microtask was never
+// removed from the queue, unhandled rejections were silently ignored, and
+// the process exited 0 in both cases.
+//
+// g_stopRequested makes the event loop stop as soon as a fatal error has
+// been reported; nothing else runs after it.
+//==============================================================================
+
+static int g_exitCode = 0;
+static bool g_stopRequested = false;
+
+// Runtime code-generation policy, consulted by the engine's security
+// callback (ForgeCodeGenerationAllowed below) for every eval(), new
+// Function(...) and WebAssembly compilation. Both default to allowed;
+// the CLI flags --disallow-code-generation-from-strings and
+// --disallow-wasm turn them off. Kavach (Phase 9) will make this per
+// package; for now the hook exists and is enforced process-wide.
+struct CodeGenerationPolicy {
+  bool allowStrings{true};
+  bool allowWasm{true};
+};
+
+static CodeGenerationPolicy g_codeGenPolicy;
+
+static bool ForgeCodeGenerationAllowed(
+    JSContext* cx, JS::RuntimeCode kind, JS::Handle<JSString*> codeString,
+    JS::CompilationType compilationType,
+    JS::Handle<JS::StackGCVector<JSString*>> parameterStrings,
+    JS::Handle<JSString*> bodyString,
+    JS::Handle<JS::StackGCVector<JS::Value>> parameterArgs,
+    JS::Handle<JS::Value> bodyArg, bool* outCanCompileStrings) {
+  (void)cx;
+  (void)codeString;
+  (void)compilationType;
+  (void)parameterStrings;
+  (void)bodyString;
+  (void)parameterArgs;
+  (void)bodyArg;
+
+  *outCanCompileStrings =
+      kind == JS::RuntimeCode::WASM ? g_codeGenPolicy.allowWasm : g_codeGenPolicy.allowStrings;
+  return true;
+}
+
+static const JSSecurityCallbacks kForgeSecurityCallbacks = {
+    ForgeCodeGenerationAllowed,  // contentSecurityPolicyAllows
+    nullptr,                     // codeForEvalGets (spec default)
+    nullptr,                     // subsumes (single principal for now)
+};
+
+// Prints a saved-frame stack object (the stack captured when an exception
+// was thrown) to stderr. Silent if there is no stack.
+static void PrintExceptionStack(JSContext* cx, JS::HandleObject stack) {
+  if (!stack) {
+    return;
+  }
+
+  JS::RootedString str(cx);
+
+  if (!JS::BuildStackString(cx, nullptr, stack, &str, 2) || !str) {
+    JS_ClearPendingException(cx);
+    return;
+  }
+
+  JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, str);
+
+  if (!utf8) {
+    JS_ClearPendingException(cx);
+    return;
+  }
+
+  fprintf(stderr, "Stack:\n%s", utf8.get());
+}
+
+// Prints an exception value plus its stack (Phase 7.9).
+static void PrintExceptionReport(JSContext* cx, const JS::ExceptionStack& exn,
+                                 const char* context) {
+  JS::ErrorReportBuilder report(cx);
+
+  if (!report.init(cx, exn, JS::ErrorReportBuilder::NoSideEffects)) {
+    JS_ClearPendingException(cx);
+    fprintf(stderr, "Forge: %s failed (could not describe the error)\n", context);
+    return;
+  }
+
+  JS::PrintError(stderr, report, false);
+  PrintExceptionStack(cx, exn.stack());
+}
+
 // Prints (and consumes) whatever exception is currently pending on `cx`,
-// tagged with `context` for the "could not even retrieve it" fallback
-// case. Shared by every callback boundary that calls into JS and cannot
-// propagate a C++ exception on failure (there are no C++ exceptions in
-// this codebase — see forge-core's Result<T>/AGENTS.md philosophy; this is
-// the JS-engine-boundary equivalent: report, don't throw, don't silently
-// drop it).
+// including its stack trace (Phase 7.9), tagged with `context` for the
+// fallback cases. Shared by every callback boundary that calls into JS and
+// cannot propagate a C++ exception on failure (there are no C++ exceptions
+// in this codebase — see forge-core's Result<T>/AGENTS.md philosophy; this
+// is the JS-engine-boundary equivalent: report, don't throw, don't
+// silently drop it).
 static void ReportPendingException(JSContext* cx, const char* context) {
   if (!JS_IsExceptionPending(cx)) {
+    // JS::Call/Evaluate returned false with nothing pending: an
+    // uncatchable error (for example, the engine terminated the script).
+    fprintf(stderr, "Forge: %s terminated by an uncatchable error\n", context);
     return;
   }
 
   JS::ExceptionStack exn(cx);
 
-  if (JS::StealPendingExceptionStack(cx, &exn)) {
-    JS::ErrorReportBuilder report(cx);
-
-    if (report.init(cx, exn, JS::ErrorReportBuilder::NoSideEffects)) {
-      JS::PrintError(stderr, report.report(), false);
-      return;
-    }
+  if (!JS::StealPendingExceptionStack(cx, &exn)) {
+    JS_ClearPendingException(cx);
+    fprintf(stderr, "Forge: %s failed (exception pending, but could not be retrieved)\n",
+            context);
+    return;
   }
 
-  fprintf(stderr, "Forge: %s failed (exception pending, but could not be retrieved)\n",
-          context);
+  PrintExceptionReport(cx, exn, context);
+}
+
+// Reports the pending exception as uncaught and makes the process exit
+// with code 1 once the event loop unwinds.
+static void ReportFatalException(JSContext* cx, const char* context) {
+  fprintf(stderr, "Uncaught exception in %s:\n", context);
+  ReportPendingException(cx, context);
+  g_exitCode = 1;
+  g_stopRequested = true;
+}
+
+// Throws a TypeError "<what> is not a function" on cx.
+static bool ThrowNotFunction(JSContext* cx, const char* what) {
+  JS_ReportErrorNumberASCII(cx, js::GetErrorMessage, nullptr, JSMSG_NOT_FUNCTION, what);
+  return false;
 }
 
 // No `arguments` field here (unlike JsTimer below): ForgeJobQueue::runJobs()
@@ -146,24 +270,50 @@ class ForgeJobQueue : public JS::JobQueue {
     return true;
   }
 
+  // Phase 7.9, matching SpiderMonkey's own InternalJobQueue::runJobs
+  // (js/src/vm/JSContext.cpp):
+  //   * the job is popped BEFORE it runs. Before, a job that threw was
+  //     never removed, so the next drain ran it again forever;
+  //   * each job runs inside its own function's realm (JSAutoRealm), not
+  //     whatever realm happened to be current. With one realm today this
+  //     changes nothing; it becomes essential once packages get their own
+  //     realms and compartments (Phase 9). Every job is a function in the
+  //     single compartment that exists today, never a cross-compartment
+  //     wrapper; Phase 9 must revisit this when compartments arrive;
+  //   * JS::JobQueueIsEmpty() before the last job lets the engine skip
+  //     queueing for a trailing `await` (it verifies the async function is
+  //     the topmost frame itself), and EnqueueMicrotask() undoes it;
+  //   * JS::ClearKeptObjects() after the drain, so WeakRef targets kept
+  //     alive during this turn can be collected (ECMAScript ClearKeptObjects).
+  // An exception thrown by a job is fatal (exit code 1), as in Node.
   void runJobs(JSContext* cx) override {
-    while (!microtasks.Empty()) {
-      Microtask* task = microtasks.Front().Get();
+    while (!microtasks.Empty() && !g_stopRequested) {
+      forge::core::memory::UniquePtr<Microtask> task = std::move(microtasks.Front());
+      microtasks.Pop();
 
-      JS::RootedObject callback(cx, task->callback);
-      JS::RootedValue thisValue(cx, JS::UndefinedValue());
-      JS::RootedValue rval(cx);
-
-      bool ok = JS::Call(cx, thisValue, callback, JS::HandleValueArray::empty(),
-                         JS::MutableHandleValue(&rval));
-
-      if (!ok) {
-        ReportPendingException(cx, "microtask");
-        return;
+      if (microtasks.Empty()) {
+        JS::JobQueueIsEmpty(cx);
       }
 
-      microtasks.Pop();
+      JS::RootedObject callback(cx, task->callback);
+      task.Reset();
+
+      JS::RootedValue rval(cx);
+      bool ok;
+
+      {
+        JSAutoRealm ar(cx, callback);
+        ok = JS::Call(cx, JS::UndefinedHandleValue, callback, JS::HandleValueArray::empty(),
+                      &rval);
+      }
+
+      if (!ok) {
+        ReportFatalException(cx, "microtask");
+      }
     }
+
+    JS::JobQueueMayNotBeEmpty(cx);
+    JS::ClearKeptObjects(cx);
   }
 
   bool enqueuePromiseJob(JSContext* cx, JS::HandleObject promise,
@@ -311,6 +461,12 @@ static void ForgeTimerFired(void* userData) noexcept {
   bool repeat = timer->repeat;
   int jsId = timer->jsId;
 
+  // Phase 7.9: after a fatal error nothing else may run, even if the
+  // loop delivers more timers in the same RunOnce() batch.
+  if (g_stopRequested) {
+    return;
+  }
+
   JS::RootedObject callback(cx, timer->callback);
   JS::RootedValue thisValue(cx, JS::UndefinedValue());
   JS::RootedValue rval(cx);
@@ -319,7 +475,7 @@ static void ForgeTimerFired(void* userData) noexcept {
                      JS::MutableHandleValue(&rval));
 
   if (!ok) {
-    ReportPendingException(cx, "timer callback");
+    ReportFatalException(cx, "timer callback");
   }
 
   // Must be last: on a one-shot timer this destroys *timer (via the
@@ -473,6 +629,10 @@ class Runtime {
   explicit Runtime(JSContext* cx)
       : cx_(cx), loop_(), timers_(loop_), jobQueue_() {
     JS::SetJobQueue(cx, &jobQueue_);
+
+    // Phase 7.9: track Promises rejected with no handler, so they can be
+    // reported (and made fatal) once the microtask queue drains.
+    JS::SetPromiseRejectionTrackerCallback(cx, &Runtime::TrackPromiseRejection, this);
   }
 
   // Must be called exactly once, after construction and before any timer
@@ -514,9 +674,22 @@ class Runtime {
   // in-flight async fs read (no timer pending) would look identical to
   // "nothing left to do", and the process would exit before that read
   // ever completes. See FsAsync.md's Design Goals for the full reasoning.
+  //
+  // Phase 7.9: after every microtask drain, any Promise still rejected
+  // without a handler is reported and ends the process with exit code 1
+  // (Node's default since v15). The loop also stops at once after any
+  // fatal error (g_stopRequested).
   void run() {
     for (;;) {
       jobQueue_.runJobs(cx_);
+
+      if (!g_stopRequested) {
+        ReportUnhandledRejections();
+      }
+
+      if (g_stopRequested) {
+        break;
+      }
 
       if (jobQueue_.empty() && loop_.Empty() && pendingAsyncOps_ == 0) {
         break;
@@ -631,6 +804,10 @@ class Runtime {
     for (auto entry : pendingFsMiscOps_) {
       JS::TraceEdge(trc, &entry.Value()->promise, "forge-async-fs-promise");
     }
+
+    for (forge::core::Size i = 0; i < unhandledRejections_.Size(); ++i) {
+      JS::TraceEdge(trc, &unhandledRejections_[i]->promise, "forge-unhandled-rejection");
+    }
   }
 
   // Releases every still-pending timer, and stops the worker pool.
@@ -656,11 +833,18 @@ class Runtime {
   // running to observe it either way once run() has already exited, so
   // this is a silent-but-harmless loss of that operation's result, not a
   // crash or UB. Not addressed further by this milestone.
+  //
+  // Phase 7.9: also releases any microtasks still queued (a fatal error
+  // stops the drain early) and tracked rejections, while cx is alive.
+  // The microtask queue is a static object; left non-empty, its JS::Heap
+  // entries would be destroyed after JS_DestroyContext.
   void Shutdown() {
     workerPool_.Shutdown();
     pendingFsReadOps_.Clear();
     pendingFsMiscOps_.Clear();
     timers_.Clear();
+    microtasks.Clear();
+    unhandledRejections_.Clear();
   }
 
  private:
@@ -682,6 +866,85 @@ class Runtime {
   // frozen per FsAsync.md's Dependencies section (nothing here touches
   // IocpLoop.h/.cpp).
   forge::core::Size pendingAsyncOps_{ 0 };
+
+  // Phase 7.9: Promises currently rejected with no handler, oldest first.
+  struct TrackedRejection {
+    JS::Heap<JSObject*> promise;
+  };
+
+  forge::core::Vector<forge::core::memory::UniquePtr<TrackedRejection>> unhandledRejections_;
+
+  // JS::PromiseRejectionTrackerCallback. Called synchronously by the
+  // engine when a Promise is rejected with no handler (Unhandled), and when
+  // a handler is attached later (Handled).
+  static void TrackPromiseRejection(JSContext* cx, bool mutedErrors, JS::HandleObject promise,
+                                    JS::PromiseRejectionHandlingState state, void* data) {
+    (void)mutedErrors;
+    auto* self = static_cast<Runtime*>(data);
+    auto& list = self->unhandledRejections_;
+
+    if (state == JS::PromiseRejectionHandlingState::Handled) {
+      for (forge::core::Size i = 0; i < list.Size(); ++i) {
+        if (list[i]->promise.unbarrieredGet() == promise.get()) {
+          for (forge::core::Size j = i; j + 1 < list.Size(); ++j) {
+            list[j] = std::move(list[j + 1]);
+          }
+
+          list.PopBack();
+          return;
+        }
+      }
+
+      return;
+    }
+
+    forge::core::Result<forge::core::memory::UniquePtr<TrackedRejection>> made =
+        forge::core::memory::MakeUnique<TrackedRejection>();
+
+    if (made.HasValue()) {
+      made.Value()->promise = promise;
+
+      if (list.PushBack(std::move(made.Value())).HasValue()) {
+        return;
+      }
+    }
+
+    // Out of memory while tracking: fail closed rather than silently lose
+    // an unhandled rejection.
+    (void)cx;
+    fprintf(stderr, "Forge: out of memory while tracking an unhandled Promise rejection\n");
+    g_exitCode = 1;
+    g_stopRequested = true;
+  }
+
+  // Reports every still-unhandled rejection (with the reason's own stack
+  // when it is an Error) and makes the process exit with code 1.
+  void ReportUnhandledRejections() {
+    if (unhandledRejections_.Empty()) {
+      return;
+    }
+
+    for (forge::core::Size i = 0; i < unhandledRejections_.Size(); ++i) {
+      JS::RootedObject promise(cx_, unhandledRejections_[i]->promise);
+      JSAutoRealm ar(cx_, promise);
+
+      JS::RootedValue reason(cx_, JS::GetPromiseResult(promise));
+      JS::RootedObject stack(cx_);
+
+      if (reason.isObject()) {
+        JS::RootedObject reasonObj(cx_, &reason.toObject());
+        stack = JS::ExceptionStackOrNull(reasonObj);
+      }
+
+      fprintf(stderr, "Uncaught (in promise):\n");
+      JS::ExceptionStack exn(cx_, reason, stack);
+      PrintExceptionReport(cx_, exn, "unhandled promise rejection");
+    }
+
+    unhandledRejections_.Clear();
+    g_exitCode = 1;
+    g_stopRequested = true;
+  }
 };
 
 static void TraceForgeRoots(JSTracer* trc, void* data) {
@@ -747,22 +1010,35 @@ static bool Print(JSContext* cx, unsigned argc, JS::Value* vp) {
   return true;
 }
 
-static bool SetTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
+// Shared by setTimeout and setInterval (Phase 7.9). Before, both
+// returned false WITHOUT setting an exception when called with fewer than
+// two arguments or a non-object callback. Returning false with nothing
+// pending is SpiderMonkey's "uncatchable termination" signal, so
+// `setTimeout(fn)` silently killed the whole script. Now:
+//   * the delay is optional and defaults to 0, as in browsers and Node;
+//   * a non-callable callback throws a catchable TypeError (Forge never
+//     evaluates a string callback);
+//   * a delay that is negative or NaN becomes 0, and one above
+//     2147483647 ms becomes 1, as in Node. Casting a huge double straight
+//     to uint64_t was undefined behaviour.
+static bool ScheduleJsTimer(JSContext* cx, unsigned argc, JS::Value* vp, bool repeat) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  const char* name = repeat ? "setInterval" : "setTimeout";
 
-  if (argc < 2) {
-    return false;
+  if (!args.get(0).isObject() || !JS::IsCallable(&args[0].toObject())) {
+    return ThrowNotFunction(cx, repeat ? "setInterval callback" : "setTimeout callback");
   }
-  if (!args[0].isObject()) {
-    return false;
-  }
+
   double delay = 0;
 
-  if (!JS::ToNumber(cx, args[1], &delay)) {
+  if (args.length() >= 2 && !JS::ToNumber(cx, args[1], &delay)) {
     return false;
   }
-  if (delay < 0 || !(delay == delay)) {  // NaN-safe: NaN < 0 is false, so clamp NaN explicitly too.
+
+  if (!(delay >= 0)) {  // also catches NaN
     delay = 0;
+  } else if (delay > 2147483647.0) {
+    delay = 1;
   }
 
   forge::core::Result<forge::core::memory::UniquePtr<JsTimer>> made =
@@ -777,18 +1053,19 @@ static bool SetTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
 
   JS::RootedObject callback(cx, &args[0].toObject());
   timer->callback = callback;
-  timer->repeat = false;
+  timer->repeat = repeat;
 
   for (unsigned i = 2; i < args.length(); i++) {
     if (!timer->arguments.append(args[i])) {
+      JS_ReportOutOfMemory(cx);
       return false;
     }
   }
 
-  int id = GetRuntime(cx)->timers().Add(std::move(timer), (uint64_t)delay);
+  int id = GetRuntime(cx)->timers().Add(std::move(timer), static_cast<uint64_t>(delay));
 
   if (id < 0) {
-    JS_ReportErrorASCII(cx, "setTimeout: failed to schedule timer");
+    JS_ReportErrorASCII(cx, "%s: failed to schedule timer", name);
     return false;
   }
 
@@ -796,11 +1073,19 @@ static bool SetTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
 
   return true;
 }
+
+static bool SetTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
+  return ScheduleJsTimer(cx, argc, vp, /*repeat=*/false);
+}
 static bool ClearTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
 
+  // Phase 7.9: clearTimeout() with no argument is a no-op (browsers and
+  // Node); it used to return false with no exception, which terminated
+  // the script.
   if (argc < 1) {
-    return false;
+    args.rval().setUndefined();
+    return true;
   }
 
   int32_t id;
@@ -816,53 +1101,7 @@ static bool ClearTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
   return true;
 }
 static bool SetInterval(JSContext* cx, unsigned argc, JS::Value* vp) {
-  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
-
-  if (argc < 2) {
-    return false;
-  }
-  if (!args[0].isObject()) {
-    return false;
-  }
-  double delay = 0;
-
-  if (!JS::ToNumber(cx, args[1], &delay)) {
-    return false;
-  }
-  if (delay < 0 || !(delay == delay)) {
-    delay = 0;
-  }
-
-  forge::core::Result<forge::core::memory::UniquePtr<JsTimer>> made =
-      forge::core::memory::MakeUnique<JsTimer>(cx);
-
-  if (made.HasError()) {
-    JS_ReportOutOfMemory(cx);
-    return false;
-  }
-
-  forge::core::memory::UniquePtr<JsTimer> timer = std::move(made.Value());
-
-  JS::RootedObject callback(cx, &args[0].toObject());
-  timer->callback = callback;
-  timer->repeat = true;
-
-  for (unsigned i = 2; i < args.length(); i++) {
-    if (!timer->arguments.append(args[i])) {
-      return false;
-    }
-  }
-
-  int id = GetRuntime(cx)->timers().Add(std::move(timer), (uint64_t)delay);
-
-  if (id < 0) {
-    JS_ReportErrorASCII(cx, "setInterval: failed to schedule timer");
-    return false;
-  }
-
-  args.rval().setInt32(id);
-
-  return true;
+  return ScheduleJsTimer(cx, argc, vp, /*repeat=*/true);
 }
 static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback) {
   forge::core::Result<forge::core::memory::UniquePtr<Microtask>> made =
@@ -881,16 +1120,18 @@ static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback) {
     return false;
   }
 
+  // Undo any JS::JobQueueIsEmpty() from runJobs: the queue is not empty
+  // any more (Phase 7.9; same as the engine's InternalJobQueue).
+  JS::JobQueueMayNotBeEmpty(cx);
   return true;
 }
 static bool QueueMicrotask(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
-  if (argc < 1) {
-    return false;
-  }
 
-  if (!args[0].isObject()) {
-    return false;
+  // Phase 7.9: a missing or non-callable argument is a catchable
+  // TypeError, not a silent termination.
+  if (!args.get(0).isObject() || !JS::IsCallable(&args[0].toObject())) {
+    return ThrowNotFunction(cx, "queueMicrotask callback");
   }
 
   JS::RootedObject callback(cx, &args[0].toObject());
@@ -1670,6 +1911,123 @@ static bool RunMarshallingSmokeTests(JSContext* cx) {
       {"ThrowJsError basic fields", SelfTest_ThrowJsErrorBasicFields},
       {"ThrowJsError PlatformError nativeCode",
        SelfTest_ThrowJsErrorPlatformErrorNativeCode},
+  };
+
+  bool allOk = true;
+
+  for (const Case& c : cases) {
+    const bool ok = c.fn(cx);
+    printf("[self-test] %-40s %s\n", c.name, ok ? "PASS" : "FAIL");
+    allOk = allOk && ok;
+  }
+
+  return allOk;
+}
+
+//==============================================================================
+// Phase 7.9 runtime-safety self-tests -- run via `forge --self-test`.
+//
+// Each case evaluates a small script that must return the string "ok".
+// Exit-code behaviour (uncaught errors and unhandled rejections exit 1)
+// cannot be tested inside this process; tests/run-runtime-tests.ps1
+// covers it by running forge.exe on the scripts in tests/.
+//==============================================================================
+
+static bool ExpectScriptReturnsOk(JSContext* cx, const char* label, const char* script) {
+  JS::RootedValue rval(cx);
+
+  if (!EvaluateExpression(cx, script, &rval)) {
+    fprintf(stderr, "  FAIL %s: script threw\n", label);
+    ReportPendingException(cx, label);
+    return false;
+  }
+
+  forge::core::Result<forge::core::String> text = ToForgeString(cx, rval);
+
+  if (text.HasError()) {
+    JS_ClearPendingException(cx);
+    fprintf(stderr, "  FAIL %s: result is not a string\n", label);
+    return false;
+  }
+
+  if (text.Value().View() != forge::core::StringView("ok")) {
+    fprintf(stderr, "  FAIL %s: got '%s'\n", label, text.Value().CStr());
+    return false;
+  }
+
+  return true;
+}
+
+static bool SelfTest_SetTimeoutWithoutDelay(JSContext* cx) {
+  return ExpectScriptReturnsOk(cx, "setTimeout(fn) without delay",
+      "(() => { const id = setTimeout(() => {}); clearTimeout(id);"
+      "  return typeof id === 'number' ? 'ok' : 'id is ' + typeof id; })()");
+}
+
+static bool SelfTest_SetTimeoutRejectsNonCallable(JSContext* cx) {
+  return ExpectScriptReturnsOk(cx, "setTimeout(non-function) throws TypeError",
+      "(() => { try { setTimeout(); return 'no throw'; }"
+      "  catch (e) { if (!(e instanceof TypeError)) return 'wrong error: ' + e; }"
+      "  try { setInterval('code', 1); return 'no throw (string)'; }"
+      "  catch (e) { return e instanceof TypeError ? 'ok' : 'wrong error: ' + e; } })()");
+}
+
+static bool SelfTest_ClearTimeoutWithoutArgument(JSContext* cx) {
+  return ExpectScriptReturnsOk(cx, "clearTimeout() without argument",
+      "(() => { clearTimeout(); clearTimeout(undefined); return 'ok'; })()");
+}
+
+static bool SelfTest_QueueMicrotaskRejectsNonCallable(JSContext* cx) {
+  return ExpectScriptReturnsOk(cx, "queueMicrotask(1) throws TypeError",
+      "(() => { try { queueMicrotask(1); return 'no throw'; }"
+      "  catch (e) { return e instanceof TypeError ? 'ok' : 'wrong error: ' + e; } })()");
+}
+
+static bool SelfTest_SharedArrayBufferDisabled(JSContext* cx) {
+  return ExpectScriptReturnsOk(cx, "SharedArrayBuffer is disabled",
+      "typeof SharedArrayBuffer === 'undefined' ? 'ok' : 'SharedArrayBuffer exists'");
+}
+
+// Flips the process-wide code-generation policy for the duration of one
+// script and restores it afterwards, so the hook is proven installed.
+static bool SelfTest_CodeGenerationPolicy(JSContext* cx) {
+  const CodeGenerationPolicy saved = g_codeGenPolicy;
+  bool ok = true;
+
+  g_codeGenPolicy.allowStrings = true;
+  ok = ExpectScriptReturnsOk(cx, "eval allowed by default",
+           "eval('1 + 1') === 2 ? 'ok' : 'eval returned the wrong value'") && ok;
+
+  g_codeGenPolicy.allowStrings = false;
+  ok = ExpectScriptReturnsOk(cx, "eval/new Function blocked by policy",
+           "(() => { try { eval('1'); return 'eval ran'; } catch (e) {"
+           "    if (!(e instanceof EvalError)) return 'wrong error: ' + e; }"
+           "  try { new Function('return 1'); return 'Function ran'; } catch (e) {"
+           "    return e instanceof EvalError ? 'ok' : 'wrong error: ' + e; } })()") && ok;
+
+  g_codeGenPolicy = saved;
+  g_codeGenPolicy.allowWasm = false;
+  ok = ExpectScriptReturnsOk(cx, "WebAssembly blocked by policy",
+           "(() => { try { new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]));"
+           "  return 'compiled'; } catch (e) { return 'ok'; } })()") && ok;
+
+  g_codeGenPolicy = saved;
+  return ok;
+}
+
+static bool RunRuntimeSafetySmokeTests(JSContext* cx) {
+  struct Case {
+    const char* name;
+    bool (*fn)(JSContext*);
+  };
+
+  const Case cases[] = {
+      {"setTimeout(fn) without delay", SelfTest_SetTimeoutWithoutDelay},
+      {"setTimeout(non-function) TypeError", SelfTest_SetTimeoutRejectsNonCallable},
+      {"clearTimeout() without argument", SelfTest_ClearTimeoutWithoutArgument},
+      {"queueMicrotask(1) TypeError", SelfTest_QueueMicrotaskRejectsNonCallable},
+      {"SharedArrayBuffer disabled", SelfTest_SharedArrayBufferDisabled},
+      {"code generation policy hook", SelfTest_CodeGenerationPolicy},
   };
 
   bool allOk = true;
@@ -3699,49 +4057,112 @@ static bool RunFsAsyncSmokeTests(JSContext* cx, Runtime& runtime) {
   return allOk;
 }
 
+static void PrintUsage() {
+  printf("Forge JavaScript Runtime\n\n");
+  printf("Usage:\n");
+  printf("  forge [options] <file.js>   Run a JavaScript file\n");
+  printf("  forge --self-test           Run the built-in self-tests\n");
+  printf("  forge --version             Show runtime version\n");
+  printf("  forge --help                Show this help\n\n");
+  printf("Options:\n");
+  printf("  --disallow-code-generation-from-strings   Make eval() and new Function() throw\n");
+  printf("  --disallow-wasm                           Make WebAssembly compilation throw\n");
+  printf("  --async-stacks                            Capture async stack traces (slower)\n");
+  printf("  --max-heap-mb=N                           Cap the JS heap at N MB (default: no cap)\n");
+}
+
 int main(int argc, char* argv[]) {
-      if (argc == 1) {
-        printf("Forge JavaScript Runtime\n");
-        printf("Usage:\n");
-        printf("  forge <file.js>\n");
-        printf("  forge --version\n");
-        printf("  forge --help\n");
-        return 0;
-    }
+  // Phase 7.9 (R22): before anything can load a DLL.
+  forge::core::platform::HardenProcess();
 
-    std::string command = argv[1];
+  // Runtime options come before the command or script name (Phase 7.9).
+  bool asyncStacks = false;
+  uint32_t maxHeapBytes = 0xffffffff;  // JSGC_MAX_BYTES default: no cap
+  int argIndex = 1;
 
-    if (command == "--version") {
-        printf("Forge v0.1.0\n");
-        return 0;
-    }
+  for (; argIndex < argc; ++argIndex) {
+    const char* arg = argv[argIndex];
 
-    if (command == "--help") {
-        printf("Forge JavaScript Runtime\n\n");
-        printf("Commands:\n");
-        printf("  forge <file.js>    Run a JavaScript file\n");
-        printf("  forge --version    Show runtime version\n");
-        printf("  forge --help       Show this help\n");
-        return 0;
+    if (strcmp(arg, "--disallow-code-generation-from-strings") == 0) {
+      g_codeGenPolicy.allowStrings = false;
+    } else if (strcmp(arg, "--disallow-wasm") == 0) {
+      g_codeGenPolicy.allowWasm = false;
+    } else if (strcmp(arg, "--async-stacks") == 0) {
+      asyncStacks = true;
+    } else if (strncmp(arg, "--max-heap-mb=", 14) == 0) {
+      char* end = nullptr;
+      const unsigned long mb = strtoul(arg + 14, &end, 10);
+
+      if (end == arg + 14 || *end != '\0' || mb == 0 || mb > 4095) {
+        fprintf(stderr, "Forge: --max-heap-mb must be a whole number from 1 to 4095\n");
+        return 2;
+      }
+
+      maxHeapBytes = static_cast<uint32_t>(mb) * 1024u * 1024u;
+    } else {
+      break;
     }
+  }
+
+  if (argIndex >= argc) {
+    PrintUsage();
+    return 0;
+  }
+
+  std::string command = argv[argIndex];
+
+  if (command == "--version") {
+    printf("Forge v0.1.0\n");
+    return 0;
+  }
+
+  if (command == "--help") {
+    PrintUsage();
+    return 0;
+  }
+
+  if (command.size() > 2 && command[0] == '-' && command[1] == '-' && command != "--self-test") {
+    fprintf(stderr, "Forge: unknown option %s (see forge --help)\n", command.c_str());
+    return 2;
+  }
 
   if (!JS_Init()) { // this is where engine start
     return 1;
   }
 
-  // 8MB (the original value here) is a GC-trigger threshold, not a hard
-  // ceiling, but it was small enough to genuinely run out under real load:
-  // microtask-bench.js queues 200,000 distinct closures before any of them
-  // run, all simultaneously reachable (and therefore uncollectable) from
-  // the microtask queue, which exceeded it and surfaced as a JS-level
-  // "out of memory" exception. 512MB gives real workloads (Node/Bun both
-  // default to well over 1GB) comfortable headroom without being an
-  // arbitrary huge number.
-  JSContext* cx = JS_NewContext(512L * 1024 * 1024); // new context
+  // Phase 7.9: real GC settings instead of a fixed 512 MB hard cap.
+  // JS_NewContext's argument becomes JSGC_MAX_BYTES, a HARD heap limit
+  // (exceeding it is a JS "out of memory" error), not a GC trigger. So,
+  // like the SpiderMonkey shell: create the context with the engine's
+  // default, then lift the cap (0xffffffff, the engine's own default for
+  // JSGC_MAX_BYTES) unless --max-heap-mb asks for one, and let the engine
+  // tune its GC heuristics to the machine's physical memory.
+  JSContext* cx = JS_NewContext(JS::DefaultHeapMaxBytes); // new context
 
   if (!cx) {
     return 1;
   }
+
+  JS_SetGCParameter(cx, JSGC_MAX_BYTES, maxHeapBytes);
+
+  if (const forge::core::u64 physicalBytes = forge::core::platform::PhysicalMemoryBytes();
+      physicalBytes > 0) {
+    const forge::core::u64 physicalMb = physicalBytes / (1024u * 1024u);
+    JS_SetGCParametersBasedOnAvailableMemory(
+        cx, physicalMb > 0xffffffffu ? 0xffffffffu : static_cast<uint32_t>(physicalMb));
+  }
+
+  // Phase 7.9: async stack capture on every Promise reaction is the most
+  // likely cause of Forge's slow Promise steps (study 10: ~1.3 us vs
+  // ~113 ns in Bun). By default stacks are captured only for debuggees
+  // (Forge has no debugger yet, so: never); --async-stacks turns full
+  // capture back on. The cost: Error.stack inside async code does not
+  // show the async callers. Benchmark both ways before deciding for good.
+  JS::ContextOptionsRef(cx).setAsyncStack(true).setAsyncStackCaptureDebuggeeOnly(!asyncStacks);
+
+  // Phase 7.9: every eval/new Function/WebAssembly compilation now passes
+  // through ForgeCodeGenerationAllowed, so policy has a place to live.
+  JS_SetSecurityCallbacks(cx, &kForgeSecurityCallbacks);
 
   if (!JS::InitSelfHostedCode(cx)) {
     return 1;
@@ -3774,7 +4195,11 @@ int main(int argc, char* argv[]) {
   // first.
   {
     JS::RealmOptions options;
-    options.creationOptions().setSharedMemoryAndAtomicsEnabled(true); // This Realm is allowed to use SharedArrayBuffer Atomics
+    // Phase 7.9: SharedArrayBuffer (and Atomics on shared memory) is OFF.
+    // Shared memory plus a fine timer is a Spectre-class side channel
+    // (study 15); browsers only allow it in cross-origin-isolated pages.
+    // It will come back behind an explicit permission later.
+    options.creationOptions().setSharedMemoryAndAtomicsEnabled(false);
 
     JS::RootedObject global(
         cx, JS_NewGlobalObject(cx, &globalClass, nullptr, JS::FireOnNewGlobalHook,
@@ -3821,6 +4246,7 @@ int main(int argc, char* argv[]) {
       // surfaces every failure at once rather than stopping at the first.
       if (command == "--self-test") {
         const bool marshallingOk = RunMarshallingSmokeTests(cx);
+        const bool runtimeSafetyOk = RunRuntimeSafetySmokeTests(cx);  // Phase 7.9
         const bool fsOk = RunFsSmokeTests(cx);
         // Phase 7.5.5: unlike the two suites above, this one calls
         // runtime.run() (possibly more than once -- see its own comment)
@@ -3830,7 +4256,7 @@ int main(int argc, char* argv[]) {
         // directory and some of RunFsSmokeTests' *Sync cases are not
         // idempotent across ordering with this suite's own fixture setup.
         const bool fsAsyncOk = RunFsAsyncSmokeTests(cx, runtime);
-        const bool ok = marshallingOk && fsOk && fsAsyncOk;
+        const bool ok = marshallingOk && runtimeSafetyOk && fsOk && fsAsyncOk;
         printf("[self-test] %s\n", ok ? "ALL PASSED" : "FAILURES ABOVE");
         runtime.Shutdown();
         return ok ? 0 : 1;
@@ -3840,11 +4266,13 @@ int main(int argc, char* argv[]) {
       // returned at the top of main(), so argc >= 2 is guaranteed by this
       // point. The old dead check has been removed.
 
+      const char* scriptArg = argv[argIndex];
+
       forge::core::Result<forge::core::Path> scriptPath =
-          forge::core::Path::Create(forge::core::StringView(argv[1]));
+          forge::core::Path::Create(forge::core::StringView(scriptArg));
 
       if (scriptPath.HasError()) {
-        fprintf(stderr, "Forge: invalid script path %s\n", argv[1]);
+        fprintf(stderr, "Forge: invalid script path %s\n", scriptArg);
         return 1;
       }
 
@@ -3852,7 +4280,7 @@ int main(int argc, char* argv[]) {
           forge::core::File::ReadAllText(scriptPath.Value());
 
       if (source.HasError()) {
-        fprintf(stderr, "Forge: cannot read %s (error code %d)\n", argv[1],
+        fprintf(stderr, "Forge: cannot read %s (error code %d)\n", scriptArg,
                 static_cast<int>(source.Error().Code()));
         return 1;
       }
@@ -3867,10 +4295,10 @@ int main(int argc, char* argv[]) {
       JS::RootedValue rval(cx);
 
       JS::CompileOptions opts(cx);
-      opts.setFileAndLine(argv[1], 1);
+      opts.setFileAndLine(scriptArg, 1);
 
       if (!JS::Evaluate(cx, opts, src, &rval)) {
-        ReportPendingException(cx, "script evaluation");
+        ReportFatalException(cx, scriptArg);
         // The script may have already called setTimeout/setInterval before
         // failing — release those before cx goes away, same reasoning as
         // the runtime.Shutdown() call after the event loop below.
@@ -3889,5 +4317,7 @@ int main(int argc, char* argv[]) {
   JS_DestroyContext(cx);
   JS_ShutDown();
 
-  return 0;
+  // Phase 7.9: 1 after an uncaught exception or unhandled rejection
+  // during the event loop (it used to be 0 no matter what).
+  return g_exitCode;
 }

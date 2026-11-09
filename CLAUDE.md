@@ -39,10 +39,16 @@ python mach build
 Output binary: `obj-spider\dist\bin\forge.exe`. `.mozconfig` sets
 `--enable-project=js` and `MOZ_OBJDIR=obj-spider`.
 
-`build.bat` (run from the tree root) does `mach build` then copies the binary to
-`C:\Forge\bin\forge.exe`; `install.ps1` does the copy alone. **Always re-copy
-after a build** — a stale `C:\Forge\bin\forge.exe` has already caused a
-false "missing binding" failure during a benchmark run.
+After a build, copy the binary AND `mozglue.dll` (forge.exe imports it) to
+`C:\Forge\bin\` -- there is no build.bat/install.ps1 in the tree:
+
+```
+Copy-Item obj-spider\dist\bin\forge.exe, obj-spider\dist\bin\mozglue.dll C:\Forge\bin\ -Force
+```
+
+**Always re-copy after a build** -- a stale `C:\Forge\bin\forge.exe` has already
+caused a false "missing binding" failure during a benchmark run. Run mach with
+Python 3.12 or older (3.14 breaks mach's command loader).
 
 `moz.build` lists the production `SOURCES`. A new `.cpp` under `forge-core/`
 must be added there (case-insensitively sorted) or it silently never compiles;

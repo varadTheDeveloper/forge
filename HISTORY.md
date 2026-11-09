@@ -3125,3 +3125,128 @@ real-build-confirmed individually (7.5.1-7.5.4), covered by a formal
 Promise-based self-test harness (7.5.5), and now benchmarked against
 Bun/Node with real numbers (7.5.6). No known open items remain for this
 phase.
+
+## Phase 7.9: foundation fixes (2026-11-09)
+
+The first phase of Master Plan v2. No new features: it fixes known bugs
+from the research studies and puts safe defaults in place before
+modules and Kavach are built on top. Every change is marked `Phase 7.9`
+in the code.
+
+**Runtime correctness (`forge.cpp`)**
+
+- **Microtasks are popped before they run.** A microtask that threw was
+  never removed from the queue, so it ran again on every drain. Each job
+  now also runs in its own function's realm (`JSAutoRealm`), and the queue
+  calls `JS::JobQueueIsEmpty` / `JobQueueMayNotBeEmpty` and
+  `JS::ClearKeptObjects` exactly like SpiderMonkey's own
+  `InternalJobQueue` (js/src/vm/JSContext.cpp).
+- **Uncaught errors are fatal, with a stack trace.** An exception in the
+  main script, a timer callback or a microtask prints the error plus its
+  stack and the process exits with code 1. Nothing runs after it. Before,
+  the process exited 0.
+- **Unhandled Promise rejections exit 1** (`JS::SetPromiseRejectionTrackerCallback`).
+  They are reported once the microtask queue drains, like Node since v15.
+- **`setTimeout(fn)` works.** The delay was required; calling without it
+  returned `false` with no exception, which SpiderMonkey treats as an
+  uncatchable termination, so the script silently died. The same bug hit
+  `clearTimeout()` and `queueMicrotask()` with missing arguments. Missing
+  delays now default to 0, non-callable callbacks throw a catchable
+  `TypeError`, delays above 2^31-1 ms become 1 ms (Node), and the
+  undefined-behaviour double-to-uint64 cast is gone.
+- Any microtasks still queued at shutdown are released while the
+  context is alive (the queue is a static object).
+
+**Safe defaults**
+
+- **SharedArrayBuffer is off** (Spectre risk, study 15).
+- **Code-generation hook installed** (`JS_SetSecurityCallbacks`): every
+  `eval`, `new Function` and WebAssembly compilation now goes through
+  `ForgeCodeGenerationAllowed`. New flags
+  `--disallow-code-generation-from-strings` and `--disallow-wasm`.
+- **Real GC settings** instead of the 512 MB *hard* cap
+  (`JS_NewContext`'s argument is `JSGC_MAX_BYTES`, a hard limit, not a
+  trigger). The heap is uncapped by default (`--max-heap-mb=N` sets one),
+  and GC heuristics are sized to physical memory.
+- **Async stack capture is off by default** (debuggee-only), the likely
+  cause of slow Promise steps (study 10). `--async-stacks` turns it back
+  on. **Needs an A/B benchmark run on real hardware before it is final.**
+- **DLL search hardening** at startup (`forge-core/platform/Process.cpp`):
+  only System32 and forge.exe's folder, never the current directory.
+
+**forge-core memory safety (rule R10)**
+
+- `FORGE_ASSERT` is now a release fast-fail (`__fastfail` on Windows).
+  The mach build defines `NDEBUG`, so every assert used to be compiled
+  out. New `FORGE_RELEASE_ASSERT` / `FORGE_DEBUG_ASSERT`.
+- Bounds checks on `operator[]`, `Front`, `Back` in `Vector`, `Queue`,
+  `String`, `Span` (so `StringView`) and `Array`.
+- **Checked size math** (`CheckedMath.h`) in `Vector`, `Queue`, `String`
+  and `HashMap`. This fixes the heap overflow study 13 reproduced with
+  ASan (`Vector<u64>::Reserve(SIZE_MAX/8 + 3)`). New `OverflowTest.cpp`.
+- **`Path::Normalize` rewritten** around a real root parser: UNC shares
+  (`//server/share`), device paths (`//?/C:`, `//?/UNC/...`, `//./PIPE`)
+  and drive-relative paths (`C:foo`) keep their root, and `..` can no
+  longer climb out of a share. A property fuzzer also found that
+  `./C:/x` normalized to the absolute `C:/x`; fixed (a leading `./` is
+  kept). New table in `PathTest.cpp`.
+- `File.cpp`: paths longer than `INT_MAX` bytes are rejected instead of
+  truncated, and reads/writes above 4 GiB are chunked instead of
+  silently truncated to a `DWORD`.
+
+**Sockets**
+
+- `SO_REUSEADDR` replaced with `SO_EXCLUSIVEADDRUSE`. On Windows,
+  `SO_REUSEADDR` lets another process bind the same port and steal
+  connections.
+- Sockets are created non-inheritable (`WSA_FLAG_NO_HANDLE_INHERIT`).
+- New `Socket::Accept(Endpoint& peer)` returns the peer address
+  (IPv4-mapped addresses unwrapped). Plain `Accept()` is unchanged.
+
+**Tests and CI**
+
+- `forge --self-test` has a new runtime-safety suite (timers,
+  queueMicrotask, SharedArrayBuffer, the code-generation hook).
+- `tests/run-runtime-tests.ps1` runs forge.exe on small scripts and
+  checks exit codes and output (uncaught errors, rejections, event order).
+- `.github/workflows/ci.yml` with `tools/ci/forge-core-tests.sh` (Linux,
+  ASan + UBSan) and `tools/ci/forge-core-tests.ps1` (Windows, MSVC). A CI
+  job that builds forge.exe itself comes with Phase 7.95.
+- `SECURITY.md` added.
+
+**Verification (honest)**
+
+- forge-core portable tests: **passed** under g++ 11 with ASan + UBSan
+  (Linux sandbox), including the new OverflowTest and the Path table. A
+  300,000-input Path property fuzz found one bug (fixed above), then 0.
+- Windows forge-core files (`File.cpp`, `Socket.cpp`, `Process.cpp`,
+  `IocpLoop.cpp`, threads) and every Windows smoke test: **compile and
+  link with MinGW g++ 13**, no warnings with `-Wall -Wextra`. Not run.
+- `forge.cpp`: **type-checks cleanly with clang 18 against this tree's
+  real SpiderMonkey headers** (`obj-spider/dist/include`, MinGW target).
+  This is not the real clang-cl `mach build`, and nothing has run yet.
+- **Still needed on the real machine:** `python mach build`, then
+  `forge --self-test`, `tests\run-runtime-tests.ps1`, the forge-core
+  smoke tests, and the benchmarks with and without `--async-stacks`.
+
+**Not done in this phase (moved on):** benchmarks still include startup
+time; install-folder ACLs; Unicode console and `wmain` (Phase 8).
+
+## Phase 7.9 real-build-confirmed (2026-11-09)
+
+Varad ran the real build on Windows: `python mach build` succeeded (no
+warnings from Forge's own files; mach needed Python 3.12, not conda's 3.14).
+Results with the freshly copied `C:\Forge\bin\forge.exe`:
+
+- `forge --self-test`: **ALL PASSED** (12 marshalling, 6 new
+  runtime-safety, 17 fs sync, 13 fs async cases).
+- `tests\run-runtime-tests.ps1`: **ALL PASSED** (9 scripts: clean exit,
+  `setTimeout(fn)`, event order, handled / unhandled / late-handled
+  rejections, uncaught errors in the script, a timer and a microtask).
+- `tools\ci\forge-core-tests.ps1` (MSVC, C++17, no exceptions): **ALL
+  PASSED** (17 tests, including the File, Socket, threading, timer and IOCP
+  smoke tests, OverflowTest and the new Path table).
+
+Still open: the `--async-stacks` A/B benchmark. Note also: `forge.exe`
+needs `mozglue.dll` next to it; `CLAUDE.md` now documents the copy step
+(the `build.bat`/`install.ps1` it used to mention do not exist).
