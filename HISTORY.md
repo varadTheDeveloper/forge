@@ -3250,3 +3250,86 @@ Results with the freshly copied `C:\Forge\bin\forge.exe`:
 Still open: the `--async-stacks` A/B benchmark. Note also: `forge.exe`
 needs `mozglue.dll` next to it; `CLAUDE.md` now documents the copy step
 (the `build.bat`/`install.ps1` it used to mention do not exist).
+
+## Phase 7.9 follow-up: async-stacks A/B (2026-11-09)
+
+One run each of `bench\promise-chain-bench.js` on Varad's machine:
+**63 ms** with the new default (async stacks captured only for debuggees)
+vs **96 ms** with `--async-stacks`. Including about 20 ms of startup, so the
+Promise work itself takes roughly 45% less time. The default stays. A full
+7-iteration `run-benchmarks.ps1` run should replace these single samples in
+`Forge_Benchmark_Report.md`.
+
+## Phase 7.95: moving to SpiderMonkey ESR 153 (started 2026-11-09)
+
+**Engine facts (verified):** Firefox 153.0esr shipped in July 2026; the
+`esr153` branch of github.com/mozilla-firefox/firefox is at 153.8.0esr,
+commit `c318e3511672a445f5e218f7c6360189de329924`, now pinned in
+`engine/engine.toml`. Mozilla supports it until 2027-09-21; ESR 175 follows.
+
+**What changed between 142 Nightly and ESR 153 for Forge** (found by
+type-checking forge.cpp against ESR 153's real headers):
+
+1. **The engine owns the microtask queue now** (`js/friend/MicroTask.h`).
+   `JS::JobQueue` lost `empty()` and `enqueuePromiseJob()`, and
+   `getHostDefinedData()` gained an incumbent-global parameter. Promise jobs
+   are engine "JS microtasks" run with `JS::RunJSMicroTask` in the realm of
+   `JS::GetExecutionGlobalFromJSMicroTask`; embedders enqueue their own jobs
+   with `JS::EnqueueMicroTask`. forge.cpp now has both job queues, selected
+   by `__has_include("js/friend/MicroTask.h")`
+   (`FORGE_ENGINE_OWNS_MICROTASK_QUEUE`), so the same file builds on 142 and
+   on ESR 153. The drain policy is identical on both.
+2. **ESR 153's headers require C++20** (`std::bit_width`, concepts, `<=>`).
+   Forge's code must now compile as both C++17 and C++20;
+   `tools/ci/forge-core-tests.sh` builds every forge-core test both ways.
+
+Nothing else in forge.cpp needed to change: the security callbacks,
+rejection tracker, ContextOptions, GC parameters and every other JSAPI call
+used today are the same in ESR 153.
+
+**Forge in its own repository:** github.com/varadTheDeveloper/forge is the
+source of truth. `tools/setup-engine.ps1` fetches the pinned engine commit
+(one commit deep), verifies it, copies Forge to `js/src/forge`, adds
+`"forge"` to `js/src/moz.build` (the only engine-tree change), and writes a
+`.mozconfig`. `VENDORED.toml` records the engine's owner, advisory feed and
+72-hour patch deadline (rule R23).
+
+**Verification (honest):**
+- forge.cpp type-checks with **zero errors** against ESR 153's headers as
+  C++20 (clang 18, MinGW target). The generated config headers came from the
+  142 build, with a hand-made stand-in for `js/PrefsGenerated.h`, so this is
+  a strong signal, not a build.
+- forge.cpp still type-checks cleanly against the 142 headers as C++17.
+- forge-core: all portable tests pass as C++17 and C++20 under ASan+UBSan;
+  all Windows files compile as C++20 with MinGW, no warnings.
+- **Not yet done:** a real `mach build` of ESR 153 with Forge, then
+  `--self-test`, the runtime tests and the benchmarks on it. A CI job that
+  builds the engine and forge.exe on GitHub Actions comes after the first
+  successful local ESR 153 build, so it copies steps that are known to work.
+
+## Phase 7.95 real-build-confirmed on SpiderMonkey ESR 153 (2026-11-09)
+
+Varad ran `tools\setup-engine.ps1`, `mach bootstrap` (SpiderMonkey) and
+`mach build` in `C:\forge-engine\esr153`. The build produced
+`obj-forge\dist\bin\forge.exe` against **MOZJS 153.8** (engine linked
+statically; only `mozglue.dll` is needed next to it). One fix was needed
+on the way: ESR 153's build runs SpiderMonkey's include-style checker
+(`config/check_spidermonkey_style.py`) over all of `js/src`, and Forge does
+not follow SpiderMonkey's include conventions. `setup-engine.ps1` now adds
+`js/src/forge/` to the checker's ignore list (the second and last change
+Forge makes inside the engine tree). The script also skips the ~1 GB
+download when the checkout is already at the pinned commit.
+
+Results with `C:\Forge\esr153\forge.exe`:
+
+- `forge --self-test`: **ALL PASSED** (48 cases). Every Promise, `await`,
+  `queueMicrotask` and async fs case now runs through ESR 153's
+  engine-owned microtask queue.
+- `tests\run-runtime-tests.ps1`: **ALL PASSED** (9 scripts).
+- `bench\promise-chain-bench.js`, one run: **42 ms** (63 ms on 142 with
+  the same Forge code). For reference only, the last full benchmark report
+  measured Bun at 44 ms and Node at 48 ms on this script; a proper
+  7-iteration run on ESR 153 is still to do.
+
+Still open for Phase 7.95: a CI job that builds the engine and forge.exe;
+deciding when to drop the 142 code path; the full benchmark rerun.

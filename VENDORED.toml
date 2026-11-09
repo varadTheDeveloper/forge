@@ -1,0 +1,15 @@
+# Every third-party component that ships inside forge.exe (rule R23).
+# Each entry names an owner, where security advisories are published, and
+# the deadline for shipping a fix after an advisory. CI will fail on known-
+# vulnerable versions once the advisory check is automated (Phase 8+).
+
+[[component]]
+name            = "SpiderMonkey (Firefox ESR)"
+version         = "153.8.0esr"
+pin             = "engine/engine.toml"
+license         = "MPL-2.0"
+owner           = "Varad Modhekar"
+advisories      = "https://www.mozilla.org/en-US/security/advisories/"
+patch_deadline  = "72 hours after Mozilla's release; 24 hours if exploited in the wild"
+end_of_support  = "2027-09-21 (move to ESR 175 before then)"
+notes           = "Includes mozglue (forge.exe imports mozglue.dll) and the vendored libraries inside the Firefox tree that the js build uses (ICU, fdlibm, double-conversion)."

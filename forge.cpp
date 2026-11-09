@@ -41,6 +41,18 @@
 #include "js/Stack.h"
 #include "js/friend/ErrorMessages.h"
 
+// Phase 7.95: engine compatibility. Newer SpiderMonkey (ESR 153) owns the
+// microtask queue itself and exposes it through js/friend/MicroTask.h; the
+// older engine (142 Nightly) asks the embedder to own it. Detecting the
+// header instead of comparing MOZJS_MAJOR_VERSION keeps this correct for
+// whichever version first shipped the new API.
+#if __has_include("js/friend/MicroTask.h")
+#  include "js/friend/MicroTask.h"
+#  define FORGE_ENGINE_OWNS_MICROTASK_QUEUE 1
+#else
+#  define FORGE_ENGINE_OWNS_MICROTASK_QUEUE 0
+#endif
+
 // JS_NewPlainObject (Phase 7.3, fs's namespace object and statSync's
 // returned {size} object) is not exposed under js/public -- confirmed by
 // reading js/public/Object.h directly, which has no object-construction
@@ -256,6 +268,11 @@ struct Microtask {
 //       Add() below.
 //==============================================================================
 
+#if !FORGE_ENGINE_OWNS_MICROTASK_QUEUE
+// ---- Engine before the MicroTask API (SpiderMonkey 142 Nightly) ----------
+// Forge owns the microtask queue and the engine hands it every Promise job
+// through enqueuePromiseJob().
+
 forge::core::Queue<forge::core::memory::UniquePtr<Microtask>> microtasks;
 
 class ForgeJobQueue : public JS::JobQueue {
@@ -331,6 +348,93 @@ js::UniquePtr<JS::JobQueue::SavedJobQueue> ForgeJobQueue::saveJobQueue(
     JSContext* cx) {
   return nullptr;
 }
+
+// True while Forge's own queue still holds a job.
+static bool MicrotasksPending(JSContext* cx) {
+  (void)cx;
+  return !microtasks.Empty();
+}
+
+#else  // FORGE_ENGINE_OWNS_MICROTASK_QUEUE
+// ---- Engine with the MicroTask API (SpiderMonkey ESR 153 and later) ------
+// Phase 7.95: the engine now owns the microtask queue (js/friend/MicroTask.h).
+// Promise jobs are engine "JS microtasks" that must be run with
+// JS::RunJSMicroTask inside the realm of JS::GetExecutionGlobalFromJSMicroTask.
+// queueMicrotask() callbacks are enqueued by Forge as plain function values;
+// the engine traces every queued value, so Forge keeps no queue or GC roots
+// of its own. The drain policy is unchanged from Phase 7.9: jobs are popped
+// before they run, JobQueueIsEmpty before the last one, ClearKeptObjects
+// after the drain, and an exception is fatal (exit code 1).
+// Mirrors InternalJobQueue::runJobs in ESR 153's js/src/vm/JSContext.cpp.
+
+class ForgeJobQueue : public JS::JobQueue {
+ public:
+  bool getHostDefinedData(JSContext* cx, JS::MutableHandle<JSObject*> incumbentGlobal,
+                          JS::MutableHandle<JSObject*> optionalHostDefinedData) const override {
+    (void)cx;
+    incumbentGlobal.set(nullptr);
+    optionalHostDefinedData.set(nullptr);
+    return true;
+  }
+
+  bool getHostDefinedGlobal(JSContext* cx, JS::MutableHandle<JSObject*> data) const override {
+    (void)cx;
+    data.set(nullptr);
+    return true;
+  }
+
+  bool isDrainingStopped() const override { return false; }
+
+  void runJobs(JSContext* cx) override {
+    JS::Rooted<JS::GenericMicroTask> next(cx);
+
+    while (!g_stopRequested && JS::HasAnyMicroTasks(cx)) {
+      next = JS::DequeueNextMicroTask(cx);
+
+      if (!JS::HasAnyMicroTasks(cx)) {
+        JS::JobQueueIsEmpty(cx);
+      }
+
+      bool ok = true;
+
+      if (JS::IsJSMicroTask(next)) {
+        JS::Rooted<JS::JSMicroTask*> job(cx, JS::ToMaybeWrappedJSMicroTask(next));
+        JS::RootedObject global(cx, JS::GetExecutionGlobalFromJSMicroTask(job));
+
+        if (!global) {
+          continue;  // dead wrapper: the engine skips these too
+        }
+
+        JSAutoRealm ar(cx, global);
+        ok = JS::RunJSMicroTask(cx, job);
+      } else if (next.isObject()) {
+        // A queueMicrotask() callback.
+        JS::RootedObject callback(cx, &next.toObject());
+        JS::RootedValue rval(cx);
+        JSAutoRealm ar(cx, callback);
+        ok = JS::Call(cx, JS::UndefinedHandleValue, callback, JS::HandleValueArray::empty(),
+                      &rval);
+      }
+
+      if (!ok) {
+        ReportFatalException(cx, "microtask");
+      }
+    }
+
+    JS::JobQueueMayNotBeEmpty(cx);
+    JS::ClearKeptObjects(cx);
+  }
+
+ protected:
+  js::UniquePtr<SavedJobQueue> saveJobQueue(JSContext* cx) override {
+    (void)cx;
+    return nullptr;  // only the Debugger API uses this; Forge has none yet
+  }
+};
+
+static bool MicrotasksPending(JSContext* cx) { return JS::HasAnyMicroTasks(cx); }
+
+#endif  // FORGE_ENGINE_OWNS_MICROTASK_QUEUE
 
 //==============================================================================
 // Timers
@@ -691,7 +795,7 @@ class Runtime {
         break;
       }
 
-      if (jobQueue_.empty() && loop_.Empty() && pendingAsyncOps_ == 0) {
+      if (!MicrotasksPending(cx_) && loop_.Empty() && pendingAsyncOps_ == 0) {
         break;
       }
 
@@ -843,7 +947,9 @@ class Runtime {
     pendingFsReadOps_.Clear();
     pendingFsMiscOps_.Clear();
     timers_.Clear();
+#if !FORGE_ENGINE_OWNS_MICROTASK_QUEUE
     microtasks.Clear();
+#endif
     unhandledRejections_.Clear();
   }
 
@@ -950,9 +1056,11 @@ class Runtime {
 static void TraceForgeRoots(JSTracer* trc, void* data) {
   auto* runtime = static_cast<Runtime*>(data);
 
+#if !FORGE_ENGINE_OWNS_MICROTASK_QUEUE
   for (forge::core::Size i = 0; i < microtasks.Size(); ++i) {
     JS::TraceEdge(trc, &microtasks[i]->callback, "forge-microtask-callback");
   }
+#endif
 
   runtime->TraceRoots(trc);
 }
@@ -1104,6 +1212,18 @@ static bool SetInterval(JSContext* cx, unsigned argc, JS::Value* vp) {
   return ScheduleJsTimer(cx, argc, vp, /*repeat=*/true);
 }
 static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback) {
+#if FORGE_ENGINE_OWNS_MICROTASK_QUEUE
+  // Phase 7.95: the engine queue holds (and traces) the callback itself.
+  if (!JS::EnqueueMicroTask(cx, JS::ObjectValue(*callback))) {
+    if (!JS_IsExceptionPending(cx)) {
+      JS_ReportOutOfMemory(cx);
+    }
+    return false;
+  }
+
+  JS::JobQueueMayNotBeEmpty(cx);
+  return true;
+#else
   forge::core::Result<forge::core::memory::UniquePtr<Microtask>> made =
       forge::core::memory::MakeUnique<Microtask>();
 
@@ -1124,6 +1244,7 @@ static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback) {
   // any more (Phase 7.9; same as the engine's InternalJobQueue).
   JS::JobQueueMayNotBeEmpty(cx);
   return true;
+#endif
 }
 static bool QueueMicrotask(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);

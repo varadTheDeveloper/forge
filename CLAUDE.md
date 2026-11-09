@@ -96,8 +96,10 @@ Results are written up in `Forge_Benchmark_Report.md`.
 
 ## Hard build constraints (each caused real bugs; see HISTORY.md)
 
-- **C++17, not C++20.** The mach build rejects C++20-only constructs even when a
-  sandbox `g++ -std=c++20` or a standalone VS project accepts them. No
+- **Must compile as BOTH C++17 and C++20** (Phase 7.95). The current 142 engine
+  build is C++17 and rejects C++20-only constructs; the ESR 153 engine's headers
+  require C++20. Until the move to ESR 153 is finished, write the common subset:
+  `tools/ci/forge-core-tests.sh` builds every test both ways. No
   `std::construct_at` (use `forge::core::detail::ConstructAt` from `Construct.h`),
   no `<bit>`, no constexpr destructors, no concepts, `<=>`, `consteval`/`constinit`,
   no `= default` on a friend comparison operator.
