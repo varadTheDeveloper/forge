@@ -3,6 +3,8 @@
 #include <memory>
 #include <utility>
 
+#include "../Assert.h"
+#include "../CheckedMath.h"
 #include "../Construct.h"
 
 namespace forge::core
@@ -17,6 +19,8 @@ constexpr typename Vector<T>::SizeType
 Vector<T>::AllocationSize(
     SizeType capacity) noexcept
 {
+    // Callers only ever pass a capacity that Reserve() has already checked
+    // against MaxElementCount<T>(), so this product cannot overflow.
     return capacity * sizeof(T);
 }
 
@@ -24,7 +28,8 @@ template<typename T>
 typename Vector<T>::SizeType
 Vector<T>::NextCapacity() const noexcept
 {
-    return capacity_ == 0 ? 1 : capacity_ * 2;
+    // Saturates at MaxElementCount<T>() instead of wrapping (Phase 7.9).
+    return GrowCapacity(capacity_, MaxElementCount<T>());
 }
 
 //==============================================================================
@@ -128,6 +133,7 @@ template<typename T>
 T& Vector<T>::operator[](
     SizeType index) noexcept
 {
+    FORGE_RELEASE_ASSERT(index < size_);
     return data_[index];
 }
 
@@ -135,30 +141,35 @@ template<typename T>
 const T& Vector<T>::operator[](
     SizeType index) const noexcept
 {
+    FORGE_RELEASE_ASSERT(index < size_);
     return data_[index];
 }
 
 template<typename T>
 T& Vector<T>::Front() noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[0];
 }
 
 template<typename T>
 const T& Vector<T>::Front() const noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[0];
 }
 
 template<typename T>
 T& Vector<T>::Back() noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[size_ - 1];
 }
 
 template<typename T>
 const T& Vector<T>::Back() const noexcept
 {
+    FORGE_RELEASE_ASSERT(size_ > 0);
     return data_[size_ - 1];
 }
 
@@ -173,6 +184,14 @@ Result<void> Vector<T>::Reserve(
     if (capacity <= capacity_)
     {
         return {};
+    }
+
+    // Phase 7.9: reject capacities whose byte size would overflow, instead
+    // of allocating a wrapped-around small block and then writing past it.
+    if (capacity > MaxElementCount<T>())
+    {
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
     }
 
     void* memory = allocator_->Allocate(
@@ -221,8 +240,16 @@ Result<void> Vector<T>::GrowIfNeeded()
         return {};
     }
 
-    return Reserve(
-        NextCapacity());
+    const SizeType next = NextCapacity();
+
+    if (next <= capacity_)
+    {
+        // Already at MaxElementCount<T>(): cannot grow any further.
+        return Result<void>(
+            Failure{ Error(ErrorCode::Overflow) });
+    }
+
+    return Reserve(next);
 }
 
 
