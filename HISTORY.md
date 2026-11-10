@@ -3442,3 +3442,28 @@ is retired (see `RETIRED.md` there).
 Working agreement: Varad runs builds and tests on his machine when asked;
 Claude makes the code changes, commits them under Varad's name and pushes
 them to GitHub.
+
+## Benchmarks: work time measured inside each script; report reorganised (2026-11-11)
+
+The 2026-11-10 run showed that the harness's totals are dominated by process
+startup on the short scripts. Changes:
+
+- Every `bench/*.js` script now measures its own workload with `Date.now()`
+  and prints `work-ms=<n>`. `run-benchmarks.ps1` records that alongside the
+  total, compares runtimes on work-time medians, prints startup separately,
+  saves the OS, CPU, RAM, power plan and runtime versions to
+  `bench/results/<timestamp>.env.txt`, runs from the `bench` folder (so the
+  fs scratch folders no longer land in whatever directory it was started
+  from), and defaults to 7 iterations.
+- Larger workloads where the old ones were a few milliseconds:
+  `loop-bench` fib(34) to fib(36), `timer-bench` 5,000 to 100,000 timers,
+  `microtask-bench` 200,000 to 1,000,000, `promise-chain-bench` 50,000 to
+  1,000,000 steps. Results for these four are not comparable across this
+  date.
+- `Forge_Benchmark_Report.md`: current results first, a "How the benchmarks
+  work" section, and the older runs moved under "History" with a list of the
+  conclusions that no longer hold.
+
+All eight scripts were checked under Node 22 in the sandbox (each prints its
+`work-ms` line). The PowerShell harness could not be run in the sandbox; its
+first run is Varad's.
