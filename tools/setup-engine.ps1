@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-  Sets up the pinned SpiderMonkey engine and builds Forge against it
-  (Phase 7.95). Forge stays in its own repository; the engine is a separate,
-  pinned Firefox ESR checkout with Forge placed at js/src/forge.
+  Sets up the pinned SpiderMonkey engine for building Forge (Phase 7.95).
+  Forge stays in its own repository; the engine is a separate, pinned
+  Firefox ESR checkout with a copy of Forge placed at js/src/forge.
 
 .DESCRIPTION
   1. Fetches exactly the commit in engine/engine.toml (shallow: one commit,
@@ -16,13 +16,15 @@
      include rules, like the other ignored directories there.
   4. Writes a .mozconfig for a SpiderMonkey-only build.
 
-  Then, in a Python 3.12 environment:
+  Then, once, in a Python 3.12 (or older) environment:
      cd <EngineDir>
      python mach bootstrap     (choose "SpiderMonkey JavaScript engine")
-     python mach build
 
-  The download is large (a full Firefox source tree, one commit deep:
-  plan for several GB of disk).
+  After that, tools\build.ps1 does the whole edit-build-test loop.
+
+  mach needs MozillaBuild installed at C:\mozilla-build. The download is
+  large (a full Firefox source tree, one commit deep: plan for several GB
+  of disk).
 
 .EXAMPLE
   .\tools\setup-engine.ps1 -EngineDir C:\forge-engine\esr153
@@ -55,6 +57,8 @@ if (-not $SyncOnly) {
     New-Item -ItemType Directory -Force -Path $EngineDir | Out-Null
     git -C $EngineDir init --quiet
     git -C $EngineDir remote add origin $repo
+    # The Firefox tree has paths longer than 260 characters.
+    git -C $EngineDir config core.longpaths true
   }
 
   # Skip the (large) download when the checkout is already at the pin.
@@ -127,8 +131,12 @@ if (-not (Test-Path $mozconfig)) {
 }
 
 Write-Host ""
-Write-Host "Next (in a Python 3.12 environment):"
+Write-Host "Next, once (in a Python 3.12 or older environment):"
 Write-Host "  cd $EngineDir"
 Write-Host "  python mach bootstrap     # choose: SpiderMonkey JavaScript engine"
-Write-Host "  python mach build"
-Write-Host "Then copy obj-forge\dist\bin\forge.exe and mozglue.dll to C:\Forge\bin\"
+Write-Host "Then build and test with:"
+Write-Host "  $forgeDir\tools\build.ps1 -Test"
+
+# robocopy leaves a non-zero (success) exit code behind; do not let it
+# become this script's exit code.
+exit 0
