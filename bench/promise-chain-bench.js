@@ -15,16 +15,20 @@
 // under a single big backlog.
 if (typeof print === "undefined") { var print = console.log; }
 
-var ITERATIONS = 50000;
+// 1,000,000 since 2026-11-11 (was 50,000, only 4-15 ms of work).
+// Not comparable with results before that date.
+var ITERATIONS = 1000000;
 var count = 0;
 
 function step() {
     count++;
     if (count >= ITERATIONS) {
         print("promise-chain-bench done, count=" + count);
+        print("work-ms=" + (Date.now() - BENCH_T0));
         return;
     }
     Promise.resolve().then(step);
 }
 
+var BENCH_T0 = Date.now(); // work timer (2026-11-11): run-benchmarks.ps1 reads the "work-ms=" line
 Promise.resolve().then(step);

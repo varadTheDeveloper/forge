@@ -114,6 +114,7 @@ function extraStep(j) {
     return fs.rm(ROUNDTRIP_PATH).then(function () {
       print("fs-async-bench done, iterations=" + ITERATIONS +
             ", extraIterations=" + EXTRA_ITERATIONS + ", checksum=" + checksum);
+      print("work-ms=" + (Date.now() - BENCH_T0));
     });
   }
 
@@ -135,6 +136,7 @@ function extraStep(j) {
   });
 }
 
+var BENCH_T0 = Date.now(); // work timer (2026-11-11): run-benchmarks.ps1 reads the "work-ms=" line
 fs.mkdir(SCRATCH_DIR, { recursive: true }).then(function () {
   return roundtripStep(0);
 }).catch(function (err) {

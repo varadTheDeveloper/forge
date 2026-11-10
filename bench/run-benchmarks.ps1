@@ -1,68 +1,39 @@
 <#
-Benchmark runner — Forge vs Bun vs Node.
+.SYNOPSIS
+  Benchmarks Forge against Bun and Node.
 
-Originally written for the Phase 0 baseline (startup.js/json-bench.js/
-loop-bench.js) and confirmed working end-to-end by the user at that
-point (see bench/results/*.csv for those runs). Extended after Phase 6
-(Runtime Integration) with three new scripts exercising the JS-visible
-surface that phase actually changed: timer-bench.js (setTimeout,
-backed by Phase 6's HashMap<int, UniquePtr<JsTimer>> timer registry),
-microtask-bench.js (queueMicrotask, backed by Phase 6's
-Queue<UniquePtr<Microtask>> microtask queue), and
-promise-chain-bench.js (sequential Promise.then() chaining, exercising
-the same microtask queue one continuation at a time rather than as one
-flat burst). This second batch has not yet been run end-to-end — please
-report back if anything errors out.
+.DESCRIPTION
+  Runs every benchmark script in this folder on whichever of forge.exe,
+  bun.exe and node.exe it finds. Each script is run once untimed (to check
+  it works and to warm the file cache), then -Iterations times.
 
-Extended again after Phase 7.3 (the `fs.*Sync` JS bindings, now
-real-build-confirmed -- see Fs.md/HISTORY.md) with fs-bench.js, exercising
-readFileSync/writeFileSync/appendFileSync/existsSync/mkdirSync/rmSync/
-statSync -- the first script able to close the "filesystem operations"
-gap the note below used to flag as not-yet-benchmarkable.
+  Two numbers are recorded per run:
 
-Extended again after Phase 7.5 (the Promise-returning `fs.*` JS bindings,
-now real-build-confirmed through 7.5.5 -- see FsAsync.md/HISTORY.md) with
-fs-async-bench.js, the async counterpart to fs-bench.js: same iteration
-counts and payload, chained through .then() one step at a time (see that
-script's own header comment for why concurrent calls over the same path
-would be a genuine race here, not just a style choice) rather than
-fs-bench.js's plain blocking for-loop. This is the first script in this
-suite whose entire body of work runs after the script itself finishes
-evaluating -- Runtime::run() has to actually drive it to completion --
-so it also exercises the same event-loop-lifetime path Phase 7.5.5's
-self-test harness isolates directly, as a byproduct rather than its main
-purpose. Has not yet been run end-to-end — please report back what it
-prints, same as every other script noted above.
+  * Total time: wall-clock time around the whole process, measured here.
+    Includes process startup, engine start-up and shutdown.
+  * Work time: the time the script itself measures around its workload
+    with Date.now() and prints as "work-ms=<n>" (millisecond resolution).
+    Excludes startup, so it compares how fast each runtime does the work.
 
-Usage:
-    .\run-benchmarks.ps1
-    .\run-benchmarks.ps1 -ForgePath "C:\Forge\bin\forge.exe" -Iterations 7
+  The comparison table uses work-time medians. Startup is compared on its
+  own with startup.js. Before 2026-11-11 only total time existed, and
+  Forge's ~30 ms faster startup decided the short benchmarks; see
+  Forge_Benchmark_Report.md.
 
-Runs every .js benchmark script in this folder against whichever of
-forge.exe / bun.exe / node.exe it can find, times each with
-Measure-Command (wall-clock around the whole process, matching how the
-architecture roadmap wants cold-start/throughput compared), and prints +
-logs a results table so progress is a number you can watch move, not a
-feeling.
+  Also records the machine and runtime versions next to the results, in
+  bench/results/<timestamp>.env.txt.
 
-Note on scope: this script covers what's actually JS-visible in Forge
-today (print/setTimeout/setInterval/clearTimeout/queueMicrotask, the
-fs.*Sync and Promise-returning fs.* surfaces added in Phase 7.3/7.5,
-plus whatever engine-native globals SpiderMonkey provides, like JSON and
-Promise). Forge Core's Socket/Thread (Phases 4-5) are still C++-only --
-nothing in forge.cpp has wired them up as JS-callable functions yet --
-so there is deliberately no networking or threading benchmark here;
-Node/Bun have net/worker_threads bindings to compare against, Forge
-doesn't yet have anything to point them at. (File was the exception:
-Phase 7.3 wired up the sync surface, Phase 7.5 the async one, so
-fs-bench.js/fs-async-bench.js now cover both.)
+.EXAMPLE
+  .\bench\run-benchmarks.ps1
+  .\bench\run-benchmarks.ps1 -ForgePath C:\Forge\bin\forge.exe -Iterations 7
 #>
-
 param(
     [string]$ForgePath = "C:\Forge\bin\forge.exe",
-    [int]$Iterations = 5
+    [int]$Iterations = 7
 )
 
+# No $ErrorActionPreference = "Stop": in Windows PowerShell 5.1 that turns
+# any line a runtime writes to stderr (captured with 2>&1) into a fatal error.
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Benchmarks = @(
     "startup.js",
@@ -77,17 +48,17 @@ $Benchmarks = @(
 
 function Resolve-Runtime {
     param([string]$CommandName, [string]$ExplicitPath)
-
-    if ($ExplicitPath -and (Test-Path $ExplicitPath)) {
-        return $ExplicitPath
-    }
-
+    if ($ExplicitPath -and (Test-Path $ExplicitPath)) { return $ExplicitPath }
     $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
-    if ($cmd) {
-        return $cmd.Source
-    }
-
+    if ($cmd) { return $cmd.Source }
     return $null
+}
+
+function Get-Median([double[]]$values) {
+    $sorted = $values | Sort-Object
+    $mid = [math]::Floor($sorted.Count / 2)
+    if ($sorted.Count % 2 -eq 0) { return ($sorted[$mid - 1] + $sorted[$mid]) / 2 }
+    return $sorted[$mid]
 }
 
 $Runtimes = [ordered]@{
@@ -96,100 +67,113 @@ $Runtimes = [ordered]@{
     "node"  = Resolve-Runtime "node.exe" $null
 }
 
-Write-Host "Detected runtimes:"
+# --- Environment -----------------------------------------------------------
+$envLines = New-Object System.Collections.Generic.List[string]
+$envLines.Add("Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')")
+try {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $envLines.Add("OS: $($os.Caption) $($os.Version) (build $($os.BuildNumber))")
+    $envLines.Add("CPU: $($cpu.Name.Trim()) ($($cpu.NumberOfCores) cores, $($cpu.NumberOfLogicalProcessors) threads)")
+    $envLines.Add("RAM: $([math]::Round($os.TotalVisibleMemorySize / 1MB, 1)) GB")
+} catch {
+    $envLines.Add("OS/CPU: could not be read ($($_.Exception.Message))")
+}
+try { $envLines.Add("Power plan: $((powercfg /getactivescheme) -join ' ')") } catch { }
 foreach ($key in $Runtimes.Keys) {
     $path = $Runtimes[$key]
-    if ($path) {
-        Write-Host ("  {0,-6} -> {1}" -f $key, $path)
-    } else {
-        Write-Host ("  {0,-6} -> NOT FOUND (skipping)" -f $key)
-    }
+    if (-not $path) { $envLines.Add("${key}: NOT FOUND (skipped)"); continue }
+    $version = (& $path --version 2>&1 | Select-Object -First 1)
+    $envLines.Add("${key}: $version ($path)")
 }
+$envLines.Add("Iterations: $Iterations (after one untimed warm-up run)")
+
+Write-Host "Environment:"
+$envLines | ForEach-Object { Write-Host "  $_" }
 Write-Host ""
 
+# --- Runs ------------------------------------------------------------------
 $Results = New-Object System.Collections.Generic.List[object]
 
-foreach ($bench in $Benchmarks) {
-    $scriptPath = Join-Path $ScriptDir $bench
-    if (-not (Test-Path $scriptPath)) {
-        Write-Warning "Missing benchmark script: $scriptPath"
-        continue
+# The fs benchmarks write a scratch folder into the current directory.
+Push-Location $ScriptDir
+try {
+    foreach ($bench in $Benchmarks) {
+        $scriptPath = Join-Path $ScriptDir $bench
+        if (-not (Test-Path $scriptPath)) { Write-Warning "Missing benchmark script: $scriptPath"; continue }
+
+        foreach ($runtimeName in $Runtimes.Keys) {
+            $exe = $Runtimes[$runtimeName]
+            if (-not $exe) { continue }
+
+            $output = & $exe $scriptPath 2>&1
+            if ($LASTEXITCODE -ne 0 -or ($output -join "`n") -match "FAILED") {
+                Write-Host ("{0,-24} {1,-6} FAILED (exit {2}): {3}" -f $bench, $runtimeName, $LASTEXITCODE, ($output -join ' '))
+                continue
+            }
+
+            $totals = New-Object System.Collections.Generic.List[double]
+            $works = New-Object System.Collections.Generic.List[double]
+            for ($i = 0; $i -lt $Iterations; $i++) {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $out = & $exe $scriptPath 2>&1
+                $sw.Stop()
+                $totals.Add($sw.Elapsed.TotalMilliseconds)
+                $m = [regex]::Match(($out -join "`n"), "work-ms=(\d+)")
+                if ($m.Success) { $works.Add([double]$m.Groups[1].Value) }
+            }
+
+            $row = [PSCustomObject]@{
+                Benchmark    = $bench
+                Runtime      = $runtimeName
+                TotalAvgMs   = [math]::Round(($totals | Measure-Object -Average).Average, 2)
+                TotalMedianMs = [math]::Round((Get-Median $totals), 2)
+                TotalMinMs   = [math]::Round(($totals | Measure-Object -Minimum).Minimum, 2)
+                WorkMedianMs = if ($works.Count -gt 0) { [math]::Round((Get-Median $works), 1) } else { $null }
+                WorkMinMs    = if ($works.Count -gt 0) { [math]::Round(($works | Measure-Object -Minimum).Minimum, 1) } else { $null }
+            }
+            $Results.Add($row)
+
+            Write-Host ("{0,-24} {1,-6} work median={2,9} ms   total median={3,10:N2} ms   total min={4,10:N2} ms" -f `
+                $bench, $runtimeName, $row.WorkMedianMs, $row.TotalMedianMs, $row.TotalMinMs)
+        }
+        Write-Host ""
     }
-
-    foreach ($runtimeName in $Runtimes.Keys) {
-        $exe = $Runtimes[$runtimeName]
-        if (-not $exe) {
-            continue
-        }
-
-        # One untimed run first: confirms the script actually runs and
-        # prints the expected marker, and warms the OS file cache so run
-        # #1 of the timed loop below isn't unfairly penalized.
-        $output = & $exe $scriptPath 2>&1
-        $exitCode = $LASTEXITCODE
-
-        if ($exitCode -ne 0) {
-            Write-Host ("{0,-24} {1,-6} FAILED (exit {2}): {3}" -f $bench, $runtimeName, $exitCode, ($output -join ' '))
-            continue
-        }
-
-        $times = New-Object System.Collections.Generic.List[double]
-        for ($i = 0; $i -lt $Iterations; $i++) {
-            $elapsed = Measure-Command { & $exe $scriptPath *> $null }
-            $times.Add($elapsed.TotalMilliseconds)
-        }
-
-        $avg = ($times | Measure-Object -Average).Average
-        $min = ($times | Measure-Object -Minimum).Minimum
-
-        # Median alongside avg/min: avg is easily skewed by one slow outlier
-        # run (a stray GC pause, OS scheduling hiccup, etc.), especially at
-        # the default -Iterations 5 -- median is a steadier number to
-        # actually compare runtimes on.
-        $sorted = $times | Sort-Object
-        $mid = [math]::Floor($sorted.Count / 2)
-        if ($sorted.Count % 2 -eq 0) {
-            $median = ($sorted[$mid - 1] + $sorted[$mid]) / 2
-        } else {
-            $median = $sorted[$mid]
-        }
-
-        $Results.Add([PSCustomObject]@{
-            Benchmark = $bench
-            Runtime   = $runtimeName
-            AvgMs     = [math]::Round($avg, 2)
-            MedianMs  = [math]::Round($median, 2)
-            MinMs     = [math]::Round($min, 2)
-        })
-
-        Write-Host ("{0,-24} {1,-6} avg={2,10:N2} ms   median={3,10:N2} ms   min={4,10:N2} ms" -f $bench, $runtimeName, $avg, $median, $min)
-    }
-    Write-Host ""
+} finally {
+    Pop-Location
 }
 
-Write-Host "=== Forge vs Bun / Node (ratio < 1.0 means Forge is faster; based on MedianMs) ==="
-foreach ($bench in $Benchmarks) {
-    $forgeRow = $Results | Where-Object { $_.Benchmark -eq $bench -and $_.Runtime -eq "forge" }
-    $bunRow   = $Results | Where-Object { $_.Benchmark -eq $bench -and $_.Runtime -eq "bun" }
-    $nodeRow  = $Results | Where-Object { $_.Benchmark -eq $bench -and $_.Runtime -eq "node" }
+# --- Comparison --------------------------------------------------------------
+function Get-Row($bench, $runtime) {
+    return $Results | Where-Object { $_.Benchmark -eq $bench -and $_.Runtime -eq $runtime }
+}
 
-    if ($forgeRow -and $bunRow) {
-        $ratio = $forgeRow.MedianMs / $bunRow.MedianMs
-        Write-Host ("{0,-24} forge/bun  ratio = {1:N2}x" -f $bench, $ratio)
-    }
-    if ($forgeRow -and $nodeRow) {
-        $ratio = $forgeRow.MedianMs / $nodeRow.MedianMs
-        Write-Host ("{0,-24} forge/node ratio = {1:N2}x" -f $bench, $ratio)
+Write-Host "=== Startup (startup.js total time, median; lower is better) ==="
+foreach ($runtimeName in $Runtimes.Keys) {
+    $r = Get-Row "startup.js" $runtimeName
+    if ($r) { Write-Host ("  {0,-6} {1,10:N2} ms" -f $runtimeName, $r.TotalMedianMs) }
+}
+Write-Host ""
+
+Write-Host "=== Work time, Forge vs Bun / Node (ratio < 1.0 means Forge is faster) ==="
+foreach ($bench in $Benchmarks) {
+    if ($bench -eq "startup.js") { continue }
+    $f = Get-Row $bench "forge"
+    foreach ($other in @("bun", "node")) {
+        $o = Get-Row $bench $other
+        if ($f -and $o -and $f.WorkMedianMs -and $o.WorkMedianMs) {
+            Write-Host ("{0,-24} forge/{1,-4} = {2:N2}x   ({3} ms vs {4} ms)" -f $bench, $other, ($f.WorkMedianMs / $o.WorkMedianMs), $f.WorkMedianMs, $o.WorkMedianMs)
+        }
     }
 }
 Write-Host ""
 
-# Save a timestamped log so results are comparable across sessions as
-# each roadmap phase lands, not just visible in this one terminal.
+# --- Save --------------------------------------------------------------------
 $LogDir = Join-Path $ScriptDir "results"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Timestamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 $LogPath = Join-Path $LogDir "$Timestamp.csv"
 $Results | Export-Csv -Path $LogPath -NoTypeInformation
+$envLines | Set-Content -Path (Join-Path $LogDir "$Timestamp.env.txt")
 
-Write-Host "Results saved to $LogPath"
+Write-Host "Results saved to $LogPath (environment in $Timestamp.env.txt)"

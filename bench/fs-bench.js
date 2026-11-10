@@ -40,6 +40,7 @@ var ROUNDTRIP_PATH = SCRATCH_DIR + "/roundtrip.txt";
 var PAYLOAD = "The quick brown fox jumps over the lazy dog. ".repeat(8);
 
 fs.mkdirSync(SCRATCH_DIR, { recursive: true });
+var BENCH_T0 = Date.now(); // work timer (2026-11-11): run-benchmarks.ps1 reads the "work-ms=" line
 
 var checksum = 0;
 
@@ -67,3 +68,4 @@ for (var j = 0; j < EXTRA_ITERATIONS; j++) {
 fs.rmSync(ROUNDTRIP_PATH);
 
 print("fs-bench done, iterations=" + ITERATIONS + ", extraIterations=" + EXTRA_ITERATIONS + ", checksum=" + checksum);
+print("work-ms=" + (Date.now() - BENCH_T0));

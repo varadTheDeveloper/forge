@@ -14,6 +14,7 @@ var sample = {
     nested: { a: 1, b: 2.5, c: "text", d: [1, 2, 3, 4, 5] }
 };
 
+var BENCH_T0 = Date.now(); // work timer (2026-11-11): run-benchmarks.ps1 reads the "work-ms=" line
 var checksum = 0;
 
 for (var i = 0; i < ITERATIONS; i++) {
@@ -23,3 +24,4 @@ for (var i = 0; i < ITERATIONS; i++) {
 }
 
 print("json-bench done, iterations=" + ITERATIONS + ", checksum=" + checksum);
+print("work-ms=" + (Date.now() - BENCH_T0));

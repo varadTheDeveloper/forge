@@ -9,4 +9,6 @@
 // on all three runtimes, so the comparison is fair.
 if (typeof print === "undefined") { var print = console.log; }
 
+var BENCH_T0 = Date.now();
 print("ready");
+print("work-ms=" + (Date.now() - BENCH_T0));

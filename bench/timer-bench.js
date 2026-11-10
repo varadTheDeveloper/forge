@@ -22,16 +22,20 @@
 // as pending-timer counts grow.
 if (typeof print === "undefined") { var print = console.log; }
 
-var ITERATIONS = 5000;
+// 100,000 since 2026-11-11 (was 5,000, only a few milliseconds of work).
+// Not comparable with results before that date.
+var ITERATIONS = 100000;
 var fired = 0;
 
 function onTimer() {
     fired++;
     if (fired === ITERATIONS) {
         print("timer-bench done, fired=" + fired);
+        print("work-ms=" + (Date.now() - BENCH_T0));
     }
 }
 
+var BENCH_T0 = Date.now(); // work timer (2026-11-11): run-benchmarks.ps1 reads the "work-ms=" line
 for (var i = 0; i < ITERATIONS; i++) {
     setTimeout(onTimer, 0);
 }
