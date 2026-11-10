@@ -12,7 +12,7 @@
 #
 # Third-party actions are pinned to a full commit SHA (supply chain).
 # MozillaBuild (Mozilla's Windows build prerequisites, required by mach) is
-# pinned by version and must carry a valid Mozilla Corporation signature.
+# pinned by version and SHA-256.
 name: ci
 
 on:
@@ -65,8 +65,10 @@ jobs:
       ENGINE_DIR: C:\fe
       MOZILLABUILD: C:\mozilla-build
       MOZILLABUILD_VERSION: "4.2.1"
-      # Set this to the SHA-256 the first run prints to pin the exact file.
-      MOZILLABUILD_SHA256: ""
+      # SHA-256 of MozillaBuildSetup-4.2.1.exe as downloaded by the first CI
+      # run (2026-11-10), which also checked its Mozilla Corporation
+      # signature. Update both values together when moving to a new version.
+      MOZILLABUILD_SHA256: "8ef5b3d2087e4867dc75bf19f5e62f12e917f518239415723cc70896b6f1e3d8"
       MACH_PYTHON: C:\mozilla-build\python3\python3.exe
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
