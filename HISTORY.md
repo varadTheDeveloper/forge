@@ -3429,3 +3429,16 @@ criterion in the master plan ("all tests green in CI on ESR 153") is met.
 Possible later speed-ups: cache `~/.mozbuild` (toolchains) and the engine
 checkout plus `obj-forge` keyed on the pinned commit, so a normal run only
 recompiles Forge's own files.
+
+## Phase 7.95 done: building from the new source folder (2026-11-10)
+
+Varad ran `C:\Forge\src\tools\build.ps1 -Test` from the new clone of this
+repository. The build recompiled only Forge's own files (17 seconds), then
+`forge --self-test` passed all 48 cases and `tests\run-runtime-tests.ps1`
+passed all 9. The edit-build-test loop from `C:\Forge\src` works end to end,
+on Varad's machine and in CI. `C:\spidermonkey-dev\gecko-dev\js\src\forge`
+is retired (see `RETIRED.md` there).
+
+Working agreement: Varad runs builds and tests on his machine when asked;
+Claude makes the code changes, commits them under Varad's name and pushes
+them to GitHub.
