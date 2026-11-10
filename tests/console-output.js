@@ -1,0 +1,24 @@
+// Expect: exit code 0; formatted console output on stdout and stderr (Phase 8).
+console.log("%s is %d years and %f%%", "Forge", 1.9, 2.5);
+console.log({ a: 1, list: [1, 2, 3], nested: { deep: { deeper: { deepest: 1 } } } });
+console.log("café ✓ \u{1F525}");
+console.info("info line");
+console.error("error line");
+console.warn("warn line");
+console.group("group label");
+console.log("inside group");
+console.groupEnd();
+console.log("after group");
+console.count();
+console.count();
+console.count("other");
+console.countReset();
+console.count();
+console.assert(true, "SHOULD NOT PRINT");
+console.assert(false, "assert %s", "message");
+console.time("t");
+console.timeEnd("t");
+console.timeEnd("missing");
+console.dir("quoted");
+console.log(new Map([["k", new Set([1])]]), [undefined, null]);
+console.log("tail", 1, "two", { three: 3 });
