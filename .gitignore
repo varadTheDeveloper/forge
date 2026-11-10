@@ -1,0 +1,10 @@
+# Output of the standalone forge-core test builds (cl.exe next to the sources)
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Scratch folders written by the self-test and the benchmarks
+forge-selftest-fs-scratch/
+bench/fs-bench-scratch/
+bench/fs-async-bench-scratch/
