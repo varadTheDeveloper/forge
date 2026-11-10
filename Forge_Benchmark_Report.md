@@ -260,3 +260,99 @@ immediately, with no code changes anywhere. Worth carrying forward as a
 process note: **refresh `C:\Forge\bin\forge.exe` from the `mach build`
 output before every benchmark run**, not just when a fresh feature was
 just added.
+
+## Results (2026-11-10): SpiderMonkey ESR 153, 7 iterations
+
+Run by the user on the same machine with
+`bench\run-benchmarks.ps1 -ForgePath C:\Forge\esr153\forge.exe -Iterations 7`
+(raw data: `bench/results/2026-11-10_145510.csv`). Forge is the Phase 7.95
+build: the Phase 7.9 fixes, async stack capture off by default, on
+SpiderMonkey ESR 153.8. The Bun and Node versions were not recorded. Node's
+JSON time is far lower than in the README's earlier table (546 ms then,
+338 ms now), which suggests Node was upgraded in between, so compare
+across dates with care.
+
+### Total time (what the harness measures)
+
+Median of 7 runs, wall-clock time for the whole process. Ratio < 1.0 means
+Forge is faster.
+
+| Benchmark | Forge (ms) | Bun (ms) | Node (ms) | Forge/Bun | Forge/Node |
+|---|---:|---:|---:|---:|---:|
+| `startup.js` | 17.47 | 48.39 | 48.22 | 0.36x | 0.36x |
+| `json-bench.js` | 406.81 | 268.71 | 338.14 | 1.51x | 1.20x |
+| `loop-bench.js` | 68.64 | 78.32 | 97.83 | 0.88x | 0.70x |
+| `timer-bench.js` | 19.87 | 57.23 | 59.49 | 0.35x | 0.33x |
+| `microtask-bench.js` | 42.10 | 61.89 | 110.11 | 0.68x | 0.38x |
+| `promise-chain-bench.js` | 32.47 | 52.77 | 53.73 | 0.62x | 0.60x |
+| `fs-bench.js` | 1,024.42 | 1,159.79 | 1,045.55 | 0.88x | 0.98x |
+| `fs-async-bench.js` | 1,057.74 | 1,356.26 | 1,517.84 | 0.78x | 0.70x |
+
+### What the totals hide: startup decides the short benchmarks
+
+**Do not quote the table above as "Forge is faster than Bun at
+promises".** Every number in it includes process startup. Forge starts in
+17 ms; Bun and Node need 48 ms. That 31 ms head start is larger than the
+whole workload of four of these scripts, so it decides who "wins" them.
+
+Subtracting each runtime's own `startup.js` median gives an estimate of the
+time spent on the actual work:
+
+| Benchmark | Forge (ms) | Bun (ms) | Node (ms) | Forge/Bun | Forge/Node | Work per step (Forge / Bun / Node) |
+|---|---:|---:|---:|---:|---:|---|
+| `json-bench.js` | 389.3 | 220.3 | 289.9 | 1.77x | 1.34x | 1.95 / 1.10 / 1.45 us per round trip |
+| `loop-bench.js` | 51.2 | 29.9 | 49.6 | 1.71x | 1.03x | n/a |
+| `timer-bench.js` | 2.4 | 8.8 | 11.3 | 0.27x | 0.21x | 0.48 / 1.77 / 2.25 us per timer |
+| `microtask-bench.js` | 24.6 | 13.5 | 61.9 | 1.82x | 0.40x | 123 / 68 / 309 ns per callback |
+| `promise-chain-bench.js` | 15.0 | 4.4 | 5.5 | 3.42x | 2.72x | 300 / 88 / 110 ns per step |
+| `fs-bench.js` | 1,007.0 | 1,111.4 | 997.3 | 0.91x | 1.01x | n/a |
+| `fs-async-bench.js` | 1,040.3 | 1,307.9 | 1,469.6 | 0.80x | 0.71x | n/a |
+
+What this run supports:
+
+- **Startup:** Forge is about 2.8x faster to start. Forge is also a far
+  smaller runtime today (no module loader, no console, almost no web
+  APIs), so expect this gap to shrink as features are added.
+- **Async file I/O:** Forge is faster than both (0.80x Bun, 0.71x Node).
+- **Sync file I/O:** a tie with Node (1%, inside the noise), ahead of Bun.
+- **Timers:** Forge is ahead, but the workload is only a few milliseconds
+  (5,000 timers), so treat this as indicative.
+- **Loop (`fib(34)`):** level with Node; Bun is about 1.7x faster.
+- **Microtasks:** Bun is about 1.8x faster; Forge is 2.5x faster than Node.
+- **JSON:** Bun is about 1.8x faster, Node about 1.3x faster.
+- **Promise chains:** still the biggest gap. Bun is about 3.4x faster and
+  Node about 2.7x faster per step.
+
+Limits of the subtraction: it is an estimate. `startup.js` measures
+"start, print one line, exit", and a runtime may do extra lazy
+initialisation when a script uses more features. For the rows where the
+work is under 30 ms, a few milliseconds of noise changes the ratio a lot.
+
+### Compared with earlier runs
+
+- **Promise chains improved about 4.6x in work time.** Total time went from
+  88.84 ms (the README's earlier table, 142 engine) to 32.47 ms; with
+  startup subtracted, roughly 69 ms to 15 ms. Two causes, measured
+  separately as single runs on 2026-11-09: turning async stack capture off
+  (96 ms to 63 ms on the 142 engine) and moving to ESR 153 (63 ms to 42 ms).
+- **Sync file I/O lost ground and this is unexplained.** Forge/Bun went
+  from 0.76x (2026-08-02) to 0.88x, and Forge/Node from 0.86x to 0.98x.
+  All three runtimes were slower in absolute terms this time (Forge 803 ms
+  to 1,024 ms, Bun 1,054 to 1,160, Node 938 to 1,046), so part of it is
+  the machine or disk state, but Forge slowed by 28% against 10-11% for
+  the others. Async file I/O moved much less (Forge +13%, Bun +9%, Node
+  +7%). Candidates, none profiled: Phase 7.9's always-on bounds checks in
+  the forge-core containers (file reads and path conversion append one
+  element at a time), the new GC settings, the engine change, or plain
+  I/O noise (Forge's seven runs ranged from 922 ms to above 1,024 ms).
+
+### Open items after this run
+
+- The harness should print the startup-subtracted table itself, or time
+  the work from inside each script, so the misleading ratio table is not
+  the only output. It should also record the Bun and Node versions.
+- Check the sync file I/O shift: rerun with the 142-based Phase 7.9 binary
+  (`C:\Forge\bin\forge.exe`) on the same day to separate the engine change
+  from the forge-core changes, then profile `File::ReadAllBytes`.
+- The promise-chain gap (3.4x against Bun in work time) remains the main
+  throughput target, followed by JSON and microtasks.

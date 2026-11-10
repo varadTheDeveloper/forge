@@ -3333,3 +3333,28 @@ Results with `C:\Forge\esr153\forge.exe`:
 
 Still open for Phase 7.95: a CI job that builds the engine and forge.exe;
 deciding when to drop the 142 code path; the full benchmark rerun.
+
+## Benchmark run on ESR 153, 7 iterations (2026-11-10)
+
+Full results and analysis: `Forge_Benchmark_Report.md`, "Results
+(2026-11-10)"; raw data in `bench/results/2026-11-10_145510.csv`.
+
+The harness's own ratio table shows Forge ahead of Bun and Node on seven of
+eight scripts. **That overstates Forge's throughput.** Every number includes
+process startup, and Forge starts 31 ms sooner (17 ms against 48 ms), which
+is more than the whole workload of the short scripts. With each runtime's
+startup subtracted (an estimate): Forge is ahead on async file I/O and
+timers, ties Node on sync file I/O and on the loop benchmark, and is behind
+Bun on JSON (1.8x), microtasks (1.8x) and promise chains (3.4x; about
+300 ns per step against 88 ns for Bun and 110 ns for Node).
+
+Corrects two earlier statements made on 2026-11-09 from single runs: the
+promise-chain times (63 ms, then 42 ms) were compared with Bun's 44 ms and
+Node's 48 ms totals, which are almost entirely startup. The improvement
+itself is real (work time roughly 69 ms on the old build, 15 ms now), but
+Forge has not caught Bun or Node on promise throughput.
+
+Also noted: sync file I/O lost ground against both Bun and Node compared
+with the 2026-08-02 run (0.76x to 0.88x against Bun). Unexplained; see the
+report's open items. The README's benchmark table was replaced with the
+startup-subtracted numbers.
