@@ -40,7 +40,8 @@ $tests = @(
   @{ Name = "LockGuardTest";      Src = "LockGuardTest.cpp $sync $mem" },
   @{ Name = "TimerSchedulerTest"; Src = "platform\TimerSchedulerTest.cpp platform\TimerScheduler.cpp $sync $mem" },
   @{ Name = "IocpCrossThreadSmokeTest"; Src = "..\IocpCrossThreadSmokeTest.cpp platform\IocpLoop.cpp platform\TimerScheduler.cpp $sync ThreadPool.cpp $mem" },
-  @{ Name = "SocketSmokeTest";    Src = "SocketSmokeTest.cpp Socket.cpp $sync $mem"; Link = "ws2_32.lib" }
+  @{ Name = "SocketSmokeTest";    Src = "SocketSmokeTest.cpp Socket.cpp $sync $mem"; Link = "ws2_32.lib" },
+  @{ Name = "HostTest";           Src = "platform\HostTest.cpp platform\Unicode.cpp platform\Environment.cpp platform\Stdio.cpp platform\Win32Error.cpp $mem" }
 )
 
 $failures = 0
