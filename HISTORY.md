@@ -3404,3 +3404,28 @@ errors against the **real** ESR 153 build headers copied from
 not yet been through a real `mach build`; the new CI job is that build. The
 PowerShell scripts could not be run in the sandbox, so CI is also their
 first real test.
+
+## Phase 7.95 confirmed in CI: forge.exe builds on a clean machine (2026-11-10)
+
+The first run of the new `forge-windows-engine` job passed
+(github.com/varadTheDeveloper/forge, Actions run 42808610738, commit
+`817a011`). On a clean GitHub-hosted Windows Server 2022 runner it:
+
+1. installed MozillaBuild 4.2.1 (Mozilla Corporation signature valid;
+   SHA-256 `8ef5b3d2087e4867dc75bf19f5e62f12e917f518239415723cc70896b6f1e3d8`,
+   now pinned in `ci.yml`; its bundled Python is 3.12.10) in 1 min;
+2. ran `tools/setup-engine.ps1`: fetched and checked out the pinned ESR
+   153.8.0 commit and added Forge to it, 11 min;
+3. ran `mach bootstrap` non-interactively, 7 min;
+4. ran `tools/build.ps1 -Test`: `mach build`, install, `forge --self-test`
+   (**ALL PASSED**) and `tests/run-runtime-tests.ps1` (**9 of 9, ALL
+   PASSED**), 17.5 min.
+
+About 37 minutes in total, with no caching yet. This is the first real
+build of the `forge.cpp` with the 142 code path removed, and the first real
+run of `build.ps1`, so both are now real-build-confirmed. Phase 7.95's exit
+criterion in the master plan ("all tests green in CI on ESR 153") is met.
+
+Possible later speed-ups: cache `~/.mozbuild` (toolchains) and the engine
+checkout plus `obj-forge` keyed on the pinned commit, so a normal run only
+recompiles Forge's own files.
