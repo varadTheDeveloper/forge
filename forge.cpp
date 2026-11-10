@@ -41,17 +41,11 @@
 #include "js/Stack.h"
 #include "js/friend/ErrorMessages.h"
 
-// Phase 7.95: engine compatibility. Newer SpiderMonkey (ESR 153) owns the
-// microtask queue itself and exposes it through js/friend/MicroTask.h; the
-// older engine (142 Nightly) asks the embedder to own it. Detecting the
-// header instead of comparing MOZJS_MAJOR_VERSION keeps this correct for
-// whichever version first shipped the new API.
-#if __has_include("js/friend/MicroTask.h")
-#  include "js/friend/MicroTask.h"
-#  define FORGE_ENGINE_OWNS_MICROTASK_QUEUE 1
-#else
-#  define FORGE_ENGINE_OWNS_MICROTASK_QUEUE 0
-#endif
+// Phase 7.95: SpiderMonkey ESR 153 owns the microtask queue and exposes it
+// through this header (RunJSMicroTask, EnqueueMicroTask, ...). The older
+// 142 Nightly engine, where the embedder owned the queue, is no longer
+// supported; see HISTORY.md, "Phase 7.95".
+#include "js/friend/MicroTask.h"
 
 // JS_NewPlainObject (Phase 7.3, fs's namespace object and statSync's
 // returned {size} object) is not exposed under js/public -- confirmed by
@@ -68,7 +62,6 @@
 #include "forge-core/File.h"
 #include "forge-core/HashMap.h"
 #include "forge-core/Path.h"
-#include "forge-core/Queue.h"
 #include "forge-core/Result.h"
 #include "forge-core/String.h"
 #include "forge-core/StringView.h"
@@ -233,131 +226,29 @@ static bool ThrowNotFunction(JSContext* cx, const char* what) {
   return false;
 }
 
-// No `arguments` field here (unlike JsTimer below): ForgeJobQueue::runJobs()
-// always invokes a microtask's callback with JS::HandleValueArray::empty(),
-// never task->arguments, so a PersistentRootedVector<JS::Value> on every
-// queued microtask was dead weight — allocated (well, self-registered with
-// `cx`) and destroyed on every single one for a field nothing ever read.
-// Only JsTimer actually needs argument forwarding, for setTimeout/
-// setInterval's extra arguments passed through to the callback.
-struct Microtask {
-  JS::Heap<JSObject*> callback;
-};
-
 //==============================================================================
 // Runtime Integration (Phase 6)
 //
-// The microtask queue and timer registry below are backed by forge-core's
-// own containers (Queue<T>/HashMap<K,V>) rather than std::vector, and
-// EnqueueMicrotask/SetTimeout/SetInterval go through forge-core's
-// MakeUnique<T> (Result<UniquePtr<T>>) rather than std::make_unique, so
-// that an allocation failure is a reported JS OOM error instead of an
-// abrupt std::terminate() (this codebase's -fno-exceptions build has no
-// other way to recover from operator new failing). See HISTORY.md's
-// Phase 6 entry for the two real bugs this rewrite fixes:
-//   (1) GC-root-tracing gap: a JobQueue must trace every still-pending
-//       microtask's callback, not just the front one, or the collector
-//       could reclaim a callback a later Pop() still needs. Fixed via
-//       Queue<T>::operator[] (front-relative indexed access, added this
-//       phase) walked in TraceForgeRoots below.
-//   (2) Use-after-free-on-OOM-rollback: JsTimerRegistry::Add() schedules
-//       the native timer before it knows whether the JS-side wrapper can
-//       actually be stored. If storing it fails, the *already-armed*
-//       native timer must be cancelled before returning, or it fires
-//       against memory that's about to be freed. See the comment in
-//       Add() below.
+// The timer registry below is backed by forge-core's own containers
+// (HashMap<K,V>) rather than std::unordered_map, and SetTimeout/SetInterval
+// go through forge-core's MakeUnique<T> (Result<UniquePtr<T>>) rather than
+// std::make_unique, so that an allocation failure is a reported JS OOM
+// error instead of an abrupt std::terminate() (this codebase's
+// -fno-exceptions build has no other way to recover from operator new
+// failing). See HISTORY.md's Phase 6 entry for the bug this fixes:
+// JsTimerRegistry::Add() schedules the native timer before it knows
+// whether the JS-side wrapper can actually be stored. If storing it fails,
+// the *already-armed* native timer must be cancelled before returning, or
+// it fires against memory that's about to be freed. See the comment in
+// Add() below.
+//
+// Until Phase 7.95 Forge also kept its own microtask queue here
+// (Queue<UniquePtr<Microtask>>, traced from TraceForgeRoots). The engine
+// owns that queue now; see ForgeJobQueue below.
 //==============================================================================
 
-#if !FORGE_ENGINE_OWNS_MICROTASK_QUEUE
-// ---- Engine before the MicroTask API (SpiderMonkey 142 Nightly) ----------
-// Forge owns the microtask queue and the engine hands it every Promise job
-// through enqueuePromiseJob().
-
-forge::core::Queue<forge::core::memory::UniquePtr<Microtask>> microtasks;
-
-class ForgeJobQueue : public JS::JobQueue {
- public:
-  bool empty() const override { return microtasks.Empty(); }
-
-  bool isDrainingStopped() const override { return false; }
-
-  bool getHostDefinedData(JSContext* cx,
-                          JS::MutableHandle<JSObject*> data) const override {
-    data.set(nullptr);
-    return true;
-  }
-
-  // Phase 7.9, matching SpiderMonkey's own InternalJobQueue::runJobs
-  // (js/src/vm/JSContext.cpp):
-  //   * the job is popped BEFORE it runs. Before, a job that threw was
-  //     never removed, so the next drain ran it again forever;
-  //   * each job runs inside its own function's realm (JSAutoRealm), not
-  //     whatever realm happened to be current. With one realm today this
-  //     changes nothing; it becomes essential once packages get their own
-  //     realms and compartments (Phase 9). Every job is a function in the
-  //     single compartment that exists today, never a cross-compartment
-  //     wrapper; Phase 9 must revisit this when compartments arrive;
-  //   * JS::JobQueueIsEmpty() before the last job lets the engine skip
-  //     queueing for a trailing `await` (it verifies the async function is
-  //     the topmost frame itself), and EnqueueMicrotask() undoes it;
-  //   * JS::ClearKeptObjects() after the drain, so WeakRef targets kept
-  //     alive during this turn can be collected (ECMAScript ClearKeptObjects).
-  // An exception thrown by a job is fatal (exit code 1), as in Node.
-  void runJobs(JSContext* cx) override {
-    while (!microtasks.Empty() && !g_stopRequested) {
-      forge::core::memory::UniquePtr<Microtask> task = std::move(microtasks.Front());
-      microtasks.Pop();
-
-      if (microtasks.Empty()) {
-        JS::JobQueueIsEmpty(cx);
-      }
-
-      JS::RootedObject callback(cx, task->callback);
-      task.Reset();
-
-      JS::RootedValue rval(cx);
-      bool ok;
-
-      {
-        JSAutoRealm ar(cx, callback);
-        ok = JS::Call(cx, JS::UndefinedHandleValue, callback, JS::HandleValueArray::empty(),
-                      &rval);
-      }
-
-      if (!ok) {
-        ReportFatalException(cx, "microtask");
-      }
-    }
-
-    JS::JobQueueMayNotBeEmpty(cx);
-    JS::ClearKeptObjects(cx);
-  }
-
-  bool enqueuePromiseJob(JSContext* cx, JS::HandleObject promise,
-                         JS::HandleObject job, JS::HandleObject allocationSite,
-                         JS::HandleObject hostDefinedData) override {
-    return EnqueueMicrotask(cx, job);
-  }
-
- protected:
-  class SavedQueue;
-
-  js::UniquePtr<SavedJobQueue> saveJobQueue(JSContext* cx) override;
-};
-js::UniquePtr<JS::JobQueue::SavedJobQueue> ForgeJobQueue::saveJobQueue(
-    JSContext* cx) {
-  return nullptr;
-}
-
-// True while Forge's own queue still holds a job.
-static bool MicrotasksPending(JSContext* cx) {
-  (void)cx;
-  return !microtasks.Empty();
-}
-
-#else  // FORGE_ENGINE_OWNS_MICROTASK_QUEUE
-// ---- Engine with the MicroTask API (SpiderMonkey ESR 153 and later) ------
-// Phase 7.95: the engine now owns the microtask queue (js/friend/MicroTask.h).
+// Job queue (Phase 7.95). The engine owns the microtask queue
+// (js/friend/MicroTask.h); Forge decides when and how it is drained.
 // Promise jobs are engine "JS microtasks" that must be run with
 // JS::RunJSMicroTask inside the realm of JS::GetExecutionGlobalFromJSMicroTask.
 // queueMicrotask() callbacks are enqueued by Forge as plain function values;
@@ -432,9 +323,6 @@ class ForgeJobQueue : public JS::JobQueue {
   }
 };
 
-static bool MicrotasksPending(JSContext* cx) { return JS::HasAnyMicroTasks(cx); }
-
-#endif  // FORGE_ENGINE_OWNS_MICROTASK_QUEUE
 
 //==============================================================================
 // Timers
@@ -795,7 +683,7 @@ class Runtime {
         break;
       }
 
-      if (!MicrotasksPending(cx_) && loop_.Empty() && pendingAsyncOps_ == 0) {
+      if (!JS::HasAnyMicroTasks(cx_) && loop_.Empty() && pendingAsyncOps_ == 0) {
         break;
       }
 
@@ -938,18 +826,14 @@ class Runtime {
   // this is a silent-but-harmless loss of that operation's result, not a
   // crash or UB. Not addressed further by this milestone.
   //
-  // Phase 7.9: also releases any microtasks still queued (a fatal error
-  // stops the drain early) and tracked rejections, while cx is alive.
-  // The microtask queue is a static object; left non-empty, its JS::Heap
-  // entries would be destroyed after JS_DestroyContext.
+  // Phase 7.9: also releases tracked rejections while cx is alive.
+  // Microtasks still queued after a fatal error belong to the engine
+  // (Phase 7.95) and are dropped with the context.
   void Shutdown() {
     workerPool_.Shutdown();
     pendingFsReadOps_.Clear();
     pendingFsMiscOps_.Clear();
     timers_.Clear();
-#if !FORGE_ENGINE_OWNS_MICROTASK_QUEUE
-    microtasks.Clear();
-#endif
     unhandledRejections_.Clear();
   }
 
@@ -1055,12 +939,6 @@ class Runtime {
 
 static void TraceForgeRoots(JSTracer* trc, void* data) {
   auto* runtime = static_cast<Runtime*>(data);
-
-#if !FORGE_ENGINE_OWNS_MICROTASK_QUEUE
-  for (forge::core::Size i = 0; i < microtasks.Size(); ++i) {
-    JS::TraceEdge(trc, &microtasks[i]->callback, "forge-microtask-callback");
-  }
-#endif
 
   runtime->TraceRoots(trc);
 }
@@ -1212,7 +1090,6 @@ static bool SetInterval(JSContext* cx, unsigned argc, JS::Value* vp) {
   return ScheduleJsTimer(cx, argc, vp, /*repeat=*/true);
 }
 static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback) {
-#if FORGE_ENGINE_OWNS_MICROTASK_QUEUE
   // Phase 7.95: the engine queue holds (and traces) the callback itself.
   if (!JS::EnqueueMicroTask(cx, JS::ObjectValue(*callback))) {
     if (!JS_IsExceptionPending(cx)) {
@@ -1221,30 +1098,10 @@ static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback) {
     return false;
   }
 
-  JS::JobQueueMayNotBeEmpty(cx);
-  return true;
-#else
-  forge::core::Result<forge::core::memory::UniquePtr<Microtask>> made =
-      forge::core::memory::MakeUnique<Microtask>();
-
-  if (made.HasError()) {
-    JS_ReportOutOfMemory(cx);
-    return false;
-  }
-
-  forge::core::memory::UniquePtr<Microtask> task = std::move(made.Value());
-  task->callback = callback;
-
-  if (microtasks.Push(std::move(task)).HasError()) {
-    JS_ReportOutOfMemory(cx);
-    return false;
-  }
-
   // Undo any JS::JobQueueIsEmpty() from runJobs: the queue is not empty
-  // any more (Phase 7.9; same as the engine's InternalJobQueue).
+  // any more (same as the engine's InternalJobQueue).
   JS::JobQueueMayNotBeEmpty(cx);
   return true;
-#endif
 }
 static bool QueueMicrotask(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);

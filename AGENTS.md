@@ -113,6 +113,15 @@ without renaming the public accessor.
 
 ## Coding Standards
 
+> **Phase 7.95 update (2026-11-10).** Forge now builds on SpiderMonkey ESR
+> 153, whose `mach build` compiles every file as **C++20** (the engine's
+> headers require it). `forge.cpp` is therefore C++20. `forge-core/` still
+> keeps to the C++17 rules below, and CI builds its tests as both C++17 and
+> C++20. The build now runs from this repository through
+> `tools\build.ps1` against a pinned engine checkout (see `CLAUDE.md` →
+> "Build"), not from `C:\spidermonkey-dev\gecko-dev`; where the text below
+> names that folder, read "the pinned engine checkout".
+
 - **C++17, not C++20.** This was wrong in earlier versions of this file.
   The real build (`mach build` inside the Gecko/SpiderMonkey tree — see
   "Verify against the real build" below) compiles this codebase as C++17

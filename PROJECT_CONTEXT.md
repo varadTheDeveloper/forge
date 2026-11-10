@@ -2,23 +2,27 @@
 
 ## Source of truth
 
-`C:\spidermonkey-dev\gecko-dev\js\src\forge\` is the **only** tracked
-copy of this project as of 2026-07-29 — it's the real Gecko/SpiderMonkey
-tree `mach build` compiles from. `C:\forge-beta\forge-runtime-beta\`
-(the original working copy) is retired; do not develop in or sync
-changes to it unless explicitly asked to. This file, `HISTORY.md`,
-`ROADMAP.md`, and `AGENTS.md` all now live directly under
-`js\src\forge\` (not `.claude\`, which rejects remote writes) —
-alongside `forge-core/`, `forge.cpp`, and `moz.build`.
+**As of 2026-11-10 (Phase 7.95) this repository,
+github.com/varadTheDeveloper/forge, is the source of truth.** The
+SpiderMonkey engine lives outside it: a Firefox ESR checkout pinned in
+`engine/engine.toml`, into which `tools\setup-engine.ps1` and
+`tools\build.ps1` copy this repository as `js/src/forge`. See `CLAUDE.md`
+→ "Build".
+
+Retired, do not develop in or sync changes to them:
+`C:\spidermonkey-dev\gecko-dev\js\src\forge\` (the only tracked copy
+from 2026-07-29 until Phase 7.95, inside the old 142 Nightly tree) and
+`C:\forge-beta\forge-runtime-beta\` (the original working copy).
 
 ## Vision
 
 Forge Core is a modern C++ systems library being built as the foundation of
-the Forge JavaScript Runtime. Written to compile as C++17, not C++20 — the
-real build (`mach build` inside the Gecko/SpiderMonkey tree) rejects
-C++20-only constructs; see `AGENTS.md` → "Coding Standards" and
-`HISTORY.md` → "Real build environment discovered" for what that ruled
-out and why.
+the Forge JavaScript Runtime. Written to compile as C++17. Since Phase
+7.95 the real build (`mach build` on SpiderMonkey ESR 153) compiles
+everything as C++20, because the engine's headers need it, but forge-core
+keeps to the subset that is also valid C++17 and CI builds its tests both
+ways; see `AGENTS.md` → "Coding Standards" and `HISTORY.md` → "Real build
+environment discovered" for the history.
 
 The goal is to build a production-quality runtime that can eventually
 compete with Node.js, Deno, and Bun.

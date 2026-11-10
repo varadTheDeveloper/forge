@@ -3248,8 +3248,10 @@ Results with the freshly copied `C:\Forge\bin\forge.exe`:
   smoke tests, OverflowTest and the new Path table).
 
 Still open: the `--async-stacks` A/B benchmark. Note also: `forge.exe`
-needs `mozglue.dll` next to it; `CLAUDE.md` now documents the copy step
-(the `build.bat`/`install.ps1` it used to mention do not exist).
+needs `mozglue.dll` next to it; `CLAUDE.md` now documents the copy step.
+(Corrected 2026-11-10: this entry first said `build.bat`/`install.ps1` do
+not exist. They do, in `js/src/forge`, not in the tree root where they
+were looked for; they copied `forge.exe` only, not `mozglue.dll`.)
 
 ## Phase 7.9 follow-up: async-stacks A/B (2026-11-09)
 
@@ -3358,3 +3360,47 @@ Also noted: sync file I/O lost ground against both Bun and Node compared
 with the 2026-08-02 run (0.76x to 0.88x against Bun). Unexplained; see the
 report's open items. The README's benchmark table was replaced with the
 startup-subtracted numbers.
+
+## Phase 7.95: 142 code path removed, one-command build, CI builds forge.exe (2026-11-10)
+
+**The 142 Nightly engine is no longer supported.** `forge.cpp` kept two job
+queues since the ESR 153 port, selected with `__has_include`. The old one
+(Forge's own `Queue<UniquePtr<Microtask>>`, traced from `TraceForgeRoots`,
+for engines that call `enqueuePromiseJob`) is deleted, along with the
+`Microtask` struct and the `forge-core/Queue.h` include. The engine-owned
+queue (`js/friend/MicroTask.h`) is the only path. About 170 lines removed.
+
+**C++ standard.** The ESR 153 `mach build` compiles every file with
+`-std:c++20` (checked in the build's `compile_commands.json`), because the
+engine's headers need it. `forge.cpp` is therefore C++20. forge-core includes
+no engine headers and still keeps to the C++17-compatible subset (the
+Manifesto and decision D5 say C++17); CI builds its tests both ways.
+
+**Source of truth moves out of the old gecko-dev tree.** This repository
+(github.com/varadTheDeveloper/forge) is now the source of truth, cloned to
+its own folder. `C:\spidermonkey-dev\gecko-dev\js\src\forge` is retired.
+New in the repository:
+
+- `tools/build.ps1`: copies the checkout into the engine tree, runs
+  `mach build`, installs `forge.exe` and `mozglue.dll` to `C:\Forge\bin`,
+  and with `-Test` runs the self-test and the runtime tests. `build.bat` is
+  now a one-line wrapper around it, and `install.ps1` copies from the new
+  engine location. (Both used to assume the 142 tree's `obj-spider`.)
+- `tools/setup-engine.ps1`: sets `core.longpaths` in the engine checkout and
+  exits 0 explicitly (robocopy's success codes are non-zero and would have
+  failed a CI step).
+- `.gitattributes` (`* -text`, the Firefox tree's own rule: store every file
+  byte-for-byte) and `.gitignore` (test build output, scratch folders).
+- `.github/workflows/ci.yml`: a third job, `forge-windows-engine`, installs
+  MozillaBuild 4.2.1 (which mach requires at `C:\mozilla-build`; the
+  installer must carry a valid Mozilla Corporation signature), runs
+  `setup-engine.ps1`, `mach bootstrap` and `build.ps1 -Test` on a clean
+  Windows runner. Runs are skipped for documentation-only pushes, and a
+  newer push cancels a run still in progress.
+
+**Verification (honest):** the trimmed `forge.cpp` type-checks with zero
+errors against the **real** ESR 153 build headers copied from
+`C:\forge-engine\esr153\obj-forge` (clang 18, C++20, MinGW target). It has
+not yet been through a real `mach build`; the new CI job is that build. The
+PowerShell scripts could not be run in the sandbox, so CI is also their
+first real test.

@@ -1,12 +1,5 @@
 @echo off
-
-python mach build
-
-if errorlevel 1 exit /b 1
-
-if not exist C:\Forge\bin mkdir C:\Forge\bin
-
-copy /Y obj-spider\dist\bin\forge.exe C:\Forge\bin\forge.exe
-
-echo.
-echo Forge installed successfully.
+rem Builds Forge against the pinned engine and installs it to C:\Forge\bin.
+rem Extra arguments go to tools\build.ps1, for example:  build.bat -Test
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\build.ps1" %*
+exit /b %errorlevel%

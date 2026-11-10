@@ -4,9 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`js/src/forge/` inside the Gecko/SpiderMonkey tree (`C:\spidermonkey-dev\gecko-dev`)
-is the **only** tracked copy of the Forge project. `C:\forge-beta\forge-runtime-beta\`
-is retired — never sync changes there.
+This repository (github.com/varadTheDeveloper/forge) is the source of truth
+for Forge. The SpiderMonkey engine is **not** in it: the engine is a separate
+Firefox ESR checkout, pinned in `engine/engine.toml` (default location
+`C:\forge-engine\esr153`), and the build copies this repository into
+`js/src/forge` inside that checkout.
+
+Retired, never edit or sync: `C:\spidermonkey-dev\gecko-dev\js\src\forge`
+(the old 142 Nightly tree, frozen since Phase 7.95) and
+`C:\forge-beta\forge-runtime-beta\`.
 
 Two layers live here:
 
@@ -29,26 +35,32 @@ component ahead of an earlier one without recording the reason in `HISTORY.md`.
 
 ## Build
 
-The real build is Gecko's `mach`, run from the tree root, not from this directory:
+One-time setup (needs MozillaBuild at `C:\mozilla-build`, and Python 3.12 or
+older on PATH as `python`; Python 3.14 breaks mach):
 
 ```
-cd C:\spidermonkey-dev\gecko-dev
-python mach build
+.\tools\setup-engine.ps1          # fetch the pinned engine, add Forge to it
+cd C:\forge-engine\esr153
+python mach bootstrap              # choose "SpiderMonkey JavaScript engine"
 ```
 
-Output binary: `obj-spider\dist\bin\forge.exe`. `.mozconfig` sets
-`--enable-project=js` and `MOZ_OBJDIR=obj-spider`.
-
-After a build, copy the binary AND `mozglue.dll` (forge.exe imports it) to
-`C:\Forge\bin\` -- there is no build.bat/install.ps1 in the tree:
+Every build after that, from this repository:
 
 ```
-Copy-Item obj-spider\dist\bin\forge.exe, obj-spider\dist\bin\mozglue.dll C:\Forge\bin\ -Force
+.\tools\build.ps1 -Test           # or: build.bat -Test
 ```
 
-**Always re-copy after a build** -- a stale `C:\Forge\bin\forge.exe` has already
-caused a false "missing binding" failure during a benchmark run. Run mach with
-Python 3.12 or older (3.14 breaks mach's command loader).
+`tools\build.ps1` copies this checkout into the engine tree, runs `mach build`,
+installs `forge.exe` **and `mozglue.dll`** (forge.exe imports it) to
+`C:\Forge\bin`, and with `-Test` runs `forge --self-test` and the runtime
+tests. Because it always installs after building, a stale
+`C:\Forge\bin\forge.exe` (which once caused a false "missing binding" failure
+during a benchmark run) can't happen as long as you build through it. CI runs
+the same two scripts (`.github/workflows/ci.yml`, job `forge-windows-engine`).
+
+`setup-engine.ps1` makes the only two changes Forge needs inside the engine
+tree: it adds `"forge"` to `js/src/moz.build` and adds `js/src/forge/` to the
+ignore list of `config/check_spidermonkey_style.py`.
 
 `moz.build` lists the production `SOURCES`. A new `.cpp` under `forge-core/`
 must be added there (case-insensitively sorted) or it silently never compiles;
@@ -96,10 +108,12 @@ Results are written up in `Forge_Benchmark_Report.md`.
 
 ## Hard build constraints (each caused real bugs; see HISTORY.md)
 
-- **Must compile as BOTH C++17 and C++20** (Phase 7.95). The current 142 engine
-  build is C++17 and rejects C++20-only constructs; the ESR 153 engine's headers
-  require C++20. Until the move to ESR 153 is finished, write the common subset:
-  `tools/ci/forge-core-tests.sh` builds every test both ways. No
+- **The real build is C++20; forge-core stays C++17-compatible.** The ESR 153
+  mach build compiles every file with `-std:c++20`, because the engine's
+  headers require it, so `forge.cpp` is C++20. `forge-core/` includes no
+  engine headers and keeps to the subset that also compiles as C++17 (the
+  Manifesto and decision D5 say C++17), and `tools/ci/forge-core-tests.sh`
+  builds every forge-core test both ways. So in `forge-core/`: no
   `std::construct_at` (use `forge::core::detail::ConstructAt` from `Construct.h`),
   no `<bit>`, no constexpr destructors, no concepts, `<=>`, `consteval`/`constinit`,
   no `= default` on a friend comparison operator.
@@ -141,8 +155,9 @@ Results are written up in `Forge_Benchmark_Report.md`.
 
 ## Runtime architecture (`forge.cpp`)
 
-`Runtime` owns everything: a `ForgeJobQueue` (a `JS::JobQueue` subclass backing
-the microtask queue), a `JsTimerRegistry` (`HashMap<int, UniquePtr<JsTimer>>`
+`Runtime` owns everything: a `ForgeJobQueue` (a `JS::JobQueue` subclass that
+drains the microtask queue; since Phase 7.95 the queue itself belongs to the
+engine, see `js/friend/MicroTask.h`), a `JsTimerRegistry` (`HashMap<int, UniquePtr<JsTimer>>`
 behind `setTimeout`/`setInterval`/`clearTimeout`), an `IoLoop`, and a shared
 `ThreadPool` for async work. A pointer to it is stashed in a global reserved slot
 and recovered via `GetRuntime(cx)` from binding functions.
