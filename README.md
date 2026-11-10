@@ -34,29 +34,29 @@ forge.exe hello.js
 
 ## Benchmarks
 
-Median of 7 runs on one Windows x64 machine, 2026-11-10. Forge is built on SpiderMonkey ESR 153.
+Median of 7 runs, 2026-11-10, on an AMD Ryzen 5 5600X with Windows 11. Forge v0.1.0 on SpiderMonkey ESR 153, Bun 1.3.14, Node 24.11.1.
 
-**Startup** (run a one-line script): Forge **17 ms**, Bun 48 ms, Node 48 ms.
+**Startup** (run a one-line script): Forge **15 ms**, Bun 40 ms, Node 43 ms.
 
-**Work time**: total time minus each runtime's own startup time. This is an estimate; lower is better.
+**Work time**, measured inside each script, so startup is not included. Lower is better.
 
 | Benchmark | Forge | Bun | Node | Winner |
 |-----------|------:|----:|-----:|:------:|
-| JSON | 389 ms | **220 ms** | 290 ms | 🥇 Bun |
-| Loop | 51 ms | **30 ms** | 50 ms | 🥇 Bun |
-| Timers | **2 ms** | 9 ms | 11 ms | 🥇 Forge |
-| Microtasks | 25 ms | **14 ms** | 62 ms | 🥇 Bun |
-| Promise Chains | 15 ms | **4 ms** | 6 ms | 🥇 Bun |
-| Filesystem (sync) | 1,007 ms | 1,111 ms | 997 ms | Tie: Node, Forge |
-| Filesystem (async) | **1,040 ms** | 1,308 ms | 1,470 ms | 🥇 Forge |
+| JSON (200k round trips) | 361 ms | **209 ms** | 286 ms | 🥇 Bun |
+| Loop (`fib(36)`) | 131 ms | **82 ms** | 129 ms | 🥇 Bun |
+| Timers (100k) | 40 ms | 43 ms | **35 ms** | 🥇 Node |
+| Microtasks (1M) | 122 ms | **54 ms** | 254 ms | 🥇 Bun |
+| Promise chains (1M steps) | 246 ms | 60 ms | **32 ms** | 🥇 Node |
+| Filesystem, sync | **1,609 ms** | 1,908 ms | 1,674 ms | 🥇 Forge |
+| Filesystem, async | **1,683 ms** | 1,946 ms | 2,050 ms | 🥇 Forge |
 
-Forge is a much smaller runtime than Bun or Node today, which is part of why it starts faster. The full numbers, including total times, and the method are in [Forge_Benchmark_Report.md](Forge_Benchmark_Report.md).
+Forge is a much smaller runtime than Bun or Node today, which is part of why it starts faster. Full results and method: [Forge_Benchmark_Report.md](Forge_Benchmark_Report.md).
 
 **Current Highlights**
 
 - 🚀 Fast startup
-- ⏱️ High-performance timers
-- 📁 Fast filesystem API, sync and async
+- 📁 Fastest filesystem API here, sync and async
+- ⏱️ Timers level with Bun and Node
 - ⚡ Microtasks ahead of Node, behind Bun
 - 🎯 Promise chains are the primary optimization target
 

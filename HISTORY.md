@@ -3467,3 +3467,23 @@ startup on the short scripts. Changes:
 All eight scripts were checked under Node 22 in the sandbox (each prints its
 `work-ms` line). The PowerShell harness could not be run in the sandbox; its
 first run is Varad's.
+
+## First benchmark run with measured work time (2026-11-10, evening)
+
+The new harness ran cleanly on Varad's machine (Ryzen 5 5600X, Windows 11
+build 26200; Bun 1.3.14, Node 24.11.1). Full table in
+`Forge_Benchmark_Report.md` → "Current results"; raw data in
+`bench/results/2026-11-10_190436.csv` and `.env.txt`.
+
+Work time per workload (Forge / Bun / Node, ms): JSON 361 / 209 / 286, loop
+131 / 82 / 129, timers 40 / 43 / 35, microtasks 122 / 54 / 254, promise
+chains 246 / 60 / 32, sync fs 1,609 / 1,908 / 1,674, async fs 1,683 / 1,946 /
+2,050. Startup 15 / 40 / 43.
+
+What changed in our understanding: timers are level, not a Forge win (that
+was startup); the promise-chain gap is larger than estimated, 4.1x against
+Bun and 7.7x against Node, and is the main throughput target; file I/O and
+startup are where Forge leads. File I/O was about 60% slower for all three
+runtimes than in the morning run, probably Windows Defender scanning the new
+scratch-folder location; the cross-runtime comparison is unaffected. The
+README table now shows these measured work times.
