@@ -11,8 +11,8 @@ cd "$(dirname "$0")/../../forge-core"
 out="${TMPDIR:-/tmp}/forge-core-tests"
 mkdir -p "$out"
 
-# Built twice: C++17 (the current 142 engine build) and C++20 (what the
-# ESR 153 engine requires of embedders, Phase 7.95). Code must pass both.
+# Built twice: C++17 (forge-core's own standard) and C++20 (how the real
+# ESR 153 mach build compiles everything, Phase 7.95). Code must pass both.
 common=(-fno-exceptions -g -O1 -Wall -Wextra
         -fsanitize=address,undefined -fno-sanitize-recover=all)
 mem=(memory/DefaultAllocator.cpp memory/detail/AllocationBackend.cpp)
