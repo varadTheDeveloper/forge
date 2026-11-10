@@ -1,25 +1,39 @@
-# Forge CI (Phase 7.9).
+# Forge CI.
 #
-# What this runs today:
-#   * forge-core unit tests on Linux under ASan + UBSan (g++);
+# Jobs:
+#   * forge-core unit tests on Linux under ASan + UBSan (g++), built as both
+#     C++17 and C++20;
 #   * forge-core unit and smoke tests on Windows with MSVC, including the
-#     Windows-only File, Socket, thread, timer and IOCP tests.
-#
-# Not yet: building forge.exe itself and running `forge --self-test` and
-# tests/run-runtime-tests.ps1. forge.exe is still built inside the
-# SpiderMonkey source tree with `mach`; that job is added in Phase 7.95,
-# when Forge moves to its own repository built against a pinned ESR engine.
+#     Windows-only File, Socket, thread, timer and IOCP tests;
+#   * forge.exe itself (Phase 7.95): fetch the SpiderMonkey commit pinned in
+#     engine/engine.toml, build Forge inside it with mach, then run
+#     `forge --self-test` and tests/run-runtime-tests.ps1. This is the same
+#     tools/setup-engine.ps1 + tools/build.ps1 path a developer uses.
 #
 # Third-party actions are pinned to a full commit SHA (supply chain).
+# MozillaBuild (Mozilla's Windows build prerequisites, required by mach) is
+# pinned by version and must carry a valid Mozilla Corporation signature.
 name: ci
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "bench/results/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "bench/results/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# A newer push to the same branch replaces a run that is still going.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   forge-core-linux-sanitizers:
@@ -29,7 +43,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: forge-core tests (ASan + UBSan)
+      - name: forge-core tests (ASan + UBSan, C++17 and C++20)
         run: bash tools/ci/forge-core-tests.sh
 
   forge-core-windows-msvc:
@@ -42,3 +56,69 @@ jobs:
       - name: forge-core tests (MSVC, C++17, no exceptions)
         shell: pwsh
         run: ./tools/ci/forge-core-tests.ps1
+
+  forge-windows-engine:
+    name: forge.exe on the pinned engine (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      ENGINE_DIR: C:\fe
+      MOZILLABUILD: C:\mozilla-build
+      MOZILLABUILD_VERSION: "4.2.1"
+      # Set this to the SHA-256 the first run prints to pin the exact file.
+      MOZILLABUILD_SHA256: ""
+      MACH_PYTHON: C:\mozilla-build\python3\python3.exe
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Show free disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n="FreeGB";e={[math]::Round($_.Free/1GB,1)}}, @{n="UsedGB";e={[math]::Round($_.Used/1GB,1)}}
+
+      - name: Install MozillaBuild
+        shell: pwsh
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+          $url = "https://ftp.mozilla.org/pub/mozilla/libraries/win32/MozillaBuildSetup-$env:MOZILLABUILD_VERSION.exe"
+          $exe = Join-Path $env:RUNNER_TEMP "MozillaBuildSetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe
+
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+          Write-Host "MozillaBuildSetup-$env:MOZILLABUILD_VERSION.exe SHA-256: $hash"
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "Signature: $($sig.Status); signer: $($sig.SignerCertificate.Subject)"
+
+          if ($env:MOZILLABUILD_SHA256) {
+            if ($hash -ne $env:MOZILLABUILD_SHA256.ToLower()) { throw "MozillaBuild installer hash mismatch" }
+          } elseif ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Mozilla Corporation") {
+            throw "MozillaBuild installer is not signed by Mozilla Corporation and no SHA-256 is pinned"
+          }
+
+          $p = Start-Process -FilePath $exe -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "MozillaBuild installer failed with exit code $($p.ExitCode)" }
+          if (-not (Test-Path "$env:MOZILLABUILD\VERSION")) { throw "MozillaBuild was not installed to $env:MOZILLABUILD" }
+          Write-Host "MozillaBuild version: $(Get-Content "$env:MOZILLABUILD\VERSION" -TotalCount 1)"
+          if (-not (Test-Path $env:MACH_PYTHON)) {
+            Get-ChildItem "$env:MOZILLABUILD" | Select-Object Name
+            throw "Expected MozillaBuild's Python at $env:MACH_PYTHON"
+          }
+          & $env:MACH_PYTHON --version
+          exit 0
+
+      - name: Fetch the pinned engine and add Forge
+        shell: pwsh
+        run: ./tools/setup-engine.ps1 -EngineDir $env:ENGINE_DIR
+
+      - name: Bootstrap the engine's build tools
+        shell: pwsh
+        working-directory: ${{ env.ENGINE_DIR }}
+        run: |
+          & $env:MACH_PYTHON mach --no-interactive bootstrap --application-choice js
+          if ($LASTEXITCODE -ne 0) { throw "mach bootstrap failed (exit code $LASTEXITCODE)" }
+          exit 0
+
+      - name: Build forge.exe and run its tests
+        shell: pwsh
+        run: ./tools/build.ps1 -EngineDir $env:ENGINE_DIR -InstallDir (Join-Path $env:RUNNER_TEMP "forge-bin") -Python $env:MACH_PYTHON -Test
