@@ -1,0 +1,3 @@
+# Store every file byte-for-byte: no line-ending conversion on any platform
+# (the same rule the Firefox tree uses). Some files here use CRLF, some LF.
+* -text
