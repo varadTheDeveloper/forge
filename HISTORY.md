@@ -3487,3 +3487,62 @@ startup are where Forge leads. File I/O was about 60% slower for all three
 runtimes than in the morning run, probably Windows Defender scanning the new
 scratch-folder location; the cross-runtime comparison is unaffected. The
 README table now shows these measured work times.
+
+## Phase 8.1: console, the Forge namespace, Unicode I/O, Ctrl+C (2026-11-10)
+
+Phase 8 is split into four steps: 8.1 runtime basics (this entry), 8.2 the
+Kavach checker, 8.3 the full filesystem API, 8.4 types, fuzzing and bypass
+replays.
+
+**Unicode in and out.** `forge.exe` now starts in `wmain` and converts the
+UTF-16 command line to UTF-8 (`main` received it in the ANSI code page, so
+characters outside it became `?`). Output goes through
+`forge-core/platform/Stdio`: `WriteConsoleW` when the stream is a console,
+raw UTF-8 `WriteFile` for pipes and files. `print`, `console` and uncaught
+error reports all use it. Conversion helpers are in `platform/Unicode`;
+invalid input becomes U+FFFD rather than an error.
+
+**`console`** (`runtime/Console.cpp`), written in C++: log, info, debug,
+warn, error, dir, dirxml, assert, trace, count, countReset, time, timeLog,
+timeEnd, group, groupCollapsed, groupEnd, with the WHATWG `%s %d %i %f %o %O
+%c %%` formatter. `console.table` prints like `console.log` for now. Values
+are formatted by `runtime/Inspect.cpp` in Node's style. Formatting never runs
+script code: getters show as `[Getter]`, Proxies as `[Proxy]`, and no
+toString, valueOf or iterator is called (Map and Set entries are read with
+the engine's own forEach and a native callback). This keeps logging a value
+from becoming a way to run code under someone else's identity once packages
+are isolated (Phase 9).
+
+**`Forge` namespace** (frozen; no `process` object): `version`, `platform`,
+`args`, `exitCode`, `exit()`, `env.get/has/toObject`, `stdout`/`stderr`
+`.write()` and `.isTerminal()`, `addSignalListener` / `removeSignalListener`.
+Exit codes are limited to 0-255. `Forge.exit()` unwinds the script with an
+uncatchable error that is not reported; pending timers, microtasks and
+`finally` blocks do not run. Environment access is not yet permission-checked;
+Kavach adds per-variable checks in 8.2.
+
+**Signals and graceful shutdown.** Ctrl+C and Ctrl+Break arrive on a system
+thread that only records them, wakes the event loop and, with no listener,
+requests an engine interrupt. With a listener, it runs on the main thread when
+the loop is idle; without one, the script stops (even inside an endless loop)
+and the process exits with 130 (SIGINT) or 149 (SIGBREAK). A second signal
+before the first is handled ends the process at once. Closing the console
+window keeps the Windows default.
+
+**Other changes.**
+- Uncaught errors print as `file:line:col`, then the formatted value and its
+  stack, through the console-aware writer.
+- The old `Result = <number>` line after a script whose last statement was a
+  number is removed; it corrupted program output.
+- `moz.build` adds `"."` to `LOCAL_INCLUDES` (mozbuild requires the list
+  sorted: `"!.."`, `"."`, `".."`) and the new source files.
+
+**Tests.** Six new self-test groups (34 formatting cases, including getters
+and Proxies that would throw if touched), six new runtime tests
+(console output, `Forge.args` with a non-ASCII argument, three exit-code
+cases, a thrown non-Error), `forge-core/platform/HostTest.cpp` in the MSVC
+CI job, and manual Ctrl+C and Unicode-display checks in `tests/manual/`.
+
+**Verified** on Varad's machine: the first real build had one error (the
+unsorted `LOCAL_INCLUDES`); after the fix, `build.ps1 -Test` passed all 54
+self-tests and 15 runtime tests. HostTest runs only in CI.

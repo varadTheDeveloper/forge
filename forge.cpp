@@ -47,6 +47,12 @@
 // supported; see HISTORY.md, "Phase 7.95".
 #include "js/friend/MicroTask.h"
 
+// Phase 8: Forge.args (arrays), the interrupt callback that lets Ctrl+C stop
+// a script stuck in a loop, and property specs for the Forge namespace.
+#include "js/Array.h"
+#include "js/Interrupt.h"
+#include "js/PropertySpec.h"
+
 // JS_NewPlainObject (Phase 7.3, fs's namespace object and statSync's
 // returned {size} object) is not exposed under js/public -- confirmed by
 // reading js/public/Object.h directly, which has no object-construction
@@ -56,8 +62,15 @@
 // kept narrower than -- included here just for this one function.
 #include "jsapi.h"
 
+#include <atomic>
+
+#include "forge-core/platform/Environment.h"
 #include "forge-core/platform/IoLoop.h"
 #include "forge-core/platform/Process.h"
+#include "forge-core/platform/Stdio.h"
+#include "forge-core/platform/Unicode.h"
+#include "forge-core/LockGuard.h"
+#include "forge-core/Mutex.h"
 #include "forge-core/Assert.h"
 #include "forge-core/File.h"
 #include "forge-core/HashMap.h"
@@ -70,6 +83,10 @@
 #include "forge-core/memory/MakeUnique.h"
 #include "forge-core/memory/UniquePtr.h"
 #include "forge-core/memory/Vector.h"
+
+// Phase 8: console and value formatting.
+#include "runtime/Console.h"
+#include "runtime/Inspect.h"
 
 // cx points to SpiderMonkey's context object.
 static const JSClass globalClass = {
@@ -105,6 +122,53 @@ static JsTimerRegistry& GetRuntimeTimers(JSContext* cx);
 
 static int g_exitCode = 0;
 static bool g_stopRequested = false;
+
+// Phase 8: Forge.exit() or a signal asked the process to end. The script is
+// unwound with an uncatchable error, which must not be reported as one.
+static bool g_exitRequested = false;
+
+static void RequestExit(int exitCode) {
+  g_exitCode = exitCode;
+  g_exitRequested = true;
+  g_stopRequested = true;
+}
+
+// Writes UTF-8 text to standard error through Forge's console-aware writer
+// (Phase 8), so non-ASCII error messages show correctly on a console.
+static void WriteStderr(forge::core::StringView text) {
+  forge::core::platform::WriteStd(forge::core::platform::StdStream::Err, text.Data(),
+                                  text.Size())
+      .Ignore();
+}
+
+// Custom TypeError / RangeError messages (Phase 8). JS_ReportErrorASCII can
+// only throw a plain Error; the engine creates other error types from a
+// message table like this one.
+enum ForgeErrorNumber : unsigned {
+  kForgeTypeError,
+  kForgeRangeError,
+  kForgeErrorCount
+};
+
+static const JSErrorFormatString kForgeErrorFormats[kForgeErrorCount] = {
+    {"ForgeTypeError", "{0}", 1, JSEXN_TYPEERR},
+    {"ForgeRangeError", "{0}", 1, JSEXN_RANGEERR},
+};
+
+static const JSErrorFormatString* GetForgeErrorMessage(void* userRef, const unsigned number) {
+  (void)userRef;
+  return number < kForgeErrorCount ? &kForgeErrorFormats[number] : nullptr;
+}
+
+static bool ThrowTypeError(JSContext* cx, const char* message) {
+  JS_ReportErrorNumberUTF8(cx, GetForgeErrorMessage, nullptr, kForgeTypeError, message);
+  return false;
+}
+
+static bool ThrowRangeError(JSContext* cx, const char* message) {
+  JS_ReportErrorNumberUTF8(cx, GetForgeErrorMessage, nullptr, kForgeRangeError, message);
+  return false;
+}
 
 // Runtime code-generation policy, consulted by the engine's security
 // callback (ForgeCodeGenerationAllowed below) for every eval(), new
@@ -145,43 +209,93 @@ static const JSSecurityCallbacks kForgeSecurityCallbacks = {
     nullptr,                     // subsumes (single principal for now)
 };
 
-// Prints a saved-frame stack object (the stack captured when an exception
-// was thrown) to stderr. Silent if there is no stack.
-static void PrintExceptionStack(JSContext* cx, JS::HandleObject stack) {
+// Appends a saved-frame stack (the stack captured when an exception was
+// thrown) to `out`, one indented frame per line. Appends nothing if there is
+// no stack.
+static void AppendStackFrames(JSContext* cx, JS::HandleObject stack, forge::core::String& out) {
   if (!stack) {
     return;
   }
 
   JS::RootedString str(cx);
 
-  if (!JS::BuildStackString(cx, nullptr, stack, &str, 2) || !str) {
+  if (!JS::BuildStackString(cx, nullptr, stack, &str, 4) || !str) {
     JS_ClearPendingException(cx);
     return;
   }
 
-  JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, str);
+  forge::core::String frames;
 
-  if (!utf8) {
+  if (!forge::runtime::AppendStringUtf8(cx, str, frames)) {
     JS_ClearPendingException(cx);
     return;
   }
 
-  fprintf(stderr, "Stack:\n%s", utf8.get());
+  forge::core::StringView view = frames.View();
+
+  while (!view.Empty() && view.Data()[view.Size() - 1] == '\n') {
+    view = forge::core::StringView(view.Data(), view.Size() - 1);
+  }
+
+  if (!view.Empty()) {
+    out.Append("\n").Ignore();
+    out.Append(view).Ignore();
+  }
 }
 
-// Prints an exception value plus its stack (Phase 7.9).
+// Prints an exception value plus its stack (Phase 7.9; Phase 8 formats it
+// with runtime/Inspect.h and writes it through the console-aware writer).
+//   file.js:3:9
+//   Error: boom
+//       inner@file.js:3:9
+//       @file.js:5:1
+// An Error prints its own stack; any other thrown value prints the stack
+// captured when it was thrown. Formatting never runs script code.
 static void PrintExceptionReport(JSContext* cx, const JS::ExceptionStack& exn,
                                  const char* context) {
-  JS::ErrorReportBuilder report(cx);
+  forge::core::String text;
 
-  if (!report.init(cx, exn, JS::ErrorReportBuilder::NoSideEffects)) {
+  {
+    JS::ErrorReportBuilder report(cx);
+
+    if (report.init(cx, exn, JS::ErrorReportBuilder::NoSideEffects) && report.report() &&
+        report.report()->filename) {
+      const JSErrorReport* r = report.report();
+      char position[48];
+      snprintf(position, sizeof(position), ":%u:%u\n", r->lineno, r->column.oneOriginValue());
+      text.Append(r->filename.c_str()).Ignore();
+      text.Append(position).Ignore();
+    }
+
     JS_ClearPendingException(cx);
-    fprintf(stderr, "Forge: %s failed (could not describe the error)\n", context);
-    return;
   }
 
-  JS::PrintError(stderr, report, false);
-  PrintExceptionStack(cx, exn.stack());
+  JS::RootedValue value(cx, exn.exception());
+  bool isError = false;
+
+  if (value.isObject()) {
+    JS::RootedObject obj(cx, &value.toObject());
+    js::ESClass cls = js::ESClass::Other;
+    isError = JS::GetBuiltinClass(cx, obj, &cls) && cls == js::ESClass::Error;
+    JS_ClearPendingException(cx);
+  }
+
+  forge::runtime::InspectOptions options;
+  options.rawTopLevelStrings = false;  // throw "x" prints 'x'
+
+  if (!forge::runtime::AppendInspected(cx, value, text, options)) {
+    JS_ClearPendingException(cx);
+    text.Append("(the thrown value could not be formatted while handling ").Ignore();
+    text.Append(context).Ignore();
+    text.Append(")").Ignore();
+  }
+
+  if (!isError) {
+    AppendStackFrames(cx, exn.stack(), text);
+  }
+
+  text.Append("\n").Ignore();
+  WriteStderr(text.View());
 }
 
 // Prints (and consumes) whatever exception is currently pending on `cx`,
@@ -193,6 +307,10 @@ static void PrintExceptionReport(JSContext* cx, const JS::ExceptionStack& exn,
 // silently drop it).
 static void ReportPendingException(JSContext* cx, const char* context) {
   if (!JS_IsExceptionPending(cx)) {
+    if (g_exitRequested) {
+      return;  // Forge.exit() or a signal: not an error
+    }
+
     // JS::Call/Evaluate returned false with nothing pending: an
     // uncatchable error (for example, the engine terminated the script).
     fprintf(stderr, "Forge: %s terminated by an uncatchable error\n", context);
@@ -214,6 +332,12 @@ static void ReportPendingException(JSContext* cx, const char* context) {
 // Reports the pending exception as uncaught and makes the process exit
 // with code 1 once the event loop unwinds.
 static void ReportFatalException(JSContext* cx, const char* context) {
+  if (g_exitRequested && !JS_IsExceptionPending(cx)) {
+    // Forge.exit() or a signal unwound the script; the exit code is set.
+    g_stopRequested = true;
+    return;
+  }
+
   fprintf(stderr, "Uncaught exception in %s:\n", context);
   ReportPendingException(cx, context);
   g_exitCode = 1;
@@ -616,6 +740,89 @@ constexpr forge::core::Size kAsyncWorkerThreadCount = 4;
 
 static void TraceForgeRoots(JSTracer* trc, void* data);
 
+//==============================================================================
+// Signals and graceful shutdown (Phase 8)
+//
+// Windows delivers Ctrl+C and Ctrl+Break on a thread of its own. That thread
+// never touches JavaScript; it only records the signal and wakes the main
+// thread:
+//   * If the script registered a listener (Forge.addSignalListener), the
+//     event loop calls it on the main thread the next time it is idle. The
+//     process keeps running unless the listener calls Forge.exit().
+//   * With no listener, the script is stopped (an engine interrupt also
+//     breaks out of a long-running loop) and the process exits with
+//     128 + the signal number: 130 for SIGINT, 149 for SIGBREAK.
+//   * A second signal that arrives before the first was handled ends the
+//     process at once, so a stuck script can always be stopped.
+// Closing the console window, logging off and shutting down keep the
+// Windows default (the process is ended).
+//==============================================================================
+
+static constexpr int kSignalCount = 2;
+static const char* const kSignalNames[kSignalCount] = {"SIGINT", "SIGBREAK"};
+static const int kSignalExitCodes[kSignalCount] = {130, 149};
+
+static std::atomic<int> g_pendingSignals[kSignalCount];
+static std::atomic<bool> g_signalHasListener[kSignalCount];
+static std::atomic<int> g_terminatingSignal{-1};
+
+// The signal thread may use these only while holding g_signalMutex; the
+// main thread clears them (under the mutex) before the context goes away.
+static forge::core::Mutex g_signalMutex;
+static JSContext* g_signalCx = nullptr;
+static forge::core::platform::IoLoop* g_signalLoop = nullptr;
+
+// Posted to the event loop to wake it; the work happens in Runtime::run().
+static forge::core::platform::IoCompletion g_signalWake;
+
+static void SignalWakeCompleted(forge::core::platform::IoCompletion*, DWORD, ULONG_PTR, bool,
+                                DWORD) {}
+
+static int SignalIndex(forge::core::platform::ConsoleSignal signal) {
+  return signal == forge::core::platform::ConsoleSignal::Interrupt ? 0 : 1;
+}
+
+// Runs on the system's signal thread.
+static bool OnConsoleSignal(forge::core::platform::ConsoleSignal signal) noexcept {
+  const int index = SignalIndex(signal);
+  forge::core::LockGuard<forge::core::Mutex> lock(g_signalMutex);
+
+  if (g_signalCx == nullptr) {
+    return false;  // no script running: default action
+  }
+
+  if (g_pendingSignals[index].fetch_add(1) > 0 || g_terminatingSignal.load() >= 0) {
+    // The previous signal has not been handled: the script is stuck.
+    forge::core::platform::TerminateProcessNow(static_cast<forge::core::u32>(kSignalExitCodes[index]));
+  }
+
+  if (!g_signalHasListener[index].load()) {
+    int expected = -1;
+    g_terminatingSignal.compare_exchange_strong(expected, index);
+    JS_RequestInterruptCallback(g_signalCx);
+  }
+
+  if (g_signalLoop != nullptr) {
+    g_signalLoop->PostCompletion(&g_signalWake, 0, 0).Ignore();
+  }
+
+  return true;
+}
+
+// JSInterruptCallback: runs on the main thread inside running script.
+// Returning false stops the script with an uncatchable error.
+static bool ForgeInterruptCallback(JSContext* cx) {
+  (void)cx;
+  const int index = g_terminatingSignal.load();
+
+  if (index < 0) {
+    return true;  // an interrupt the engine requested for itself
+  }
+
+  RequestExit(kSignalExitCodes[index]);
+  return false;
+}
+
 class Runtime {
  public:
   explicit Runtime(JSContext* cx)
@@ -677,6 +884,11 @@ class Runtime {
 
       if (!g_stopRequested) {
         ReportUnhandledRejections();
+      }
+
+      // Phase 8: Ctrl+C / Ctrl+Break recorded since the last pass.
+      if (!g_stopRequested && DispatchSignals()) {
+        continue;  // drain what the listeners queued before waiting
       }
 
       if (g_stopRequested) {
@@ -781,6 +993,56 @@ class Runtime {
     pendingFsMiscOps_.Erase(op);
   }
 
+  // Forge.addSignalListener / removeSignalListener (Phase 8). Adding the
+  // same function twice has no effect, like addEventListener. Listeners do
+  // not keep the event loop alive. Returns false only on out of memory.
+  bool AddSignalListener(int signal, JSObject* callback) {
+    for (forge::core::Size i = 0; i < signalListeners_.Size(); ++i) {
+      if (signalListeners_[i]->signal == signal &&
+          signalListeners_[i]->callback.unbarrieredGet() == callback) {
+        return true;
+      }
+    }
+
+    forge::core::Result<forge::core::memory::UniquePtr<SignalListener>> made =
+        forge::core::memory::MakeUnique<SignalListener>();
+
+    if (made.HasError()) {
+      return false;
+    }
+
+    made.Value()->signal = signal;
+    made.Value()->callback = callback;
+
+    if (signalListeners_.PushBack(std::move(made.Value())).HasError()) {
+      return false;
+    }
+
+    g_signalHasListener[signal].store(true);
+    return true;
+  }
+
+  void RemoveSignalListener(int signal, JSObject* callback) {
+    bool remaining = false;
+
+    for (forge::core::Size i = 0; i < signalListeners_.Size();) {
+      if (signalListeners_[i]->signal == signal &&
+          signalListeners_[i]->callback.unbarrieredGet() == callback) {
+        for (forge::core::Size j = i; j + 1 < signalListeners_.Size(); ++j) {
+          signalListeners_[j] = std::move(signalListeners_[j + 1]);
+        }
+
+        signalListeners_.PopBack();
+        continue;
+      }
+
+      remaining = remaining || signalListeners_[i]->signal == signal;
+      ++i;
+    }
+
+    g_signalHasListener[signal].store(remaining);
+  }
+
   // Traces every GC root this Runtime owns: the timer registry's
   // callbacks (unchanged from before Phase 7.5) plus every in-flight
   // async fs operation's Promise, from both pending-op maps -- so a GC
@@ -799,6 +1061,10 @@ class Runtime {
 
     for (forge::core::Size i = 0; i < unhandledRejections_.Size(); ++i) {
       JS::TraceEdge(trc, &unhandledRejections_[i]->promise, "forge-unhandled-rejection");
+    }
+
+    for (forge::core::Size i = 0; i < signalListeners_.Size(); ++i) {
+      JS::TraceEdge(trc, &signalListeners_[i]->callback, "forge-signal-listener");
     }
   }
 
@@ -835,6 +1101,11 @@ class Runtime {
     pendingFsMiscOps_.Clear();
     timers_.Clear();
     unhandledRejections_.Clear();
+    signalListeners_.Clear();
+
+    for (int i = 0; i < kSignalCount; ++i) {
+      g_signalHasListener[i].store(false);
+    }
   }
 
  private:
@@ -863,6 +1134,72 @@ class Runtime {
   };
 
   forge::core::Vector<forge::core::memory::UniquePtr<TrackedRejection>> unhandledRejections_;
+
+  // Phase 8: Forge.addSignalListener callbacks, in registration order.
+  struct SignalListener {
+    int signal{0};
+    JS::Heap<JSObject*> callback;
+  };
+
+  forge::core::Vector<forge::core::memory::UniquePtr<SignalListener>> signalListeners_;
+
+  // Handles signals recorded by OnConsoleSignal (Phase 8). Returns true if
+  // any listener ran, so run() drains the microtasks it may have queued.
+  bool DispatchSignals() {
+    bool ranListener = false;
+
+    for (int index = 0; index < kSignalCount && !g_stopRequested; ++index) {
+      if (g_pendingSignals[index].load() == 0) {
+        continue;
+      }
+
+      const int terminating = g_terminatingSignal.load();
+
+      if (terminating >= 0 || !g_signalHasListener[index].load()) {
+        RequestExit(kSignalExitCodes[terminating >= 0 ? terminating : index]);
+        return ranListener;
+      }
+
+      // Copy the listeners first: one may add or remove listeners.
+      JS::RootedVector<JSObject*> callbacks(cx_);
+
+      for (forge::core::Size i = 0; i < signalListeners_.Size(); ++i) {
+        if (signalListeners_[i]->signal == index &&
+            !callbacks.append(signalListeners_[i]->callback.get())) {
+          fprintf(stderr, "Forge: out of memory while handling %s\n", kSignalNames[index]);
+          RequestExit(kSignalExitCodes[index]);
+          return ranListener;
+        }
+      }
+
+      // Cleared only now: a second signal arriving while the listeners
+      // were being collected counts as "not handled yet".
+      g_pendingSignals[index].store(0);
+
+      for (size_t i = 0; i < callbacks.length() && !g_stopRequested; ++i) {
+        JS::RootedObject callback(cx_, callbacks[i]);
+        JSAutoRealm ar(cx_, callback);
+        JS::RootedValue name(cx_);
+        JSString* nameStr = JS_NewStringCopyZ(cx_, kSignalNames[index]);
+        bool ok = nameStr != nullptr;
+
+        if (ok) {
+          name.setString(nameStr);
+          JS::RootedValue fn(cx_, JS::ObjectValue(*callback));
+          JS::RootedValue rval(cx_);
+          ok = JS::Call(cx_, JS::UndefinedHandleValue, fn, JS::HandleValueArray(name), &rval);
+        }
+
+        if (!ok) {
+          ReportFatalException(cx_, "signal listener");
+        }
+
+        ranListener = true;
+      }
+    }
+
+    return ranListener;
+  }
 
   // JS::PromiseRejectionTrackerCallback. Called synchronously by the
   // engine when a Promise is rejected with no handler (Unhandled), and when
@@ -967,31 +1304,34 @@ static JsTimerRegistry& GetRuntimeTimers(JSContext* cx) {
   return GetRuntime(cx)->timers();
 }
 
+// print(...values): the engine shell's print, kept for older scripts.
+// Each value goes through ToString (it may run the value's toString) and
+// the line is written through the console-aware writer (Phase 8), so
+// non-ASCII text shows correctly. New code should use console.log.
 static bool Print(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  forge::core::String line;
 
   for (unsigned i = 0; i < args.length(); i++) {
     JS::RootedString str(cx, JS::ToString(cx, args[i]));
 
-    if (!str) {
+    if (!str || !forge::runtime::AppendStringUtf8(cx, str, line)) {
       return false;
     }
 
-    JS::UniqueChars bytes = JS_EncodeStringToUTF8(cx, str);
-
-    if (!bytes) {
+    if (i + 1 < args.length() && line.Append(' ').HasError()) {
+      JS_ReportOutOfMemory(cx);
       return false;
-    }
-
-    printf("%s", bytes.get());
-
-    if (i + 1 < args.length()) {
-      printf(" ");
     }
   }
 
-  printf("\n");
+  if (line.Append('\n').HasError()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
 
+  forge::core::platform::WriteStd(forge::core::platform::StdStream::Out, line.Data(), line.Size())
+      .Ignore();
   args.rval().setUndefined();
   return true;
 }
@@ -3169,6 +3509,450 @@ static bool DefineFsNamespace(JSContext* cx, JS::HandleObject global) {
 }
 
 //==============================================================================
+// The Forge namespace (Phase 8)
+//
+//   Forge.version            "0.1.0"
+//   Forge.platform           "windows"
+//   Forge.args               frozen array of the script's arguments
+//   Forge.exitCode           exit code used when the script ends normally
+//   Forge.exit([code])       end the process now (pending timers, I/O and
+//                            microtasks are dropped; finally blocks do not run)
+//   Forge.env.get(name)      a variable's value, or undefined
+//   Forge.env.has(name)      whether a variable is set
+//   Forge.env.toObject()     every variable, as a plain object
+//   Forge.stdout.write(data) write a string (as UTF-8) or bytes; returns the
+//   Forge.stderr.write(data) number of bytes written
+//   Forge.stdout.isTerminal() / Forge.stderr.isTerminal()
+//   Forge.addSignalListener(name, fn) / Forge.removeSignalListener(name, fn)
+//                            name is "SIGINT" (Ctrl+C) or "SIGBREAK" (Ctrl+Break)
+//
+// There is deliberately no Node-style `process` object. The namespace and
+// its sub-objects are frozen, so no script can replace these functions.
+// Environment access will be checked by Kavach per variable (Phase 8.2).
+//==============================================================================
+
+static const char kForgeVersion[] = "0.1.0";
+
+// The script's own arguments, as UTF-8, set by ForgeMain before any script runs.
+static char** g_scriptArgs = nullptr;
+static int g_scriptArgCount = 0;
+
+// Exit codes are limited to 0-255 so scripts behave the same on Windows and
+// (from the Linux port on) POSIX systems.
+static bool ToExitCode(JSContext* cx, JS::HandleValue value, const char* what, int* out) {
+  if (!value.isNumber()) {
+    char message[96];
+    snprintf(message, sizeof(message), "%s must be a number", what);
+    return ThrowTypeError(cx, message);
+  }
+
+  const double number = value.toNumber();
+
+  if (!(number >= 0 && number <= 255) || number != static_cast<double>(static_cast<int>(number))) {
+    char message[96];
+    snprintf(message, sizeof(message), "%s must be a whole number from 0 to 255", what);
+    return ThrowRangeError(cx, message);
+  }
+
+  *out = static_cast<int>(number);
+  return true;
+}
+
+static bool ForgeExit(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  int code = g_exitCode;
+
+  if (args.hasDefined(0) && !ToExitCode(cx, args[0], "Forge.exit: the exit code", &code)) {
+    return false;
+  }
+
+  RequestExit(code);
+
+  // Returning false with no exception pending is an uncatchable error: the
+  // whole script unwinds at once and nothing else runs.
+  return false;
+}
+
+static bool ForgeGetExitCode(JSContext* cx, unsigned argc, JS::Value* vp) {
+  (void)cx;
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  args.rval().setInt32(g_exitCode);
+  return true;
+}
+
+static bool ForgeSetExitCode(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  int code = 0;
+
+  if (args.hasDefined(0) && !ToExitCode(cx, args[0], "Forge.exitCode", &code)) {
+    return false;
+  }
+
+  g_exitCode = code;
+  args.rval().setUndefined();
+  return true;
+}
+
+// Reads a required string argument as UTF-8; throws a TypeError otherwise.
+static bool RequireStringArg(JSContext* cx, const JS::CallArgs& args, unsigned index,
+                             const char* what, forge::core::String& out) {
+  if (!args.get(index).isString()) {
+    char message[128];
+    snprintf(message, sizeof(message), "%s must be a string", what);
+    return ThrowTypeError(cx, message);
+  }
+
+  return forge::runtime::AppendStringUtf8(cx, args[index].toString(), out);
+}
+
+static bool RequireEnvName(JSContext* cx, const JS::CallArgs& args, const char* function,
+                           forge::core::String& name) {
+  char what[64];
+  snprintf(what, sizeof(what), "%s: the variable name", function);
+
+  if (!RequireStringArg(cx, args, 0, what, name)) {
+    return false;
+  }
+
+  if (!forge::core::platform::IsValidEnvName(name.View())) {
+    char message[128];
+    snprintf(message, sizeof(message),
+             "%s: the variable name must not be empty or contain '=' or NUL", function);
+    return ThrowTypeError(cx, message);
+  }
+
+  return true;
+}
+
+static bool ForgeEnvGet(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  forge::core::String name;
+
+  if (!RequireEnvName(cx, args, "Forge.env.get", name)) {
+    return false;
+  }
+
+  forge::core::String value;
+  forge::core::Result<bool> found = forge::core::platform::GetEnv(name.View(), value);
+
+  if (found.HasError()) {
+    ThrowJsError(cx, found.Error(), "Forge.env.get");
+    return false;
+  }
+
+  if (!found.Value()) {
+    args.rval().setUndefined();
+    return true;
+  }
+
+  JSString* str = FromForgeString(cx, value.View());
+
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool ForgeEnvHas(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  forge::core::String name;
+
+  if (!RequireEnvName(cx, args, "Forge.env.has", name)) {
+    return false;
+  }
+
+  forge::core::String value;
+  forge::core::Result<bool> found = forge::core::platform::GetEnv(name.View(), value);
+
+  if (found.HasError()) {
+    ThrowJsError(cx, found.Error(), "Forge.env.has");
+    return false;
+  }
+
+  args.rval().setBoolean(found.Value());
+  return true;
+}
+
+static bool ForgeEnvToObject(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  forge::core::Result<forge::core::Vector<forge::core::platform::EnvEntry>> entries =
+      forge::core::platform::ListEnv();
+
+  if (entries.HasError()) {
+    ThrowJsError(cx, entries.Error(), "Forge.env.toObject");
+    return false;
+  }
+
+  JS::RootedObject result(cx, JS_NewPlainObject(cx));
+
+  if (!result) {
+    return false;
+  }
+
+  JS::RootedString name(cx);
+  JS::RootedId id(cx);
+  JS::RootedValue value(cx);
+
+  for (forge::core::Size i = 0; i < entries.Value().Size(); ++i) {
+    const forge::core::platform::EnvEntry& entry = entries.Value()[i];
+    name = FromForgeString(cx, entry.name.View());
+
+    if (!name || !JS_StringToId(cx, name, &id)) {
+      return false;
+    }
+
+    JSString* valueStr = FromForgeString(cx, entry.value.View());
+
+    if (!valueStr) {
+      return false;
+    }
+
+    value.setString(valueStr);
+
+    // Define, not set: a variable named "__proto__" must not change the
+    // object's prototype.
+    if (!JS_DefinePropertyById(cx, result, id, value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+// Shared by Forge.stdout.write and Forge.stderr.write.
+static bool WriteToStdStream(JSContext* cx, const JS::CallArgs& args,
+                             forge::core::platform::StdStream stream, const char* function) {
+  if (args.get(0).isString()) {
+    forge::core::String text;
+
+    if (!forge::runtime::AppendStringUtf8(cx, args[0].toString(), text)) {
+      return false;
+    }
+
+    forge::core::Result<void> written =
+        forge::core::platform::WriteStd(stream, text.Data(), text.Size());
+
+    if (written.HasError()) {
+      ThrowJsError(cx, written.Error(), function);
+      return false;
+    }
+
+    args.rval().setNumber(static_cast<double>(text.Size()));
+    return true;
+  }
+
+  forge::core::Result<forge::core::Span<const forge::core::u8>> bytes =
+      AsByteSpan(cx, args.get(0));
+
+  if (bytes.HasError()) {
+    char message[128];
+    snprintf(message, sizeof(message), "%s: data must be a string, Uint8Array or ArrayBuffer",
+             function);
+    return ThrowTypeError(cx, message);
+  }
+
+  // Nothing below can run script or GC, so the span stays valid.
+  const forge::core::Size size = bytes.Value().Size();
+  forge::core::Result<void> written = forge::core::platform::WriteStd(
+      stream, reinterpret_cast<const char*>(bytes.Value().Data()), size);
+
+  if (written.HasError()) {
+    ThrowJsError(cx, written.Error(), function);
+    return false;
+  }
+
+  args.rval().setNumber(static_cast<double>(size));
+  return true;
+}
+
+static bool ForgeStdoutWrite(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  return WriteToStdStream(cx, args, forge::core::platform::StdStream::Out, "Forge.stdout.write");
+}
+
+static bool ForgeStderrWrite(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  return WriteToStdStream(cx, args, forge::core::platform::StdStream::Err, "Forge.stderr.write");
+}
+
+static bool ForgeStdoutIsTerminal(JSContext* cx, unsigned argc, JS::Value* vp) {
+  (void)cx;
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  args.rval().setBoolean(forge::core::platform::IsTerminal(forge::core::platform::StdStream::Out));
+  return true;
+}
+
+static bool ForgeStderrIsTerminal(JSContext* cx, unsigned argc, JS::Value* vp) {
+  (void)cx;
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  args.rval().setBoolean(forge::core::platform::IsTerminal(forge::core::platform::StdStream::Err));
+  return true;
+}
+
+// Validates (signal name, listener) for add/removeSignalListener.
+static bool GetSignalArgs(JSContext* cx, const JS::CallArgs& args, const char* function,
+                          int* signal, JS::MutableHandleObject callback) {
+  forge::core::String name;
+  char what[96];
+  snprintf(what, sizeof(what), "%s: the signal name", function);
+
+  if (!RequireStringArg(cx, args, 0, what, name)) {
+    return false;
+  }
+
+  *signal = -1;
+
+  for (int i = 0; i < kSignalCount; ++i) {
+    if (name.View() == forge::core::StringView(kSignalNames[i])) {
+      *signal = i;
+    }
+  }
+
+  if (*signal < 0) {
+    char message[160];
+    snprintf(message, sizeof(message),
+             "%s: unsupported signal; on Windows use \"SIGINT\" or \"SIGBREAK\"", function);
+    return ThrowTypeError(cx, message);
+  }
+
+  if (!args.get(1).isObject() || !JS::IsCallable(&args[1].toObject())) {
+    char message[96];
+    snprintf(message, sizeof(message), "%s: the listener must be a function", function);
+    return ThrowTypeError(cx, message);
+  }
+
+  callback.set(&args[1].toObject());
+  return true;
+}
+
+static bool ForgeAddSignalListener(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  int signal = 0;
+  JS::RootedObject callback(cx);
+
+  if (!GetSignalArgs(cx, args, "Forge.addSignalListener", &signal, &callback)) {
+    return false;
+  }
+
+  if (!GetRuntime(cx)->AddSignalListener(signal, callback)) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  args.rval().setUndefined();
+  return true;
+}
+
+static bool ForgeRemoveSignalListener(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  int signal = 0;
+  JS::RootedObject callback(cx);
+
+  if (!GetSignalArgs(cx, args, "Forge.removeSignalListener", &signal, &callback)) {
+    return false;
+  }
+
+  GetRuntime(cx)->RemoveSignalListener(signal, callback);
+  args.rval().setUndefined();
+  return true;
+}
+
+static const JSFunctionSpec kForgeMethods[] = {
+    JS_FN("exit", ForgeExit, 1, JSPROP_ENUMERATE),
+    JS_FN("addSignalListener", ForgeAddSignalListener, 2, JSPROP_ENUMERATE),
+    JS_FN("removeSignalListener", ForgeRemoveSignalListener, 2, JSPROP_ENUMERATE),
+    JS_FS_END,
+};
+
+static const JSFunctionSpec kForgeEnvMethods[] = {
+    JS_FN("get", ForgeEnvGet, 1, JSPROP_ENUMERATE),
+    JS_FN("has", ForgeEnvHas, 1, JSPROP_ENUMERATE),
+    JS_FN("toObject", ForgeEnvToObject, 0, JSPROP_ENUMERATE),
+    JS_FS_END,
+};
+
+static const JSFunctionSpec kForgeStdoutMethods[] = {
+    JS_FN("write", ForgeStdoutWrite, 1, JSPROP_ENUMERATE),
+    JS_FN("isTerminal", ForgeStdoutIsTerminal, 0, JSPROP_ENUMERATE),
+    JS_FS_END,
+};
+
+static const JSFunctionSpec kForgeStderrMethods[] = {
+    JS_FN("write", ForgeStderrWrite, 1, JSPROP_ENUMERATE),
+    JS_FN("isTerminal", ForgeStderrIsTerminal, 0, JSPROP_ENUMERATE),
+    JS_FS_END,
+};
+
+// Creates a frozen object holding `methods` and stores it as forge[name].
+static bool DefineFrozenSubObject(JSContext* cx, JS::HandleObject forge, const char* name,
+                                  const JSFunctionSpec* methods) {
+  JS::RootedObject obj(cx, JS_NewPlainObject(cx));
+
+  return obj && JS_DefineFunctions(cx, obj, methods) && JS_FreezeObject(cx, obj) &&
+         JS_DefineProperty(cx, forge, name, obj, JSPROP_ENUMERATE | JSPROP_READONLY |
+                                                     JSPROP_PERMANENT);
+}
+
+static bool DefineForgeNamespace(JSContext* cx, JS::HandleObject global) {
+  JS::RootedObject forge(cx, JS_NewPlainObject(cx));
+
+  if (!forge || !JS_DefineFunctions(cx, forge, kForgeMethods) ||
+      !DefineFrozenSubObject(cx, forge, "env", kForgeEnvMethods) ||
+      !DefineFrozenSubObject(cx, forge, "stdout", kForgeStdoutMethods) ||
+      !DefineFrozenSubObject(cx, forge, "stderr", kForgeStderrMethods)) {
+    return false;
+  }
+
+  const unsigned constant = JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT;
+
+  JS::RootedString version(cx, JS_NewStringCopyZ(cx, kForgeVersion));
+  JS::RootedString platform(cx, JS_NewStringCopyZ(cx, "windows"));
+
+  if (!version || !platform || !JS_DefineProperty(cx, forge, "version", version, constant) ||
+      !JS_DefineProperty(cx, forge, "platform", platform, constant)) {
+    return false;
+  }
+
+  if (!JS_DefineProperty(cx, forge, "exitCode", ForgeGetExitCode, ForgeSetExitCode,
+                         JSPROP_ENUMERATE)) {
+    return false;
+  }
+
+  JS::RootedValueVector argValues(cx);
+
+  for (int i = 0; i < g_scriptArgCount; ++i) {
+    JSString* arg = FromForgeString(cx, forge::core::StringView(g_scriptArgs[i]));
+
+    if (!arg || !argValues.append(JS::StringValue(arg))) {
+      if (!JS_IsExceptionPending(cx)) {
+        JS_ReportOutOfMemory(cx);
+      }
+
+      return false;
+    }
+  }
+
+  JS::RootedObject argsArray(cx, JS::NewArrayObject(cx, argValues));
+
+  if (!argsArray || !JS_FreezeObject(cx, argsArray) ||
+      !JS_DefineProperty(cx, forge, "args", argsArray, constant)) {
+    return false;
+  }
+
+  if (!JS_FreezeObject(cx, forge)) {
+    return false;
+  }
+
+  // Writable and configurable on the global, like console; the object
+  // itself cannot be changed.
+  return JS_DefineProperty(cx, global, "Forge", forge, 0);
+}
+
+//==============================================================================
 // Phase 7.3 smoke tests -- run via `forge --self-test` (see main()'s CLI
 // dispatch below), immediately after the Phase 7.2 marshalling suite.
 // Exercises every fs.*Sync method above through the real JS-visible
@@ -4035,10 +4819,198 @@ static bool RunFsAsyncSmokeTests(JSContext* cx, Runtime& runtime) {
   return allOk;
 }
 
+//==============================================================================
+// Phase 8 self-tests: value formatting (runtime/Inspect.h), console and the
+// Forge namespace. Output that only shows up on a real console or in a
+// separate process (console.log text, Forge.exit codes, Ctrl+C) is covered
+// by tests\run-runtime-tests.ps1 instead.
+//==============================================================================
+
+struct InspectCase {
+  const char* expression;
+  const char* expected;
+};
+
+static const InspectCase kInspectCases[] = {
+    {"({a: 1, b: 'x'})", "{ a: 1, b: 'x' }"},
+    {"({})", "{}"},
+    {"[1, 2, 3]", "[ 1, 2, 3 ]"},
+    {"[]", "[]"},
+    {"[1, , 3]", "[ 1, <1 empty item>, 3 ]"},
+    {"'top level'", "top level"},
+    {"[\"it's\"]", "[ \"it's\" ]"},
+    {"['line\\nbreak']", "[ 'line\\nbreak' ]"},
+    {"['\\u00e9']", "[ '\xc3\xa9' ]"},
+    {"-0", "-0"},
+    {"1.5", "1.5"},
+    {"10n", "10n"},
+    {"Symbol('s')", "Symbol(s)"},
+    {"null", "null"},
+    {"undefined", "undefined"},
+    {"new Map([['k', 1]])", "Map(1) { 'k' => 1 }"},
+    {"new Set([1, 2])", "Set(2) { 1, 2 }"},
+    {"(function foo() {})", "[Function: foo]"},
+    {"[() => {}]", "[ [Function (anonymous)] ]"},
+    {"new Date(0)", "1970-01-01T00:00:00.000Z"},
+    {"new Date(NaN)", "Invalid Date"},
+    {"/a+b/gi", "/a+b/gi"},
+    {"new Uint8Array([1, 2])", "Uint8Array(2) [ 1, 2 ]"},
+    {"(() => { const o = {}; o.self = o; return o; })()", "{ self: [Circular] }"},
+    {"({a: {b: {c: {d: 1}}}})", "{ a: { b: { c: [Object] } } }"},
+    {"(() => { class Foo { constructor() { this.x = 1; } } return new Foo(); })()",
+     "Foo { x: 1 }"},
+    {"Object.create(null)", "[Object: null prototype] {}"},
+    {"({'a-b': 1, [Symbol('k')]: 2})", "{ 'a-b': 1, [Symbol(k)]: 2 }"},
+    {"Promise.resolve(1)", "Promise { 1 }"},
+    {"[new TypeError('boom')]", "[ [TypeError: boom] ]"},
+    {"new ArrayBuffer(4)", "ArrayBuffer { byteLength: 4 }"},
+    // Inspection must never run script code:
+    {"({ get g() { throw new Error('getter ran'); } })", "{ g: [Getter] }"},
+    {"new Proxy({}, { ownKeys() { throw new Error('trap ran'); },"
+     " getPrototypeOf() { throw new Error('trap ran'); } })",
+     "[Proxy]"},
+    {"Object.create(Object.defineProperty({}, 'constructor',"
+     " { get() { throw new Error('getter ran'); } }))",
+     "{}"},
+};
+
+static bool SelfTest_InspectFormats(JSContext* cx) {
+  bool allOk = true;
+
+  for (const InspectCase& c : kInspectCases) {
+    JS::RootedValue value(cx);
+
+    if (!EvaluateExpression(cx, c.expression, &value)) {
+      fprintf(stderr, "  FAIL inspect(%s): evaluating threw\n", c.expression);
+      ReportPendingException(cx, "inspect self-test");
+      allOk = false;
+      continue;
+    }
+
+    forge::core::String text;
+
+    if (!forge::runtime::AppendInspected(cx, value, text)) {
+      fprintf(stderr, "  FAIL inspect(%s): formatting failed\n", c.expression);
+      ReportPendingException(cx, "inspect self-test");
+      allOk = false;
+      continue;
+    }
+
+    if (text.View() != forge::core::StringView(c.expected)) {
+      fprintf(stderr, "  FAIL inspect(%s):\n    got      <%s>\n    expected <%s>\n", c.expression,
+              text.CStr(), c.expected);
+      allOk = false;
+    }
+  }
+
+  return allOk;
+}
+
+static bool SelfTest_ForgeNamespaceShape(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Forge namespace shape",
+      "typeof Forge === 'object' && Object.isFrozen(Forge) && Object.isFrozen(Forge.env) &&"
+      " Object.isFrozen(Forge.stdout) && Object.isFrozen(Forge.stderr) &&"
+      " Array.isArray(Forge.args) && Object.isFrozen(Forge.args) &&"
+      " Forge.version === '0.1.0' && Forge.platform === 'windows' &&"
+      " typeof Forge.exit === 'function' && typeof console.log === 'function' &&"
+      " typeof console.timeEnd === 'function' && !('process' in globalThis) ? 'ok' : 'bad'");
+}
+
+static bool SelfTest_ForgeEnv(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Forge.env",
+      "(() => {"
+      "  if (!Forge.env.has('PATH') || typeof Forge.env.get('PATH') !== 'string') return 'PATH';"
+      "  if (Forge.env.get('FORGE_SELF_TEST_UNSET_8f2c') !== undefined) return 'unset';"
+      "  const all = Forge.env.toObject();"
+      "  if (typeof (all.PATH ?? all.Path) !== 'string') return 'toObject';"
+      "  for (const bad of ['', 'A=B', 'A\\0B', 5]) {"
+      "    try { Forge.env.get(bad); return 'no throw: ' + String(bad); }"
+      "    catch (e) { if (!(e instanceof TypeError)) return String(e); }"
+      "  }"
+      "  return 'ok';"
+      "})()");
+}
+
+static bool SelfTest_ForgeExitCode(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Forge.exitCode",
+      "(() => {"
+      "  Forge.exitCode = 3;"
+      "  const read = Forge.exitCode;"
+      "  Forge.exitCode = 0;"
+      "  if (read !== 3) return 'read ' + read;"
+      "  for (const bad of [256, -1, 1.5, NaN]) {"
+      "    try { Forge.exitCode = bad; return 'no throw: ' + bad; }"
+      "    catch (e) { if (!(e instanceof RangeError)) return String(e); }"
+      "  }"
+      "  try { Forge.exit('1'); return 'exit did not throw'; }"
+      "  catch (e) { if (!(e instanceof TypeError)) return String(e); }"
+      "  return Forge.exitCode === 0 ? 'ok' : 'changed';"
+      "})()");
+}
+
+static bool SelfTest_ForgeStdStreams(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Forge.stdout / Forge.stderr",
+      "(() => {"
+      "  if (Forge.stdout.write('') !== 0) return 'empty string';"
+      "  if (Forge.stderr.write(new Uint8Array(0)) !== 0) return 'empty bytes';"
+      "  if (typeof Forge.stdout.isTerminal() !== 'boolean') return 'isTerminal';"
+      "  try { Forge.stdout.write(42); return 'no throw'; }"
+      "  catch (e) { if (!(e instanceof TypeError)) return String(e); }"
+      "  return 'ok';"
+      "})()");
+}
+
+static bool SelfTest_ForgeSignalListeners(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Forge.addSignalListener",
+      "(() => {"
+      "  const f = () => {};"
+      "  Forge.addSignalListener('SIGINT', f);"
+      "  Forge.addSignalListener('SIGINT', f);"
+      "  Forge.removeSignalListener('SIGINT', f);"
+      "  Forge.removeSignalListener('SIGBREAK', f);"
+      "  for (const [name, fn] of [['SIGTERM', f], ['SIGINT', 1], [1, f]]) {"
+      "    try { Forge.addSignalListener(name, fn); return 'no throw: ' + String(name); }"
+      "    catch (e) { if (!(e instanceof TypeError)) return String(e); }"
+      "  }"
+      "  return 'ok';"
+      "})()");
+}
+
+static bool RunConsoleAndForgeSmokeTests(JSContext* cx) {
+  struct Case {
+    const char* name;
+    bool (*fn)(JSContext*);
+  };
+
+  const Case cases[] = {
+      {"inspect: value formatting", SelfTest_InspectFormats},
+      {"Forge namespace shape", SelfTest_ForgeNamespaceShape},
+      {"Forge.env", SelfTest_ForgeEnv},
+      {"Forge.exitCode / Forge.exit checks", SelfTest_ForgeExitCode},
+      {"Forge.stdout / Forge.stderr", SelfTest_ForgeStdStreams},
+      {"Forge signal listeners", SelfTest_ForgeSignalListeners},
+  };
+
+  bool allOk = true;
+
+  for (const Case& c : cases) {
+    const bool ok = c.fn(cx);
+    printf("[self-test] %-40s %s\n", c.name, ok ? "PASS" : "FAIL");
+    allOk = allOk && ok;
+  }
+
+  return allOk;
+}
+
 static void PrintUsage() {
   printf("Forge JavaScript Runtime\n\n");
   printf("Usage:\n");
-  printf("  forge [options] <file.js>   Run a JavaScript file\n");
+  printf("  forge [options] <file.js> [args...]   Run a JavaScript file; args go to Forge.args\n");
   printf("  forge --self-test           Run the built-in self-tests\n");
   printf("  forge --version             Show runtime version\n");
   printf("  forge --help                Show this help\n\n");
@@ -4049,7 +5021,21 @@ static void PrintUsage() {
   printf("  --max-heap-mb=N                           Cap the JS heap at N MB (default: no cap)\n");
 }
 
-int main(int argc, char* argv[]) {
+// Phase 8: stops the signal thread from touching the context or the event
+// loop. Safe to call more than once; must run before JS_DestroyContext.
+static void StopSignalHandling() {
+  forge::core::platform::RemoveConsoleSignalHandler();
+  forge::core::LockGuard<forge::core::Mutex> lock(g_signalMutex);
+  g_signalCx = nullptr;
+  g_signalLoop = nullptr;
+}
+
+struct SignalHandlingScope {
+  ~SignalHandlingScope() { StopSignalHandling(); }
+};
+
+// argv is UTF-8 (see wmain below).
+static int ForgeMain(int argc, char* argv[]) {
   // Phase 7.9 (R22): before anything can load a DLL.
   forge::core::platform::HardenProcess();
 
@@ -4123,6 +5109,11 @@ int main(int argc, char* argv[]) {
 
   JS_SetGCParameter(cx, JSGC_MAX_BYTES, maxHeapBytes);
 
+  // Phase 8: lets Ctrl+C stop a script that never returns to the event loop.
+  if (!JS_AddInterruptCallback(cx, ForgeInterruptCallback)) {
+    return 1;
+  }
+
   if (const forge::core::u64 physicalBytes = forge::core::platform::PhysicalMemoryBytes();
       physicalBytes > 0) {
     const forge::core::u64 physicalMb = physicalBytes / (1024u * 1024u);
@@ -4153,6 +5144,26 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "Forge: failed to initialize the event loop (native code %d)\n",
             initialized.Error().NativeCode());
     return 1;
+  }
+
+  // Phase 8: Ctrl+C / Ctrl+Break handling (see OnConsoleSignal).
+  SignalHandlingScope signalScope;
+  g_signalWake.callback = SignalWakeCompleted;
+
+  {
+    forge::core::LockGuard<forge::core::Mutex> lock(g_signalMutex);
+    g_signalCx = cx;
+    g_signalLoop = &runtime.Loop();
+  }
+
+  if (forge::core::platform::InstallConsoleSignalHandler(OnConsoleSignal).HasError()) {
+    fprintf(stderr, "Forge: warning: Ctrl+C handling is not available\n");
+  }
+
+  // Phase 8: the script's own arguments (everything after its path).
+  if (command != "--self-test") {
+    g_scriptArgs = argv + argIndex + 1;
+    g_scriptArgCount = argc - argIndex - 1;
   }
 
   // Everything from here down that touches `global` (including the
@@ -4213,6 +5224,13 @@ int main(int argc, char* argv[]) {
         return 1;
       }
 
+      // Phase 8: console and the Forge namespace.
+      if (!forge::runtime::DefineConsole(cx, global) || !DefineForgeNamespace(cx, global)) {
+        ReportFatalException(cx, "startup");
+        runtime.Shutdown();
+        return 1;
+      }
+
       // `forge --self-test` runs the Phase 7.2 marshalling smoke tests
       // (see RunMarshallingSmokeTests above) and the Phase 7.3 fs.*Sync
       // smoke tests (see RunFsSmokeTests above) against this real,
@@ -4234,7 +5252,8 @@ int main(int argc, char* argv[]) {
         // directory and some of RunFsSmokeTests' *Sync cases are not
         // idempotent across ordering with this suite's own fixture setup.
         const bool fsAsyncOk = RunFsAsyncSmokeTests(cx, runtime);
-        const bool ok = marshallingOk && runtimeSafetyOk && fsOk && fsAsyncOk;
+        const bool consoleOk = RunConsoleAndForgeSmokeTests(cx);  // Phase 8
+        const bool ok = marshallingOk && runtimeSafetyOk && fsOk && fsAsyncOk && consoleOk;
         printf("[self-test] %s\n", ok ? "ALL PASSED" : "FAILURES ABOVE");
         runtime.Shutdown();
         return ok ? 0 : 1;
@@ -4280,17 +5299,20 @@ int main(int argc, char* argv[]) {
         // The script may have already called setTimeout/setInterval before
         // failing — release those before cx goes away, same reasoning as
         // the runtime.Shutdown() call after the event loop below.
+        StopSignalHandling();
         runtime.Shutdown();
-        return 1;
+        // Phase 8: Forge.exit(n) in the main script is not a failure.
+        return g_exitRequested ? g_exitCode : 1;
       }
 
-      if (rval.isNumber()) {
-        printf("Result = %f\n", rval.toNumber());
-      }
+      // Phase 8: the old "Result = <number>" line printed after a script
+      // whose last statement was a number is gone; no other runtime does
+      // that, and it corrupted the output of real programs.
       runtime.run();
     }
   } // end of the `global`-owning scope — global is destroyed here, cx is still alive.
 
+  StopSignalHandling();
   runtime.Shutdown();
   JS_DestroyContext(cx);
   JS_ShutDown();
@@ -4299,3 +5321,44 @@ int main(int argc, char* argv[]) {
   // during the event loop (it used to be 0 no matter what).
   return g_exitCode;
 }
+
+#if defined(_WIN32)
+// Phase 8: Windows passes the command line as UTF-16. The old main() got it
+// converted to the ANSI code page, which turns any character outside that
+// code page into '?'. wmain converts every argument to UTF-8 instead.
+int wmain(int argc, wchar_t* wargv[]) {
+  forge::core::Vector<forge::core::String> utf8Args;
+  forge::core::Vector<char*> argv;
+
+  if (utf8Args.Reserve(static_cast<forge::core::Size>(argc)).HasError() ||
+      argv.Reserve(static_cast<forge::core::Size>(argc) + 1).HasError()) {
+    fprintf(stderr, "Forge: out of memory reading the command line\n");
+    return 1;
+  }
+
+  for (int i = 0; i < argc; ++i) {
+    forge::core::String arg;
+    forge::core::Size length = 0;
+
+    while (wargv[i][length] != L'\0') {
+      ++length;
+    }
+
+    if (forge::core::platform::AppendUtf16AsUtf8(wargv[i], length, arg).HasError() ||
+        utf8Args.PushBack(std::move(arg)).HasError()) {
+      fprintf(stderr, "Forge: could not read command-line argument %d\n", i);
+      return 1;
+    }
+  }
+
+  // The capacity was reserved above, so these pointers stay valid.
+  for (int i = 0; i < argc; ++i) {
+    argv.PushBack(utf8Args[static_cast<forge::core::Size>(i)].Data()).Ignore();
+  }
+
+  argv.PushBack(nullptr).Ignore();
+  return ForgeMain(argc, argv.Data());
+}
+#else
+int main(int argc, char* argv[]) { return ForgeMain(argc, argv); }
+#endif

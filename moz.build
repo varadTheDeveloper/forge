@@ -4,14 +4,19 @@ SOURCES += [
     "forge-core/memory/DefaultAllocator.cpp",
     "forge-core/memory/detail/AllocationBackend.cpp",
     "forge-core/Mutex.cpp",
+    "forge-core/platform/Environment.cpp",
     "forge-core/platform/IocpLoop.cpp",
     "forge-core/platform/Process.cpp",
+    "forge-core/platform/Stdio.cpp",
     "forge-core/platform/TimerScheduler.cpp",
+    "forge-core/platform/Unicode.cpp",
     "forge-core/platform/Win32Error.cpp",
     "forge-core/Socket.cpp",
     "forge-core/Thread.cpp",
     "forge-core/ThreadPool.cpp",
     "forge.cpp",
+    "runtime/Console.cpp",
+    "runtime/Inspect.cpp",
 ]
 
 # Socket.cpp (Phase 5) links against Winsock's WSAStartup/socket/connect/
@@ -30,8 +35,12 @@ USE_LIBS += [
 
 DEFINES["EXPORT_JS_API"] = True
 
+# "." is this folder (js/src/forge), so "runtime/..." and "forge-core/..."
+# resolve from every source file, not only from forge.cpp (Phase 8).
+# mozbuild requires this list sorted: "!..", ".", "..".
 LOCAL_INCLUDES += [
     "!..",
+    ".",
     "..",
 ]
 
