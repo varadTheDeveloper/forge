@@ -2,7 +2,8 @@
 #
 # Jobs:
 #   * forge-core unit tests on Linux under ASan + UBSan (g++), built as both
-#     C++17 and C++20;
+#     C++17 and C++20, plus Kavach's portable path-rule tests (Phase 8.2);
+#   * a one-minute libFuzzer run of the Kavach path rules (Phase 8.2, R24);
 #   * forge-core unit and smoke tests on Windows with MSVC, including the
 #     Windows-only File, Socket, thread, timer and IOCP tests;
 #   * forge.exe itself (Phase 7.95): fetch the SpiderMonkey commit pinned in
@@ -45,6 +46,19 @@ jobs:
           persist-credentials: false
       - name: forge-core tests (ASan + UBSan, C++17 and C++20)
         run: bash tools/ci/forge-core-tests.sh
+
+  # Phase 8.2 (R24): fuzz the Kavach path rules for a minute on every push.
+  fuzz-kavach:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install clang's fuzzer and sanitizer runtimes
+        run: sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev
+      - name: Fuzz kavach/PathRules (60 s)
+        run: CXX=clang++-18 bash tools/ci/fuzz.sh 60
 
   forge-core-windows-msvc:
     runs-on: windows-2022
