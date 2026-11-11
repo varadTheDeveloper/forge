@@ -96,6 +96,16 @@ Write-Host ""
 $Results = New-Object System.Collections.Generic.List[object]
 
 # The fs benchmarks write a scratch folder into the current directory.
+# Forge denies file access by default (Kavach, Phase 8.2), so it gets
+# read and write permission for exactly those two folders.
+$RuntimeArgs = @{
+    "forge" = @(
+        "--allow-read=fs-bench-scratch", "--allow-write=fs-bench-scratch",
+        "--allow-read=fs-async-bench-scratch", "--allow-write=fs-async-bench-scratch")
+    "bun"   = @()
+    "node"  = @()
+}
+
 Push-Location $ScriptDir
 try {
     foreach ($bench in $Benchmarks) {
@@ -106,7 +116,8 @@ try {
             $exe = $Runtimes[$runtimeName]
             if (-not $exe) { continue }
 
-            $output = & $exe $scriptPath 2>&1
+            $extraArgs = $RuntimeArgs[$runtimeName]
+            $output = & $exe @extraArgs $scriptPath 2>&1
             if ($LASTEXITCODE -ne 0 -or ($output -join "`n") -match "FAILED") {
                 Write-Host ("{0,-24} {1,-6} FAILED (exit {2}): {3}" -f $bench, $runtimeName, $LASTEXITCODE, ($output -join ' '))
                 continue
@@ -116,7 +127,7 @@ try {
             $works = New-Object System.Collections.Generic.List[double]
             for ($i = 0; $i -lt $Iterations; $i++) {
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                $out = & $exe $scriptPath 2>&1
+                $out = & $exe @extraArgs $scriptPath 2>&1
                 $sw.Stop()
                 $totals.Add($sw.Elapsed.TotalMilliseconds)
                 $m = [regex]::Match(($out -join "`n"), "work-ms=(\d+)")
