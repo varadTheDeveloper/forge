@@ -15,6 +15,9 @@ SOURCES += [
     "forge-core/Thread.cpp",
     "forge-core/ThreadPool.cpp",
     "forge.cpp",
+    "kavach/Kavach.cpp",
+    "kavach/Ops.cpp",
+    "kavach/PathRules.cpp",
     "runtime/Console.cpp",
     "runtime/Inspect.cpp",
 ]

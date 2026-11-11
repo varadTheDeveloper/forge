@@ -62,6 +62,9 @@
 // kept narrower than -- included here just for this one function.
 #include "jsapi.h"
 
+// Phase 8.2: js::GetPropertyKeys, for the op-table self-test (R2).
+#include "jsfriendapi.h"
+
 #include <atomic>
 
 #include "forge-core/platform/Environment.h"
@@ -87,6 +90,10 @@
 // Phase 8: console and value formatting.
 #include "runtime/Console.h"
 #include "runtime/Inspect.h"
+
+// Phase 8.2: Kavach, the permission checker.
+#include "kavach/Kavach.h"
+#include "kavach/Ops.h"
 
 // cx points to SpiderMonkey's context object.
 static const JSClass globalClass = {
@@ -1656,21 +1663,9 @@ static forge::core::Result<forge::core::String> ToForgeString(JSContext* cx,
   return forge::core::String::Create(forge::core::StringView(utf8.get()));
 }
 
-// Converts a JS value to a forge::core::Path by first converting it to a
-// String (above) and then through Path::Create -- Path never touches the
-// OS itself (see Path.md), so this is pure value conversion, no new
-// failure modes beyond what ToForgeString/Path::Create already have.
-static forge::core::Result<forge::core::Path> ToForgePath(
-    JSContext* cx, JS::HandleValue value) {
-  forge::core::Result<forge::core::String> str = ToForgeString(cx, value);
-
-  if (str.HasError()) {
-    return forge::core::Result<forge::core::Path>(
-        forge::core::Failure{str.Error()});
-  }
-
-  return forge::core::Path::Create(str.Value().View());
-}
+// (Phase 8.2: ToForgePath, which turned any value into a path with
+// ToString, is gone. Filesystem natives get paths only through
+// CheckPathArg, which accepts strings and asks Kavach; see rule R3.)
 
 // Converts a forge::core::StringView to a new JS string (copies; does not
 // take ownership of `text`'s storage, matching every JS_New*StringCopy*
@@ -1909,29 +1904,6 @@ static bool SelfTest_ToForgeStringSymbolFails(JSContext* cx) {
   }
 
   return ok;
-}
-
-static bool SelfTest_ToForgePathFromLiteral(JSContext* cx) {
-  JS::RootedValue val(cx);
-
-  if (!EvaluateExpression(cx, "'a/b/c.txt'", &val)) {
-    fprintf(stderr, "  FAIL ToForgePath(literal): evaluate failed\n");
-    JS_ClearPendingException(cx);
-    return false;
-  }
-
-  forge::core::Result<forge::core::Path> result = ToForgePath(cx, val);
-
-  if (result.HasError()) {
-    fprintf(stderr, "  FAIL ToForgePath(literal): unexpected error\n");
-    return false;
-  }
-  if (result.Value().View() != forge::core::StringView("a/b/c.txt")) {
-    fprintf(stderr, "  FAIL ToForgePath(literal): content mismatch\n");
-    return false;
-  }
-
-  return true;
 }
 
 static bool SelfTest_FromForgeStringRoundTrip(JSContext* cx) {
@@ -2219,7 +2191,6 @@ static bool RunMarshallingSmokeTests(JSContext* cx) {
       {"ToForgeString(literal)", SelfTest_ToForgeStringFromLiteral},
       {"ToForgeString(number)", SelfTest_ToForgeStringFromNumber},
       {"ToForgeString(symbol) fails cleanly", SelfTest_ToForgeStringSymbolFails},
-      {"ToForgePath(literal)", SelfTest_ToForgePathFromLiteral},
       {"FromForgeString round-trip", SelfTest_FromForgeStringRoundTrip},
       {"Uint8ArrayFromBytes", SelfTest_Uint8ArrayFromBytes},
       {"AsByteSpan(Uint8Array)", SelfTest_AsByteSpanUint8Array},
@@ -2290,6 +2261,31 @@ static bool SelfTest_SetTimeoutRejectsNonCallable(JSContext* cx) {
       "  catch (e) { return e instanceof TypeError ? 'ok' : 'wrong error: ' + e; } })()");
 }
 
+static bool SelfTest_ClearInterval(JSContext* cx) {
+  return ExpectScriptReturnsOk(cx, "clearInterval",
+      "(() => { const id = setInterval(() => {}, 1000); clearInterval(id); clearInterval();"
+      " return typeof clearInterval === 'function' ? 'ok' : 'missing'; })()");
+}
+
+// Phase 8.2: HardenProcess() turned these on before main() did anything.
+static bool SelfTest_ProcessMitigations(JSContext* cx) {
+  (void)cx;
+  const forge::core::platform::MitigationStatus status =
+      forge::core::platform::QueryMitigations();
+
+  if (!status.noRemoteImages || !status.noLowLabelImages || !status.preferSystem32Images ||
+      !status.extensionPointsDisabled) {
+    fprintf(stderr,
+            "  FAIL process mitigations: noRemoteImages=%d noLowLabelImages=%d "
+            "preferSystem32Images=%d extensionPointsDisabled=%d\n",
+            status.noRemoteImages, status.noLowLabelImages, status.preferSystem32Images,
+            status.extensionPointsDisabled);
+    return false;
+  }
+
+  return true;
+}
+
 static bool SelfTest_ClearTimeoutWithoutArgument(JSContext* cx) {
   return ExpectScriptReturnsOk(cx, "clearTimeout() without argument",
       "(() => { clearTimeout(); clearTimeout(undefined); return 'ok'; })()");
@@ -2343,6 +2339,8 @@ static bool RunRuntimeSafetySmokeTests(JSContext* cx) {
       {"setTimeout(fn) without delay", SelfTest_SetTimeoutWithoutDelay},
       {"setTimeout(non-function) TypeError", SelfTest_SetTimeoutRejectsNonCallable},
       {"clearTimeout() without argument", SelfTest_ClearTimeoutWithoutArgument},
+      {"clearInterval", SelfTest_ClearInterval},
+      {"process mitigation policies (R22)", SelfTest_ProcessMitigations},
       {"queueMicrotask(1) TypeError", SelfTest_QueueMicrotaskRejectsNonCallable},
       {"SharedArrayBuffer disabled", SelfTest_SharedArrayBufferDisabled},
       {"code generation policy hook", SelfTest_CodeGenerationPolicy},
@@ -2447,6 +2445,113 @@ static bool WriteAllBytes(JSContext* cx, forge::core::File& file,
   return true;
 }
 
+//==============================================================================
+// Kavach glue (Phase 8.2)
+//
+// Every filesystem native gets its path through CheckPathArg, and every
+// environment native goes through CheckEnvArg. Both throw the plain-language
+// refusal from kavach::FormatDenial (permission UX spec, G38) as an Error
+// with these extra properties:
+//   code        "PermissionDenied", or "InvalidArgument" for an unusable path
+//   permission  "read", "write", "env" or "env (every variable)"
+//   op          the function, e.g. "fs.readFileSync"
+//   path / variable  what was refused
+// The properties are defined, not assigned, so no setter on
+// Error.prototype can run.
+//==============================================================================
+
+static void DefineStringOnPendingError(JSContext* cx, const char* name,
+                                       forge::core::StringView value) {
+  JS::RootedValue exception(cx);
+
+  if (!JS_GetPendingException(cx, &exception) || !exception.isObject()) {
+    return;
+  }
+
+  JS::RootedObject error(cx, &exception.toObject());
+  JS::RootedString str(cx, JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(value.Data(), value.Size())));
+
+  if (!str) {
+    // Keep the original error, not an out-of-memory one, pending.
+    JS_SetPendingException(cx, exception);
+    return;
+  }
+
+  JS::RootedValue strValue(cx, JS::StringValue(str));
+
+  if (!JS_DefineProperty(cx, error, name, strValue, JSPROP_ENUMERATE)) {
+    JS_SetPendingException(cx, exception);
+  }
+}
+
+static bool ThrowKavachDenial(JSContext* cx, forge::kavach::Op op,
+                              const forge::kavach::Denial& denial) {
+  forge::core::String message;
+  forge::kavach::FormatDenial(op, denial, message);
+
+  if (message.Empty()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  JS_ReportErrorUTF8(cx, "%s", message.CStr());
+
+  if (!JS_IsExceptionPending(cx)) {
+    return false;
+  }
+
+  const forge::kavach::OpInfo& info = forge::kavach::GetOpInfo(op);
+  const bool invalidPath = denial.kind == forge::kavach::Denial::Kind::InvalidPath;
+  const bool isEnv = info.permission == forge::kavach::Permission::Env ||
+                     info.permission == forge::kavach::Permission::EnvAll;
+
+  DefineStringOnPendingError(cx, "code", invalidPath ? "InvalidArgument" : "PermissionDenied");
+  DefineStringOnPendingError(cx, "permission", forge::kavach::PermissionName(info.permission));
+  DefineStringOnPendingError(cx, "op", info.name);
+  DefineStringOnPendingError(cx, isEnv ? "variable" : "path", denial.target.View());
+  return false;
+}
+
+// Throws a TypeError for a wrong argument type, with code "InvalidArgument"
+// like Forge's other argument errors.
+static bool ThrowArgumentTypeError(JSContext* cx, forge::kavach::Op op, const char* what) {
+  char message[160];
+  snprintf(message, sizeof(message), "%s: %s", forge::kavach::GetOpInfo(op).name, what);
+  ThrowTypeError(cx, message);
+  DefineStringOnPendingError(cx, "code", "InvalidArgument");
+  return false;
+}
+
+// The only way a filesystem native gets a path (rule R3). Only a string is
+// accepted: no ToString, so an object cannot choose its own path through
+// toString(), and no Uint8Array or URL forms until they are designed.
+static forge::core::Result<forge::kavach::CheckedPath> CheckPathArg(JSContext* cx,
+                                                                    forge::kavach::Op op,
+                                                                    JS::HandleValue value) {
+  using Checked = forge::kavach::CheckedPath;
+  const forge::core::Failure failure{forge::core::Error(forge::core::ErrorCode::InvalidArgument)};
+
+  if (!value.isString()) {
+    ThrowArgumentTypeError(cx, op, "the path must be a string");
+    return forge::core::Result<Checked>(failure);
+  }
+
+  forge::core::String utf8;
+
+  if (!forge::runtime::AppendStringUtf8(cx, value.toString(), utf8)) {
+    return forge::core::Result<Checked>(failure);
+  }
+
+  forge::kavach::Denial denial;
+  forge::core::Result<Checked> checked = forge::kavach::CheckPath(op, utf8.View(), denial);
+
+  if (checked.HasError()) {
+    ThrowKavachDenial(cx, op, denial);
+  }
+
+  return checked;
+}
+
 // fs.readFileSync(path, encoding?) -- Uint8Array via File::ReadAllBytes,
 // or a string via File::ReadAllText when encoding === "utf8". Any other
 // encoding value is a JS-argument-shape error (not a Result<T> failure),
@@ -2458,11 +2563,12 @@ static bool FsReadFileSync(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsReadFileSync, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "readFileSync");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   bool wantUtf8 = false;
@@ -2471,7 +2577,7 @@ static bool FsReadFileSync(JSContext* cx, unsigned argc, JS::Value* vp) {
     forge::core::Result<forge::core::String> encoding = ToForgeString(cx, args[1]);
 
     if (encoding.HasError()) {
-      ThrowJsError(cx, encoding.Error(), "readFileSync", &path.Value());
+      ThrowJsError(cx, encoding.Error(), "readFileSync", &path.Value().Path());
       return false;
     }
 
@@ -2479,17 +2585,17 @@ static bool FsReadFileSync(JSContext* cx, unsigned argc, JS::Value* vp) {
       wantUtf8 = true;
     } else {
       ThrowJsError(cx, forge::core::Error(forge::core::ErrorCode::InvalidArgument),
-                   "readFileSync", &path.Value());
+                   "readFileSync", &path.Value().Path());
       return false;
     }
   }
 
   if (wantUtf8) {
     forge::core::Result<forge::core::String> text =
-        forge::core::File::ReadAllText(path.Value());
+        forge::core::File::ReadAllText(path.Value().Path());
 
     if (text.HasError()) {
-      ThrowJsError(cx, text.Error(), "readFileSync", &path.Value());
+      ThrowJsError(cx, text.Error(), "readFileSync", &path.Value().Path());
       return false;
     }
 
@@ -2504,10 +2610,10 @@ static bool FsReadFileSync(JSContext* cx, unsigned argc, JS::Value* vp) {
   }
 
   forge::core::Result<forge::core::Vector<forge::core::u8>> bytes =
-      forge::core::File::ReadAllBytes(path.Value());
+      forge::core::File::ReadAllBytes(path.Value().Path());
 
   if (bytes.HasError()) {
-    ThrowJsError(cx, bytes.Error(), "readFileSync", &path.Value());
+    ThrowJsError(cx, bytes.Error(), "readFileSync", &path.Value().Path());
     return false;
   }
 
@@ -2676,11 +2782,12 @@ static bool FsReadFile(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsReadFile, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "readFile");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   bool wantUtf8 = false;
@@ -2689,7 +2796,7 @@ static bool FsReadFile(JSContext* cx, unsigned argc, JS::Value* vp) {
     forge::core::Result<forge::core::String> encoding = ToForgeString(cx, args[1]);
 
     if (encoding.HasError()) {
-      ThrowJsError(cx, encoding.Error(), "readFile", &path.Value());
+      ThrowJsError(cx, encoding.Error(), "readFile", &path.Value().Path());
       return false;
     }
 
@@ -2697,7 +2804,7 @@ static bool FsReadFile(JSContext* cx, unsigned argc, JS::Value* vp) {
       wantUtf8 = true;
     } else {
       ThrowJsError(cx, forge::core::Error(forge::core::ErrorCode::InvalidArgument),
-                   "readFile", &path.Value());
+                   "readFile", &path.Value().Path());
       return false;
     }
   }
@@ -2723,7 +2830,7 @@ static bool FsReadFile(JSContext* cx, unsigned argc, JS::Value* vp) {
 
   forge::core::memory::UniquePtr<AsyncFsReadOp> owned = std::move(made.Value());
   owned->promise = promise;
-  owned->path = std::move(path.Value());
+  owned->path = path.Value().ReleasePath();
   owned->wantUtf8 = wantUtf8;
   owned->completion.callback = &FsAsyncReadOpCompleted;
 
@@ -3100,11 +3207,15 @@ static bool FsWriteOrAppend(JSContext* cx, unsigned argc, JS::Value* vp,
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path = CheckPathArg(
+      cx,
+      kind == AsyncFsMiscOpKind::Write ? forge::kavach::Op::FsWriteFile
+                                       : forge::kavach::Op::FsAppendFile,
+      args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), context);
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   forge::core::String ownedText;
@@ -3112,7 +3223,7 @@ static bool FsWriteOrAppend(JSContext* cx, unsigned argc, JS::Value* vp,
       ResolveWriteData(cx, args[1], &ownedText);
 
   if (data.HasError()) {
-    ThrowJsError(cx, data.Error(), context, &path.Value());
+    ThrowJsError(cx, data.Error(), context, &path.Value().Path());
     return false;
   }
 
@@ -3124,7 +3235,7 @@ static bool FsWriteOrAppend(JSContext* cx, unsigned argc, JS::Value* vp,
     return false;
   }
 
-  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()), kind,
+  return DispatchAsyncFsMiscOp(cx, args, path.Value().ReleasePath(), kind,
                                 std::move(owned), context);
 }
 
@@ -3146,14 +3257,15 @@ static bool FsExists(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsExists, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "exists");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
-  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()),
+  return DispatchAsyncFsMiscOp(cx, args, path.Value().ReleasePath(),
                                 AsyncFsMiscOpKind::Exists,
                                 forge::core::Vector<forge::core::u8>(), "exists");
 }
@@ -3168,11 +3280,12 @@ static bool FsMkdir(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsMkdir, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "mkdir");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   bool recursive = false;
@@ -3180,7 +3293,7 @@ static bool FsMkdir(JSContext* cx, unsigned argc, JS::Value* vp) {
   if (args.hasDefined(1)) {
     if (!args[1].isObject()) {
       ThrowJsError(cx, forge::core::Error(forge::core::ErrorCode::InvalidArgument),
-                   "mkdir", &path.Value());
+                   "mkdir", &path.Value().Path());
       return false;
     }
 
@@ -3197,7 +3310,7 @@ static bool FsMkdir(JSContext* cx, unsigned argc, JS::Value* vp) {
   }
 
   return DispatchAsyncFsMiscOp(
-      cx, args, std::move(path.Value()),
+      cx, args, path.Value().ReleasePath(),
       recursive ? AsyncFsMiscOpKind::MkdirRecursive : AsyncFsMiscOpKind::Mkdir,
       forge::core::Vector<forge::core::u8>(), "mkdir");
 }
@@ -3211,14 +3324,15 @@ static bool FsRm(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsRm, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "rm");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
-  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()),
+  return DispatchAsyncFsMiscOp(cx, args, path.Value().ReleasePath(),
                                 AsyncFsMiscOpKind::Rm,
                                 forge::core::Vector<forge::core::u8>(), "rm");
 }
@@ -3232,14 +3346,15 @@ static bool FsStat(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsStat, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "stat");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
-  return DispatchAsyncFsMiscOp(cx, args, std::move(path.Value()),
+  return DispatchAsyncFsMiscOp(cx, args, path.Value().ReleasePath(),
                                 AsyncFsMiscOpKind::Stat,
                                 forge::core::Vector<forge::core::u8>(), "stat");
 }
@@ -3257,11 +3372,15 @@ static bool FsWriteOrAppendImpl(JSContext* cx, unsigned argc, JS::Value* vp,
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path = CheckPathArg(
+      cx,
+      mode == forge::core::FileMode::Write ? forge::kavach::Op::FsWriteFileSync
+                                           : forge::kavach::Op::FsAppendFileSync,
+      args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), context);
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   forge::core::String ownedText;
@@ -3269,19 +3388,19 @@ static bool FsWriteOrAppendImpl(JSContext* cx, unsigned argc, JS::Value* vp,
       ResolveWriteData(cx, args[1], &ownedText);
 
   if (data.HasError()) {
-    ThrowJsError(cx, data.Error(), context, &path.Value());
+    ThrowJsError(cx, data.Error(), context, &path.Value().Path());
     return false;
   }
 
   forge::core::Result<forge::core::File> file =
-      forge::core::File::Open(path.Value(), mode);
+      forge::core::File::Open(path.Value().Path(), mode);
 
   if (file.HasError()) {
-    ThrowJsError(cx, file.Error(), context, &path.Value());
+    ThrowJsError(cx, file.Error(), context, &path.Value().Path());
     return false;
   }
 
-  if (!WriteAllBytes(cx, file.Value(), data.Value(), context, &path.Value())) {
+  if (!WriteAllBytes(cx, file.Value(), data.Value(), context, &path.Value().Path())) {
     return false;
   }
 
@@ -3314,17 +3433,18 @@ static bool FsExistsSync(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsExistsSync, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "existsSync");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
-  forge::core::Result<bool> exists = forge::core::File::Exists(path.Value());
+  forge::core::Result<bool> exists = forge::core::File::Exists(path.Value().Path());
 
   if (exists.HasError()) {
-    ThrowJsError(cx, exists.Error(), "existsSync", &path.Value());
+    ThrowJsError(cx, exists.Error(), "existsSync", &path.Value().Path());
     return false;
   }
 
@@ -3345,11 +3465,12 @@ static bool FsMkdirSync(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsMkdirSync, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "mkdirSync");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   bool recursive = false;
@@ -3357,7 +3478,7 @@ static bool FsMkdirSync(JSContext* cx, unsigned argc, JS::Value* vp) {
   if (args.hasDefined(1)) {
     if (!args[1].isObject()) {
       ThrowJsError(cx, forge::core::Error(forge::core::ErrorCode::InvalidArgument),
-                   "mkdirSync", &path.Value());
+                   "mkdirSync", &path.Value().Path());
       return false;
     }
 
@@ -3374,11 +3495,11 @@ static bool FsMkdirSync(JSContext* cx, unsigned argc, JS::Value* vp) {
   }
 
   forge::core::Result<void> result =
-      recursive ? forge::core::File::CreateDirectories(path.Value())
-                : forge::core::File::MakeDirectory(path.Value());
+      recursive ? forge::core::File::CreateDirectories(path.Value().Path())
+                : forge::core::File::MakeDirectory(path.Value().Path());
 
   if (result.HasError()) {
-    ThrowJsError(cx, result.Error(), "mkdirSync", &path.Value());
+    ThrowJsError(cx, result.Error(), "mkdirSync", &path.Value().Path());
     return false;
   }
 
@@ -3398,17 +3519,18 @@ static bool FsRmSync(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsRmSync, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "rmSync");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
-  forge::core::Result<void> result = forge::core::File::Remove(path.Value());
+  forge::core::Result<void> result = forge::core::File::Remove(path.Value().Path());
 
   if (result.HasError()) {
-    ThrowJsError(cx, result.Error(), "rmSync", &path.Value());
+    ThrowJsError(cx, result.Error(), "rmSync", &path.Value().Path());
     return false;
   }
 
@@ -3428,25 +3550,26 @@ static bool FsStatSync(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  forge::core::Result<forge::core::Path> path = ToForgePath(cx, args[0]);
+  // Phase 8.2: the path must be a string and pass Kavach (rule R3).
+  forge::core::Result<forge::kavach::CheckedPath> path =
+      CheckPathArg(cx, forge::kavach::Op::FsStatSync, args[0]);
 
   if (path.HasError()) {
-    ThrowJsError(cx, path.Error(), "statSync");
-    return false;
+    return false;  // CheckPathArg threw
   }
 
   forge::core::Result<forge::core::File> file =
-      forge::core::File::Open(path.Value(), forge::core::FileMode::Read);
+      forge::core::File::Open(path.Value().Path(), forge::core::FileMode::Read);
 
   if (file.HasError()) {
-    ThrowJsError(cx, file.Error(), "statSync", &path.Value());
+    ThrowJsError(cx, file.Error(), "statSync", &path.Value().Path());
     return false;
   }
 
   forge::core::Result<forge::core::u64> size = file.Value().SizeInBytes();
 
   if (size.HasError()) {
-    ThrowJsError(cx, size.Error(), "statSync", &path.Value());
+    ThrowJsError(cx, size.Error(), "statSync", &path.Value().Path());
     return false;
   }
 
@@ -3528,7 +3651,7 @@ static bool DefineFsNamespace(JSContext* cx, JS::HandleObject global) {
 //
 // There is deliberately no Node-style `process` object. The namespace and
 // its sub-objects are frozen, so no script can replace these functions.
-// Environment access will be checked by Kavach per variable (Phase 8.2).
+// Environment access is checked by Kavach per variable (Phase 8.2).
 //==============================================================================
 
 static const char kForgeVersion[] = "0.1.0";
@@ -3624,11 +3747,23 @@ static bool RequireEnvName(JSContext* cx, const JS::CallArgs& args, const char* 
   return true;
 }
 
+// Phase 8.2: one variable at a time, as granted by --allow-env.
+static bool CheckEnvAccess(JSContext* cx, forge::kavach::Op op, const forge::core::String& name) {
+  forge::kavach::Denial denial;
+
+  if (forge::kavach::CheckEnv(op, name.View(), denial).HasError()) {
+    return ThrowKavachDenial(cx, op, denial);
+  }
+
+  return true;
+}
+
 static bool ForgeEnvGet(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
   forge::core::String name;
 
-  if (!RequireEnvName(cx, args, "Forge.env.get", name)) {
+  if (!RequireEnvName(cx, args, "Forge.env.get", name) ||
+      !CheckEnvAccess(cx, forge::kavach::Op::EnvGet, name)) {
     return false;
   }
 
@@ -3659,7 +3794,8 @@ static bool ForgeEnvHas(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
   forge::core::String name;
 
-  if (!RequireEnvName(cx, args, "Forge.env.has", name)) {
+  if (!RequireEnvName(cx, args, "Forge.env.has", name) ||
+      !CheckEnvAccess(cx, forge::kavach::Op::EnvHas, name)) {
     return false;
   }
 
@@ -3677,6 +3813,13 @@ static bool ForgeEnvHas(JSContext* cx, unsigned argc, JS::Value* vp) {
 
 static bool ForgeEnvToObject(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+  // Phase 8.2: needs --allow-env with no list.
+  forge::kavach::Denial denial;
+
+  if (forge::kavach::CheckEnvAll(forge::kavach::Op::EnvToObject, denial).HasError()) {
+    return ThrowKavachDenial(cx, forge::kavach::Op::EnvToObject, denial);
+  }
 
   forge::core::Result<forge::core::Vector<forge::core::platform::EnvEntry>> entries =
       forge::core::platform::ListEnv();
@@ -3974,6 +4117,9 @@ static bool DefineForgeNamespace(JSContext* cx, JS::HandleObject global) {
 //==============================================================================
 
 static const char* kFsScratchDir = "forge-selftest-fs-scratch";
+
+// Phase 8.2: granted to the self-test, and never set.
+static const char kSelfTestUnsetEnv[] = "FORGE_SELF_TEST_UNSET_8f2c";
 
 // Ensures the scratch directory exists, via forge-core directly (not
 // through fs.mkdirSync -- that's exercised by its own test cases below,
@@ -4917,20 +5063,294 @@ static bool SelfTest_ForgeNamespaceShape(JSContext* cx) {
       " typeof console.timeEnd === 'function' && !('process' in globalThis) ? 'ok' : 'bad'");
 }
 
+// Runs under the self-test policy: PATH and kSelfTestUnsetEnv are granted,
+// nothing else (Phase 8.2).
 static bool SelfTest_ForgeEnv(JSContext* cx) {
   return ExpectScriptReturnsOk(
       cx, "Forge.env",
       "(() => {"
       "  if (!Forge.env.has('PATH') || typeof Forge.env.get('PATH') !== 'string') return 'PATH';"
+      "  if (typeof Forge.env.get('path') !== 'string') return 'case-insensitive name';"
       "  if (Forge.env.get('FORGE_SELF_TEST_UNSET_8f2c') !== undefined) return 'unset';"
-      "  const all = Forge.env.toObject();"
-      "  if (typeof (all.PATH ?? all.Path) !== 'string') return 'toObject';"
       "  for (const bad of ['', 'A=B', 'A\\0B', 5]) {"
       "    try { Forge.env.get(bad); return 'no throw: ' + String(bad); }"
       "    catch (e) { if (!(e instanceof TypeError)) return String(e); }"
       "  }"
       "  return 'ok';"
       "})()");
+}
+
+static bool SelfTest_KavachEnvDenied(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Kavach: env not granted",
+      "(() => {"
+      "  try { Forge.env.get('USERNAME'); return 'get not denied'; }"
+      "  catch (e) {"
+      "    if (e.code !== 'PermissionDenied' || e.permission !== 'env' ||"
+      "        e.variable !== 'USERNAME' || e.op !== 'Forge.env.get') return 'get: ' + e;"
+      "    if (!e.message.includes('--allow-env=USERNAME')) return 'get message: ' + e.message;"
+      "  }"
+      "  try { Forge.env.has('TEMP'); return 'has not denied'; }"
+      "  catch (e) { if (e.code !== 'PermissionDenied') return 'has: ' + e; }"
+      "  try { Forge.env.toObject(); return 'toObject not denied'; }"
+      "  catch (e) {"
+      "    if (e.code !== 'PermissionDenied' || !e.message.includes('--allow-env'))"
+      "      return 'toObject: ' + e;"
+      "  }"
+      "  return 'ok';"
+      "})()");
+}
+
+// Phase 8.2: the filesystem natives under the self-test policy, which
+// grants read and write only inside the scratch folder.
+static bool SelfTest_KavachFsDenied(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Kavach: fs outside the grant",
+      "(() => {"
+      "  const denied = (fn, permission) => {"
+      "    try { fn(); return 'not denied: ' + fn; }"
+      "    catch (e) {"
+      "      if (e.code !== 'PermissionDenied') return 'wrong code ' + e.code + ': ' + e.message;"
+      "      if (permission && e.permission !== permission) return 'permission ' + e.permission;"
+      "      if (typeof e.path !== 'string' || typeof e.op !== 'string') return 'fields';"
+      "      return null;"
+      "    }"
+      "  };"
+      "  const checks = ["
+      "    denied(() => fs.readFileSync('forge-selftest-outside.txt'), 'read'),"
+      "    denied(() => fs.writeFileSync('forge-selftest-outside.txt', 'x'), 'write'),"
+      "    denied(() => fs.existsSync('forge-selftest-fs-scratch/../outside.txt'), 'read'),"
+      "    denied(() => fs.statSync('forge-selftest-fs-scratch/../../x'), 'read'),"
+      "    denied(() => fs.mkdirSync('forge-selftest-fs-scratchy'), 'write'),"
+      "    denied(() => fs.rmSync('C:\\\\Windows\\\\win.ini'), 'write'),"
+      "    denied(() => fs.readFile('forge-selftest-outside.txt'), 'read'),"
+      "  ];"
+      "  const bad = checks.find((c) => c !== null);"
+      "  if (bad) return bad;"
+      "  try { fs.readFileSync('forge-selftest-outside.txt'); }"
+      "  catch (e) {"
+      "    if (!e.message.includes('--allow-read=')) return 'message: ' + e.message;"
+      "  }"
+      "  return 'ok';"
+      "})()");
+}
+
+static bool SelfTest_KavachProtectedPaths(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Kavach: protected paths (R13)",
+      "(() => {"
+      "  for (const p of ['forge-selftest-fs-scratch/.git/config',"
+      "                   'forge-selftest-fs-scratch/.GIT',"
+      "                   'forge-selftest-fs-scratch/sub/forge.json',"
+      "                   'forge-selftest-fs-scratch/forge.lock']) {"
+      "    try { fs.writeFileSync(p, 'x'); return 'not denied: ' + p; }"
+      "    catch (e) {"
+      "      if (e.code !== 'PermissionDenied' || !e.message.includes('protected'))"
+      "        return p + ': ' + e.message;"
+      "    }"
+      "  }"
+      "  return 'ok';"
+      "})()");
+}
+
+static bool SelfTest_KavachInvalidPaths(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Kavach: ambiguous paths refused",
+      "(() => {"
+      "  for (const p of ['forge-selftest-fs-scratch/a:stream',"
+      "                   'forge-selftest-fs-scratch/file.txt::$DATA',"
+      "                   'forge-selftest-fs-scratch/con',"
+      "                   'forge-selftest-fs-scratch/NUL.txt',"
+      "                   'forge-selftest-fs-scratch/trailing.',"
+      "                   'forge-selftest-fs-scratch/trailing ',"
+      "                   'forge-selftest-fs-scratch/MISSIN~1',"
+      "                   'C:relative',"
+      "                   '\\\\\\\\?\\\\C:\\\\Windows',"
+      "                   '\\\\\\\\.\\\\PhysicalDrive0',"
+      "                   'forge-selftest-fs-scratch/a*b', '']) {"
+      "    try { fs.readFileSync(p); return 'accepted: ' + JSON.stringify(p); }"
+      "    catch (e) {"
+      "      if (e.code !== 'InvalidArgument') return JSON.stringify(p) + ': ' + e.message;"
+      "    }"
+      "  }"
+      "  return 'ok';"
+      "})()");
+}
+
+// R3: only strings are paths. An object's toString must never run.
+static bool SelfTest_KavachPathTypes(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "Kavach: only strings are paths",
+      "(() => {"
+      "  let called = false;"
+      "  const sneaky = { toString() { called = true; return 'forge-selftest-fs-scratch/x'; } };"
+      "  for (const p of [sneaky, new Uint8Array([65]), 42, undefined, null, Symbol('p')]) {"
+      "    try { fs.existsSync(p); return 'accepted ' + typeof p; }"
+      "    catch (e) {"
+      "      if (!(e instanceof TypeError) || e.code !== 'InvalidArgument') return String(e);"
+      "    }"
+      "  }"
+      "  return called ? 'toString ran' : 'ok';"
+      "})()");
+}
+
+// Names of the global object's properties right after the standard
+// classes were set up, before Forge added its own (Phase 8.2, R2 check).
+static forge::core::Vector<forge::core::String>* g_standardGlobalNames = nullptr;
+
+// Recursively visits what Forge put on the global. Every function or
+// accessor found must have a row in kavach/Ops.h.
+static bool WalkHostObject(JSContext* cx, JS::HandleObject obj, const forge::core::String& prefix,
+                           bool* seen, int depth) {
+  bool ok = true;
+  JS::RootedIdVector ids(cx);
+
+  if (!js::GetPropertyKeys(cx, obj, JSITER_OWNONLY | JSITER_HIDDEN | JSITER_SYMBOLS, &ids)) {
+    JS_ClearPendingException(cx);
+    return false;
+  }
+
+  JS::RootedId id(cx);
+
+  for (size_t i = 0; i < ids.length(); ++i) {
+    id = ids[i];
+
+    if (!id.isString()) {
+      continue;
+    }
+
+    forge::core::String name;
+
+    if (!forge::runtime::AppendStringUtf8(cx, id.toString(), name)) {
+      JS_ClearPendingException(cx);
+      return false;
+    }
+
+    forge::core::String path;
+    path.Append(prefix.View()).Ignore();
+
+    if (!prefix.Empty()) {
+      path.Append('.').Ignore();
+    }
+
+    path.Append(name.View()).Ignore();
+
+    JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(cx);
+
+    if (!JS_GetOwnPropertyDescriptorById(cx, obj, id, &desc) || desc.isNothing()) {
+      JS_ClearPendingException(cx);
+      continue;
+    }
+
+    bool isFunction = desc->isAccessorDescriptor();
+    JS::RootedObject child(cx);
+
+    if (!isFunction && desc->value().isObject()) {
+      child = &desc->value().toObject();
+      isFunction = JS::IsCallable(child);
+    }
+
+    if (isFunction) {
+      const forge::kavach::Op op = forge::kavach::FindOp(path.Data(), path.Size());
+
+      if (op == forge::kavach::Op::Count) {
+        fprintf(stderr, "  FAIL op table: %s is reachable from JavaScript but has no row in "
+                        "kavach/Ops.h\n", path.CStr());
+        ok = false;
+      } else {
+        seen[static_cast<size_t>(op)] = true;
+      }
+
+      continue;
+    }
+
+    bool isArray = false;
+
+    if (child && depth < 4 && JS::IsArrayObject(cx, child, &isArray) && !isArray) {
+      ok = WalkHostObject(cx, child, path, seen, depth + 1) && ok;
+    }
+
+    JS_ClearPendingException(cx);
+  }
+
+  return ok;
+}
+
+static bool SelfTest_OpTableCoversNatives(JSContext* cx) {
+  JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
+
+  if (!global || !g_standardGlobalNames) {
+    fprintf(stderr, "  FAIL op table: no global snapshot\n");
+    return false;
+  }
+
+  bool seen[forge::kavach::kOpCount] = {};
+  bool ok = true;
+  JS::RootedIdVector ids(cx);
+
+  if (!js::GetPropertyKeys(cx, global, JSITER_OWNONLY | JSITER_HIDDEN, &ids)) {
+    JS_ClearPendingException(cx);
+    return false;
+  }
+
+  JS::RootedId id(cx);
+
+  for (size_t i = 0; i < ids.length(); ++i) {
+    id = ids[i];
+
+    if (!id.isString()) {
+      continue;
+    }
+
+    forge::core::String name;
+
+    if (!forge::runtime::AppendStringUtf8(cx, id.toString(), name)) {
+      JS_ClearPendingException(cx);
+      return false;
+    }
+
+    bool standard = JS_IdToProtoKey(cx, id) != JSProto_Null;
+
+    for (forge::core::Size j = 0; j < g_standardGlobalNames->Size() && !standard; ++j) {
+      standard = (*g_standardGlobalNames)[j].View() == name.View();
+    }
+
+    if (standard) {
+      continue;
+    }
+
+    // Something Forge added: walk it as a root.
+    JS::RootedObject holder(cx, JS_NewPlainObject(cx));
+    JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(cx);
+
+    JS::RootedValue rootValue(cx);
+
+    if (holder && JS_GetOwnPropertyDescriptorById(cx, global, id, &desc) && desc.isSome() &&
+        desc->isDataDescriptor()) {
+      rootValue = desc->value();
+    }
+
+    if (!holder || desc.isNothing() ||
+        !JS_DefinePropertyById(cx, holder, id, rootValue, JSPROP_ENUMERATE)) {
+      JS_ClearPendingException(cx);
+      fprintf(stderr, "  FAIL op table: could not inspect global %s\n", name.CStr());
+      ok = false;
+      continue;
+    }
+
+    forge::core::String noPrefix;
+    ok = WalkHostObject(cx, holder, noPrefix, seen, 0) && ok;
+  }
+
+  for (size_t i = 0; i < forge::kavach::kOpCount; ++i) {
+    if (!seen[i]) {
+      fprintf(stderr, "  FAIL op table: row %s has no function reachable from JavaScript\n",
+              forge::kavach::GetOpInfo(static_cast<forge::kavach::Op>(i)).name);
+      ok = false;
+    }
+  }
+
+  return ok;
 }
 
 static bool SelfTest_ForgeExitCode(JSContext* cx) {
@@ -4991,6 +5411,11 @@ static bool RunConsoleAndForgeSmokeTests(JSContext* cx) {
       {"inspect: value formatting", SelfTest_InspectFormats},
       {"Forge namespace shape", SelfTest_ForgeNamespaceShape},
       {"Forge.env", SelfTest_ForgeEnv},
+      {"Kavach: env not granted", SelfTest_KavachEnvDenied},
+      {"Kavach: fs outside the grant", SelfTest_KavachFsDenied},
+      {"Kavach: protected paths (R13)", SelfTest_KavachProtectedPaths},
+      {"Kavach: ambiguous paths refused", SelfTest_KavachInvalidPaths},
+      {"Kavach: only strings are paths", SelfTest_KavachPathTypes},
       {"Forge.exitCode / Forge.exit checks", SelfTest_ForgeExitCode},
       {"Forge.stdout / Forge.stderr", SelfTest_ForgeStdStreams},
       {"Forge signal listeners", SelfTest_ForgeSignalListeners},
@@ -5018,7 +5443,16 @@ static void PrintUsage() {
   printf("  --disallow-code-generation-from-strings   Make eval() and new Function() throw\n");
   printf("  --disallow-wasm                           Make WebAssembly compilation throw\n");
   printf("  --async-stacks                            Capture async stack traces (slower)\n");
-  printf("  --max-heap-mb=N                           Cap the JS heap at N MB (default: no cap)\n");
+  printf("  --max-heap-mb=N                           Cap the JS heap at N MB (default: no cap)\n\n");
+  printf("Permissions (Kavach). Nothing outside the process is allowed unless granted:\n");
+  printf("  --allow-read=<path>     Read files and folders under <path> (repeat for more)\n");
+  printf("  --allow-write=<path>    Create, change and delete under <path> (repeat for more)\n");
+  printf("  --allow-env=<A,B,...>   Read these environment variables\n");
+  printf("  --allow-env             Read every environment variable\n");
+  printf("  --audit-log=<file>      Append every permission decision to <file> (JSON lines)\n");
+  printf("A drive root, a network share root or your whole home folder cannot be granted.\n");
+  printf(".git folders, forge.json, forge.lock, the audit log and Forge's install folder\n");
+  printf("are protected: no grant covers them.\n");
 }
 
 // Phase 8: stops the signal thread from touching the context or the event
@@ -5040,6 +5474,9 @@ static int ForgeMain(int argc, char* argv[]) {
   forge::core::platform::HardenProcess();
 
   // Runtime options come before the command or script name (Phase 7.9).
+  // Phase 8.2: permission options build the Kavach policy.
+  forge::kavach::PolicyOptions policy;
+  bool hasPermissionOptions = false;
   bool asyncStacks = false;
   uint32_t maxHeapBytes = 0xffffffff;  // JSGC_MAX_BYTES default: no cap
   int argIndex = 1;
@@ -5063,6 +5500,54 @@ static int ForgeMain(int argc, char* argv[]) {
       }
 
       maxHeapBytes = static_cast<uint32_t>(mb) * 1024u * 1024u;
+    } else if (strncmp(arg, "--allow-read=", 13) == 0 || strncmp(arg, "--allow-write=", 14) == 0 ||
+               strncmp(arg, "--audit-log=", 12) == 0) {
+      const bool read = arg[8] == 'r';
+      const bool audit = arg[2] == 'a' && arg[3] == 'u';
+      const char* value = strchr(arg, '=') + 1;
+      hasPermissionOptions = true;
+
+      if (*value == '\0') {
+        fprintf(stderr, "Forge: %.*s needs a path, for example %.*sC:\\work\\data\n",
+                static_cast<int>(value - arg - 1), arg, static_cast<int>(value - arg), arg);
+        return 2;
+      }
+
+      forge::core::Result<forge::core::String> text =
+          forge::core::String::Create(forge::core::StringView(value));
+
+      if (text.HasError()) {
+        return 1;
+      }
+
+      if (audit) {
+        policy.auditLogPath.Swap(text.Value());
+      } else if ((read ? policy.readPaths : policy.writePaths).PushBack(std::move(text.Value())).HasError()) {
+        return 1;
+      }
+    } else if (strcmp(arg, "--allow-env") == 0) {
+      policy.allEnv = true;
+      hasPermissionOptions = true;
+    } else if (strncmp(arg, "--allow-env=", 12) == 0) {
+      hasPermissionOptions = true;
+      const char* name = arg + 12;
+
+      // A comma-separated list of names.
+      while (*name != '\0') {
+        const char* end = strchr(name, ',');
+        const size_t length = end ? static_cast<size_t>(end - name) : strlen(name);
+
+        if (length > 0) {
+          forge::core::Result<forge::core::String> text =
+              forge::core::String::Create(forge::core::StringView(name, length));
+
+          if (text.HasError() || policy.envNames.PushBack(std::move(text.Value())).HasError()) {
+            return 1;
+          }
+        }
+
+        name += length + (end ? 1 : 0);
+      }
     } else {
       break;
     }
@@ -5089,6 +5574,47 @@ static int ForgeMain(int argc, char* argv[]) {
     fprintf(stderr, "Forge: unknown option %s (see forge --help)\n", command.c_str());
     return 2;
   }
+
+  // Phase 8.2: the self-test runs under its own fixed policy: read and
+  // write in its scratch folder, and two environment variables.
+  if (command == "--self-test") {
+    if (hasPermissionOptions) {
+      fprintf(stderr, "Forge: --self-test uses its own permissions; remove the --allow-* and "
+                      "--audit-log options\n");
+      return 2;
+    }
+
+    forge::core::Result<forge::core::String> scratchRead =
+        forge::core::String::Create(forge::core::StringView(kFsScratchDir));
+    forge::core::Result<forge::core::String> scratchWrite =
+        forge::core::String::Create(forge::core::StringView(kFsScratchDir));
+    forge::core::Result<forge::core::String> envPath =
+        forge::core::String::Create(forge::core::StringView("PATH"));
+    forge::core::Result<forge::core::String> envUnset =
+        forge::core::String::Create(forge::core::StringView(kSelfTestUnsetEnv));
+
+    if (scratchRead.HasError() || scratchWrite.HasError() || envPath.HasError() ||
+        envUnset.HasError() || policy.readPaths.PushBack(std::move(scratchRead.Value())).HasError() ||
+        policy.writePaths.PushBack(std::move(scratchWrite.Value())).HasError() ||
+        policy.envNames.PushBack(std::move(envPath.Value())).HasError() ||
+        policy.envNames.PushBack(std::move(envUnset.Value())).HasError()) {
+      return 1;
+    }
+  }
+
+  {
+    forge::core::String message;
+
+    if (!forge::kavach::Initialize(policy, message)) {
+      fprintf(stderr, "Forge: %s\n", message.CStr());
+      return 2;
+    }
+  }
+
+  // Writes the audit log's closing records however ForgeMain returns.
+  struct KavachScope {
+    ~KavachScope() { forge::kavach::Shutdown(); }
+  } kavachScope;
 
   if (!JS_Init()) { // this is where engine start
     return 1;
@@ -5203,8 +5729,38 @@ static int ForgeMain(int argc, char* argv[]) {
 
       if (!JS::InitRealmStandardClasses(cx)) {
         return 1;
+      }
+
+      // Phase 8.2: remember the standard globals, so the op-table self-test
+      // can tell them apart from what Forge adds below.
+      static forge::core::Vector<forge::core::String> standardGlobalNames;
+
+      if (command == "--self-test") {
+        JS::RootedIdVector globalIds(cx);
+
+        if (!js::GetPropertyKeys(cx, global, JSITER_OWNONLY | JSITER_HIDDEN, &globalIds)) {
+          return 1;
+        }
+
+        for (size_t i = 0; i < globalIds.length(); ++i) {
+          forge::core::String name;
+
+          if (globalIds[i].isString() &&
+              (!forge::runtime::AppendStringUtf8(cx, globalIds[i].toString(), name) ||
+               standardGlobalNames.PushBack(std::move(name)).HasError())) {
+            return 1;
+          }
+        }
+
+        g_standardGlobalNames = &standardGlobalNames;
       } // Initialize standard JS class constructors, prototypes, and any top-level functions and constants associated with the standard classes
       JS_DefineFunction(cx, global, "clearTimeout", ClearTimeout, 1, 0);
+      // Phase 8.2: clearInterval (required by the WinterTC minimum common
+      // API). Timeouts and intervals share one id space, so it is the same
+      // native, as in browsers.
+      if (!JS_DefineFunction(cx, global, "clearInterval", ClearTimeout, 1, 0)) {
+        return 1;
+      }
       if (!JS_DefineFunction(cx, global, "setInterval", SetInterval, 2, 0)) {
         return 1;
       }
@@ -5241,6 +5797,10 @@ static int ForgeMain(int argc, char* argv[]) {
       // always run, even if the first one fails, so a single invocation
       // surfaces every failure at once rather than stopping at the first.
       if (command == "--self-test") {
+        // Phase 8.2 (R2): before any other test can add globals.
+        const bool opTableOk = SelfTest_OpTableCoversNatives(cx);
+        printf("[self-test] %-40s %s\n", "op table covers every native (R2)",
+               opTableOk ? "PASS" : "FAIL");
         const bool marshallingOk = RunMarshallingSmokeTests(cx);
         const bool runtimeSafetyOk = RunRuntimeSafetySmokeTests(cx);  // Phase 7.9
         const bool fsOk = RunFsSmokeTests(cx);
@@ -5253,7 +5813,8 @@ static int ForgeMain(int argc, char* argv[]) {
         // idempotent across ordering with this suite's own fixture setup.
         const bool fsAsyncOk = RunFsAsyncSmokeTests(cx, runtime);
         const bool consoleOk = RunConsoleAndForgeSmokeTests(cx);  // Phase 8
-        const bool ok = marshallingOk && runtimeSafetyOk && fsOk && fsAsyncOk && consoleOk;
+        const bool ok =
+            opTableOk && marshallingOk && runtimeSafetyOk && fsOk && fsAsyncOk && consoleOk;
         printf("[self-test] %s\n", ok ? "ALL PASSED" : "FAILURES ABOVE");
         runtime.Shutdown();
         return ok ? 0 : 1;

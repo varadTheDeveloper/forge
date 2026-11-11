@@ -3546,3 +3546,80 @@ CI job, and manual Ctrl+C and Unicode-display checks in `tests/manual/`.
 **Verified** on Varad's machine: the first real build had one error (the
 unsorted `LOCAL_INCLUDES`); after the fix, `build.ps1 -Test` passed all 54
 self-tests and 15 runtime tests. HostTest runs only in CI.
+
+## Phase 8.2: Kavach core, the permission checker (2026-11-11)
+
+Forge now denies file and environment access unless it is granted on the
+command line (`--allow-read=`, `--allow-write=`, `--allow-env[=A,B]`,
+`--audit-log=`). Full user documentation and the permission UX rules (G38)
+are in `Kavach.md`.
+
+**What was built**
+- `kavach/Ops.h` (R2): one table row per JavaScript-reachable native (49
+  rows), with its permission. Natives that check name their row, so a
+  missing row is a compile error, and `--self-test` walks everything Forge
+  adds to the global and fails on a function without a row or a row
+  without a function.
+- `kavach/PathRules.cpp` (R3): the one canonicalizer and the grant matcher.
+  It is pure string code with Windows semantics, so it also runs in the
+  Linux sanitizer job and under libFuzzer. It refuses device and namespace
+  paths, drive-relative paths, trailing dots and spaces, `:` (alternate data
+  streams), reserved device names (with or without an extension, including
+  superscript digits), `< > " | ? *`, `..` above the root, and missing 8.3
+  short names.
+- `kavach/Kavach.cpp`: the checker, policy, resolver and audit log. A path
+  must be covered by a grant as written (nothing is opened and no network
+  share is contacted otherwise), then is resolved with
+  `GetFinalPathNameByHandleW`, and the real location must be covered too,
+  so a junction out of a granted folder is refused. Protected paths (R13):
+  `.git`, `forge.json`, `forge.lock`, the audit log and the install folder.
+  Grants of a drive root, a share root or the home folder stop startup with
+  exit code 2. Environment variables are checked one name at a time.
+- Proof tokens: filesystem natives get paths only from `CheckPathArg`,
+  which returns a `kavach::CheckedPath` that only the checker can make.
+  `ToForgePath` (which called `ToString` on any value) is gone; only strings
+  are paths.
+- Audit log: JSON lines for every allow and deny, written before the
+  operation runs; a rate limit of 1,000 records and then 100 per second per
+  op, with the rest counted in `suppressed` records (R15); a failed write
+  refuses the operation (R7).
+- Refusals are catchable Errors with `code`, `permission`, `op` and
+  `path`/`variable`, and a message that names the exact option that would
+  allow the operation.
+
+**Also in this step**
+- `clearInterval` (missing; required by the WinterTC minimum common API).
+- Windows process mitigation policies (R22): no DLLs from network shares or
+  low-integrity files, System32 preferred, extension points disabled.
+  Self-tested by reading them back.
+- Bug fix: `File::CreateDirectories` used to try to create every ancestor up
+  to the drive root and ignore "already exists". With the absolute paths
+  Kavach now passes, `CreateDirectoryW("C:/")` returns access denied, so
+  `mkdirSync(..., { recursive: true })` failed. It now stops at the first
+  existing ancestor.
+- Benchmarks pass `--allow-read`/`--allow-write` for their two scratch
+  folders. Filesystem results from now on include Kavach's checks.
+
+**Tests**
+- Self-tests: the op-table walk, env denial, fs denial outside the grant,
+  protected paths, 12 ambiguous paths refused, non-string paths refused
+  (an object's `toString` must not run), `clearInterval`, mitigations.
+- Runtime tests: reads inside and outside the grant, a junction escape
+  (created with `mklink /J` in Temp, no admin rights), an uncaught refusal,
+  the audit log contents, startup refusals for `C:\` and the home folder,
+  and env grants.
+- `kavach/PathRulesTest.cpp` in the Linux (ASan, UBSan, C++17 and C++20)
+  and MSVC jobs.
+- `kavach/fuzz/PathRulesFuzz.cpp`: libFuzzer with invariants (idempotence,
+  no `.`/`..`/`/` in output, parent covers child, prefix siblings never
+  covered). 1.86 million runs in the sandbox without a failure; a new CI
+  job runs it for 60 s on every push.
+
+**Known limits** (see `Kavach.md`): paths are checked, then opened by name
+(a race remains until handle-based checks in 8.3); hard links are not yet
+detected; one policy for the whole program until Phase 9; the async fs
+functions throw refusals instead of rejecting.
+
+**Verified** on Varad's machine: the first run found the CreateDirectories
+bug and three escaping mistakes in the new self-test code itself; after the
+fixes, `build.ps1 -Test` passed all 61 self-tests and 22 runtime tests.
