@@ -18,8 +18,11 @@ SOURCES += [
     "kavach/Kavach.cpp",
     "kavach/Ops.cpp",
     "kavach/PathRules.cpp",
+    "kavach/SecureFs.cpp",
     "runtime/Console.cpp",
+    "runtime/Fs.cpp",
     "runtime/Inspect.cpp",
+    "runtime/JsUtil.cpp",
 ]
 
 # Socket.cpp (Phase 5) links against Winsock's WSAStartup/socket/connect/

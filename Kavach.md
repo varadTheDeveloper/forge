@@ -1,7 +1,7 @@
 # Kavach: permissions in Forge
 
 Kavach is Forge's permission system. This file describes what exists today
-(Phase 8.2), how to use it, and the user-experience rules every later
+(Phase 8.3), how to use it, and the user-experience rules every later
 permission feature must follow (gap G38 in the master plan).
 
 Status: **preview**. Until packages are isolated from each other (Phase 9)
@@ -147,18 +147,34 @@ With `--audit-log=<file>`, Forge appends one JSON object per line:
 - The log file is opened for appending only and is protected: no grant
   covers it.
 
-## Known limits (Phase 8.2)
+## On disk: handles, links and hard links (Phase 8.3)
 
-- **Check, then open by name.** A path is checked and then opened by name,
-  so a link swapped in between the two can still redirect the operation.
-  Handle-based checks come with the full filesystem API (Phase 8.3).
-- **Hard links.** A hard link inside a granted folder to a file outside it
-  is not yet detected (Phase 8.3).
+The check above decides on names. Every file operation then works on
+handles (`kavach/SecureFs.cpp`), so a change on disk between the check and
+the operation cannot widen what it reaches:
+
+- The parent folder is opened and must still be exactly the folder that was
+  checked; the file is then opened **relative to that folder's handle**.
+  Replacing a folder with a junction after the check is detected.
+- Reads may follow links, but the opened file's real location must still
+  be covered by a read grant and not be protected.
+- Writing, creating, renaming and deleting never follow a link at the last
+  step. Writing *through* a symbolic link or junction is refused; deleting
+  one deletes the link itself; a recursive delete never descends into one.
+- Writing a file that has **more than one hard link** is refused, because
+  the same file may also be reachable from outside the granted folders.
+  Reading such a file is allowed (package stores commonly use hard links).
+
+Refusals found at this stage say so in plain words (`"... found that the
+path led to ..."`, `"... will not write through ..."`, `"... has more than
+one hard link ..."`) and are audited with the reasons `changed-after-check`,
+`link` and `hard-link`.
+
+## Known limits
+
 - **One policy for the whole program.** Per-package permissions need
   isolated packages (Phase 9).
-- **Asynchronous functions throw.** `fs.readFile` and the other
-  Promise-returning functions throw a refusal synchronously instead of
-  returning a rejected Promise.
+- **Creating links** (`symlink`, `link`) is not offered yet.
 - **Non-ASCII letter case.** Matching ignores the case of ASCII letters
   only. A path whose non-ASCII letters differ in case from the grant, in a
   part that does not exist yet, is refused (never wrongly allowed).

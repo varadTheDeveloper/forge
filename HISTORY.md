@@ -3623,3 +3623,51 @@ functions throw refusals instead of rejecting.
 **Verified** on Varad's machine: the first run found the CreateDirectories
 bug and three escaping mistakes in the new self-test code itself; after the
 fixes, `build.ps1 -Test` passed all 61 self-tests and 22 runtime tests.
+
+## Phase 8.3: handle-based filesystem and the full fs API (2026-11-11)
+
+**Handle-based checks (rule R3, "checked on the opened handle; hard links
+handled").** `kavach/SecureFs.cpp` performs every file operation on handles,
+so nothing changed on disk between Kavach's check and the operation can widen
+what it reaches:
+- The parent folder is opened and its final path must be exactly the folder
+  that was checked; the file is then opened relative to that handle
+  (`NtCreateFile` with a root directory). A folder swapped for a junction
+  after the check is detected and refused (`changed-after-check`).
+- Reads may follow links; the opened handle's final path is re-checked.
+- Writes, creation, rename and delete never follow the last link: writing
+  through a link is refused, deleting a link deletes the link, and recursive
+  delete never descends into one.
+- Writing a file with more than one hard link is refused.
+- Rename uses `NtSetInformationFile(FileRenameInformationEx)` with the
+  destination folder's handle as the root.
+
+**Checker change.** For `rm`, `rename` and `lstat`, which act on a link
+itself, Kavach now resolves only the folders above the last component. It
+used to follow the last link too, so removing a junction inside a granted
+folder was refused because its target was outside.
+
+**New and changed fs API** (`runtime/Fs.h`): `readdir` (with
+`{ withFileTypes }`), `rename`, `copyFile`, `lstat`, `realpath`, each sync
+and Promise-returning; `rm` removes folders with `{ recursive: true }`;
+`stat` returns `type`, `isFile`, `isDirectory`, `isSymbolicLink`, `nlink`
+and four timestamps besides `size`; `"utf-8"` is accepted besides `"utf8"`.
+A refusal from a Promise-returning function is now a rejected Promise.
+
+**Refactoring.** The fs natives (about 1,900 lines) moved from `forge.cpp`
+to `runtime/Fs.cpp`, with one job type for both the sync and async paths.
+Shared binding helpers moved to `runtime/JsUtil.cpp`. The op table has 61
+rows. Kavach's audit writes are serialized with a mutex, so worker threads
+can record late refusals.
+
+**Tests.** A self-test for the new functions; runtime tests for the async
+functions (including a rejected refusal) and for links (a real hard link
+and junction made with `mklink`: writing the hard link is refused, removing
+the junction leaves the outside file intact).
+
+**Verified** on Varad's machine. The first run found a rename bug (the new
+name was placed 4 bytes too far into the rename structure, error 123). The
+second found the checker following the last link for `rm`. The third passed
+all 62 self-tests and 24 runtime tests; the runner's final cleanup then
+stopped on an error message from `cmd /c rmdir` for the junction the test
+had already removed, which is fixed.
