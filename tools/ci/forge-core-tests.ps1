@@ -41,6 +41,7 @@ $tests = @(
   @{ Name = "TimerSchedulerTest"; Src = "platform\TimerSchedulerTest.cpp platform\TimerScheduler.cpp $sync $mem" },
   @{ Name = "IocpCrossThreadSmokeTest"; Src = "..\IocpCrossThreadSmokeTest.cpp platform\IocpLoop.cpp platform\TimerScheduler.cpp $sync ThreadPool.cpp $mem" },
   @{ Name = "SocketSmokeTest";    Src = "SocketSmokeTest.cpp Socket.cpp $sync $mem"; Link = "ws2_32.lib" },
+  @{ Name = "PathRulesTest";      Src = "..\kavach\PathRulesTest.cpp ..\kavach\PathRules.cpp $mem"; Inc = ".." },
   @{ Name = "HostTest";           Src = "platform\HostTest.cpp platform\Unicode.cpp platform\Environment.cpp platform\Stdio.cpp platform\Win32Error.cpp $mem" }
 )
 
@@ -50,7 +51,10 @@ try {
   foreach ($t in $tests) {
     $exe = Join-Path $out "$($t.Name).exe"
     $link = if ($t.Link) { "/link $($t.Link)" } else { "" }
-    $cmd = "`"$vcvars`" >nul && cl /nologo /std:c++17 /EHs- /D_HAS_EXCEPTIONS=0 /W4 /Fo`"$out\\`" /Fe`"$exe`" $($t.Src) $link"
+    # Inc: an extra include folder, relative to forge-core\ (Phase 8.2:
+    # the Kavach tests include "kavach/..." and "forge-core/..." from the root).
+    $inc = if ($t.Inc) { "/I`"$($t.Inc)`"" } else { "" }
+    $cmd = "`"$vcvars`" >nul && cl /nologo /std:c++17 /EHs- /D_HAS_EXCEPTIONS=0 /W4 $inc /Fo`"$out\\`" /Fe`"$exe`" $($t.Src) $link"
     cmd /c $cmd > (Join-Path $out "$($t.Name).build.log") 2>&1
 
     if ($LASTEXITCODE -ne 0) {

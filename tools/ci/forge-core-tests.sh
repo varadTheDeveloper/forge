@@ -37,6 +37,21 @@ for std in c++17 c++20; do
   done
 done
 
+# Phase 8.2: Kavach's portable path rules (kavach/PathRules.cpp). They live
+# outside forge-core, so they build from the repository root.
+for std in c++17 c++20; do
+  exe="$out/PathRulesTest-$std"
+  if (cd .. && g++ -std=$std "${common[@]}" -iquote . kavach/PathRulesTest.cpp kavach/PathRules.cpp \
+        forge-core/memory/DefaultAllocator.cpp forge-core/memory/detail/AllocationBackend.cpp \
+        -o "$exe") && "$exe" > "$exe.log" 2>&1; then
+    echo "[kavach] PathRulesTest ($std) PASS"
+  else
+    echo "[kavach] PathRulesTest ($std) FAIL"
+    cat "$exe.log" 2>/dev/null || true
+    failures=$((failures + 1))
+  fi
+done
+
 if [ "$failures" -ne 0 ]; then
   echo "[forge-core] $failures FAILED"
   exit 1
