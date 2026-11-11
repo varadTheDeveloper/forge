@@ -39,6 +39,9 @@ New-Item -ItemType Directory -Force -Path $kGranted, $kOutside | Out-Null
 Set-Content -NoNewline -Path (Join-Path $kGranted "ok.txt") -Value "ok-content"
 Set-Content -NoNewline -Path (Join-Path $kOutside "secret.txt") -Value "secret-content"
 cmd /c mklink /J "$kLink" "$kOutside" | Out-Null
+# Phase 8.3: a hard link inside the granted folder to the outside file.
+$kHardLink = Join-Path $kGranted "hardlink.txt"
+cmd /c mklink /H "$kHardLink" (Join-Path $kOutside "secret.txt") | Out-Null
 $env:FORGE_KAVACH_TEST = "env-ok"
 
 # File, expected exit code, text that must appear (stdout+stderr), text that
@@ -94,7 +97,24 @@ $cases = @(
   @{ File = "clean-exit.js";             Exit = 2; Has = @("refused", "home folder"); Not = @();
      Pre = @("--allow-write=$env:USERPROFILE") },
   @{ File = "kavach-env.js";             Exit = 0; Has = @("env: env-ok", "env denied: PermissionDenied"); Not = @("SHOULD NOT READ");
-     Pre = @("--allow-env=FORGE_KAVACH_TEST") }
+     Pre = @("--allow-env=FORGE_KAVACH_TEST") },
+  @{ File = "fs-async.js";               Exit = 0; Has = @("names: e,f.txt", "typed: e:directory,f.txt:file", "stat: 3 file",
+                                                           "lstat: directory", "realpath ends: true", "gone: true",
+                                                           "async denied: PermissionDenied"); Not = @("SHOULD NOT READ");
+     Pre = @("--allow-read=$kGranted", "--allow-write=$kGranted");
+     Args = @((Join-Path $kGranted "async"), (Join-Path $kOutside "secret.txt")) },
+  # Last: it removes the junction the earlier cases use.
+  @{ File = "kavach-links.js";           Exit = 0; Has = @("hardlink: PermissionDenied explained", "junction removed: true", "plain: plain-ok");
+     Not = @("SHOULD NOT WRITE");
+     Pre = @("--allow-read=$kGranted", "--allow-write=$kGranted");
+     Args = @($kHardLink, $kLink, (Join-Path $kGranted "plain.txt"));
+     Check = {
+       $p = @()
+       $secret = Join-Path $kOutside "secret.txt"
+       if (-not (Test-Path $secret)) { $p += "the file behind the junction was deleted" }
+       elseif ((Get-Content -Raw $secret) -ne "secret-content") { $p += "the outside file was changed" }
+       $p
+     } }
 )
 
 $failures = 0
@@ -134,8 +154,12 @@ foreach ($c in $cases) {
   }
 }
 
-# Remove the junction first (rmdir removes the link, not its target).
-cmd /c rmdir "$kLink" 2>$null
+# Remove the junction first, if a test has not already removed it.
+# Directory.Delete on a junction removes the link, not its target. (A plain
+# `cmd /c rmdir` here wrote "cannot find the file" to stderr once the
+# kavach-links test had removed it, and with $ErrorActionPreference = "Stop"
+# that ended the script before it reported success.)
+if (Test-Path -LiteralPath $kLink) { [System.IO.Directory]::Delete($kLink) }
 Remove-Item -Recurse -Force $kRoot -ErrorAction SilentlyContinue
 Remove-Item Env:\FORGE_KAVACH_TEST -ErrorAction SilentlyContinue
 
