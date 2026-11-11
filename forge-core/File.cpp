@@ -427,17 +427,32 @@ Result<void> File::CreateDirectories(
         return {};
     }
 
-    // Walk from `path` up to the root via repeated Parent() calls,
-    // collecting each ancestor as an owned Path (NOT a StringView into
-    // `current` — `current` gets reassigned every iteration, which would
-    // leave any StringView into its old buffer dangling). Then create
-    // them shallowest-first.
+    // Walk from `path` up via repeated Parent() calls, collecting each
+    // ancestor as an owned Path (NOT a StringView into `current` —
+    // `current` gets reassigned every iteration, which would leave any
+    // StringView into its old buffer dangling). Then create them
+    // shallowest-first.
+    //
+    // Phase 8.2: the walk stops at the first ancestor that already exists.
+    // It used to go all the way to the root and "create" every ancestor,
+    // tolerating AlreadyExists. That worked for relative paths, but Kavach
+    // now hands File absolute paths, and CreateDirectoryW("C:/") fails with
+    // ERROR_ACCESS_DENIED rather than ERROR_ALREADY_EXISTS, so
+    // mkdirSync(..., { recursive: true }) failed with PermissionDenied.
+    // It also no longer touches folders above the one that exists.
     Vector<Path> ancestors;
 
     Path current = path;
 
     while (!current.Empty())
     {
+        Result<bool> exists = Exists(current);
+
+        if (exists.HasValue() && exists.Value())
+        {
+            break; // already there; everything above it is too
+        }
+
         Result<Path> currentCopy = Path::Create(current.View());
 
         if (currentCopy.HasError())
