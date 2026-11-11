@@ -90,6 +90,9 @@ public:
 
     Op GetOp() const noexcept { return op_; }
 
+    /// What the path was checked for (Phase 8.3).
+    Access GetAccess() const noexcept { return access_; }
+
     /// Moves the path out, for an operation that runs on a worker thread
     /// after the check (the async fs functions). Leaves this proof empty.
     forge::core::Path ReleasePath() noexcept { return std::move(path_); }
@@ -100,6 +103,7 @@ private:
     forge::core::Path path_;
     forge::core::String text_;
     Op op_ = Op::Count;
+    Access access_ = Access::Read;
 };
 
 /// Why an operation was refused; turned into a message by FormatDenial.
@@ -113,10 +117,14 @@ struct Denial
         Protected,     // R13: no grant can cover it
         AuditFailed,   // the decision could not be recorded (R7)
         Internal,      // out of memory or an unexpected OS failure
+        Link,          // 8.3: writing or creating through a symbolic link or junction
+        HardLink,      // 8.3: writing a file that has more than one hard link
+        Changed,       // 8.3: the path led somewhere else when it was opened
     };
 
     Kind kind = Kind::None;
     PathError pathError = PathError::None;
+    Access access = Access::Read;
 
     /// The canonical path (or the variable name); the input as typed when
     /// it could not be canonicalized.
@@ -131,6 +139,34 @@ forge::core::Result<CheckedPath> CheckPath(
     Op op,
     forge::core::StringView path,
     Denial& denial) noexcept;
+
+/// The same, for an op whose permission covers more than one kind of
+/// access (fs.copyFile reads its source and writes its destination).
+[[nodiscard]]
+forge::core::Result<CheckedPath> CheckPath(
+    Op op,
+    Access access,
+    forge::core::StringView path,
+    Denial& denial) noexcept;
+
+/// Phase 8.3, rule R3 ("checked on the opened handle"): called with the
+/// final path of a handle that was opened for `checked`, as Windows reports
+/// it (canonical form). True if it is still covered by a grant for the same
+/// access and not protected. On false, `denial` says why (Kind::Changed or
+/// Kind::Protected) and the refusal is audited. Safe to call from any thread.
+[[nodiscard]]
+bool VerifyOpenedPath(
+    const CheckedPath& checked,
+    forge::core::StringView finalPath,
+    Denial& denial) noexcept;
+
+/// Records a refusal decided after the check (Link, HardLink, Changed).
+/// Safe to call from any thread.
+void RecordLateDenial(
+    const CheckedPath& checked,
+    Denial& denial,
+    Denial::Kind kind,
+    forge::core::StringView target) noexcept;
 
 /// Checks that `op` may read the environment variable `name`.
 [[nodiscard]]

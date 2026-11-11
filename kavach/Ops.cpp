@@ -35,9 +35,23 @@ const char* PermissionName(
     case Permission::Write: return "write";
     case Permission::Env: return "env";
     case Permission::EnvAll: return "env (every variable)";
+    case Permission::ReadWrite: return "read and write";
     }
 
     return "unknown";
+}
+
+bool OpAllows(
+    Permission permission,
+    Access access) noexcept
+{
+    switch (permission)
+    {
+    case Permission::Read: return access == Access::Read;
+    case Permission::Write: return access == Access::Write;
+    case Permission::ReadWrite: return true;
+    default: return false;
+    }
 }
 
 Op FindOp(

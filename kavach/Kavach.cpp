@@ -9,6 +9,8 @@
 #endif
 #include <windows.h>
 
+#include "forge-core/LockGuard.h"
+#include "forge-core/Mutex.h"
 #include "forge-core/platform/Environment.h"
 #include "forge-core/platform/Unicode.h"
 
@@ -67,6 +69,26 @@ struct State
 };
 
 State g_state;
+
+// Phase 8.3: filesystem work runs on worker threads too, and they may need
+// to record a late refusal. Every audit write holds this lock. The policy
+// itself never changes after Initialize(), so reading it needs no lock.
+forge::core::Mutex g_auditMutex;
+
+/// The permission an audit record names: the access for filesystem ops,
+/// otherwise the op's own permission.
+const char* AuditPermissionName(Op op, Access access) noexcept
+{
+    const Permission permission = GetOpInfo(op).permission;
+
+    if (permission == Permission::Read || permission == Permission::Write ||
+        permission == Permission::ReadWrite)
+    {
+        return access == Access::Write ? "write" : "read";
+    }
+
+    return PermissionName(permission);
+}
 
 bool Append(String& out, StringView text) noexcept
 {
@@ -265,6 +287,67 @@ PathError Resolve(const CanonicalPath& lexical, String& out) noexcept
     }
 }
 
+/// Like Resolve, but leaves the last component as written: the folders
+/// above it are resolved, the last component itself is not followed.
+PathError ResolveParent(const CanonicalPath& lexical, String& out) noexcept
+{
+    out.Clear();
+
+    // A last component that looks like a short name cannot be expanded
+    // without following it, so it is refused like a missing short name.
+    if (lexical.lastShortNameComponent == lexical.componentCount)
+    {
+        return PathError::ShortName;
+    }
+
+    CanonicalPath parent;
+
+    if (parent.text.Append(ParentPath(lexical.text.View())).HasError())
+    {
+        return PathError::TooLong;
+    }
+
+    parent.componentCount = lexical.componentCount - 1;
+    parent.lastShortNameComponent = lexical.lastShortNameComponent;
+    parent.isUnc = lexical.isUnc;
+
+    String resolvedParent;
+    const PathError error = Resolve(parent, resolvedParent);
+
+    if (error != PathError::None)
+    {
+        return error;
+    }
+
+    const bool needSeparator =
+        !(resolvedParent.Size() > 0 && resolvedParent.Data()[resolvedParent.Size() - 1] == '\\');
+
+    if (!Append(out, resolvedParent.View()) || (needSeparator && !Append(out, "\\")) ||
+        !Append(out, LastComponent(lexical.text.View())))
+    {
+        return PathError::TooLong;
+    }
+
+    return PathError::None;
+}
+
+/// Ops whose last path component is the link itself, never its target.
+bool ActsOnLinkItself(Op op) noexcept
+{
+    switch (op)
+    {
+    case Op::FsRmSync:
+    case Op::FsRm:
+    case Op::FsRenameSync:
+    case Op::FsRename:
+    case Op::FsLstatSync:
+    case Op::FsLstat:
+        return true;
+    default:
+        return false;
+    }
+}
+
 //------------------------------------------------------------------------------
 // Policy queries
 //------------------------------------------------------------------------------
@@ -288,11 +371,6 @@ bool IsProtected(StringView path) noexcept
 
     const StringView last = LastComponent(path);
     return PathEquals(last, "forge.json") || PathEquals(last, "forge.lock");
-}
-
-const Vector<Grant>& GrantsFor(Permission permission) noexcept
-{
-    return permission == Permission::Write ? g_state.writeGrants : g_state.readGrants;
 }
 
 bool CoveredByTyped(const Vector<Grant>& grants, StringView path) noexcept
@@ -424,6 +502,9 @@ const char* DenialReason(Denial::Kind kind) noexcept
     case Denial::Kind::Protected: return "protected";
     case Denial::Kind::AuditFailed: return "audit-failed";
     case Denial::Kind::Internal: return "internal-error";
+    case Denial::Kind::Link: return "link";
+    case Denial::Kind::HardLink: return "hard-link";
+    case Denial::Kind::Changed: return "changed-after-check";
     }
 
     return "unknown";
@@ -431,12 +512,14 @@ const char* DenialReason(Denial::Kind kind) noexcept
 
 /// Records one decision. Returns false if the record could not be written;
 /// the caller must then refuse the operation (R7).
-bool Audit(Op op, StringView target, Denial::Kind kind) noexcept
+bool Audit(Op op, const char* permission, StringView target, Denial::Kind kind) noexcept
 {
     if (g_state.audit == INVALID_HANDLE_VALUE)
     {
         return true;
     }
+
+    forge::core::LockGuard<forge::core::Mutex> lock(g_auditMutex);
 
     if (g_state.auditBroken)
     {
@@ -485,7 +568,7 @@ bool Audit(Op op, StringView target, Denial::Kind kind) noexcept
     line.Append(",\"op\":").Ignore();
     AppendJsonString(line, GetOpInfo(op).name);
     line.Append(",\"permission\":").Ignore();
-    AppendJsonString(line, PermissionName(GetOpInfo(op).permission));
+    AppendJsonString(line, permission);
     line.Append(",\"target\":").Ignore();
     AppendJsonString(line, target);
     line.Append(",\"decision\":").Ignore();
@@ -515,7 +598,8 @@ Result<T> Refuse(Op op, Denial& denial, Denial::Kind kind, StringView target,
     denial.pathError = pathError;
     denial.target.Clear();
     denial.target.Append(target).Ignore();
-    Audit(op, target, kind);  // a failed write cannot make a refusal worse
+    // A failed write cannot make a refusal worse.
+    Audit(op, AuditPermissionName(op, denial.access), target, kind);
 
     const ErrorCode code =
         kind == Denial::Kind::InvalidPath ? ErrorCode::InvalidArgument : ErrorCode::PermissionDenied;
@@ -801,12 +885,12 @@ bool OpenAuditLog(const String& path, String& message) noexcept
 class Checker
 {
 public:
-    static Result<CheckedPath> Check(Op op, StringView input, Denial& denial) noexcept
+    static Result<CheckedPath> Check(Op op, Access access, StringView input, Denial& denial) noexcept
     {
         denial = Denial();
-        const Permission permission = GetOpInfo(op).permission;
+        denial.access = access;
 
-        if (!g_state.initialized || (permission != Permission::Read && permission != Permission::Write))
+        if (!g_state.initialized || !OpAllows(GetOpInfo(op).permission, access))
         {
             return Refuse<CheckedPath>(op, denial, Denial::Kind::Internal, input);
         }
@@ -821,7 +905,8 @@ public:
 
         // Decide on the path as written first: nothing is opened (and no
         // network share is contacted) for a path no grant could cover.
-        const Vector<Grant>& grants = GrantsFor(permission);
+        const Vector<Grant>& grants =
+            access == Access::Write ? g_state.writeGrants : g_state.readGrants;
 
         if (IsProtected(lexical.text.View()))
         {
@@ -833,9 +918,15 @@ public:
             return Refuse<CheckedPath>(op, denial, Denial::Kind::NotGranted, lexical.text.View());
         }
 
-        // Then on where it really leads.
+        // Then on where it really leads. Ops that act on a link itself
+        // (rm, rename, lstat) resolve only the folders above the last
+        // component (Phase 8.3): removing a junction inside a granted folder
+        // removes the link, so the link's own location is what is checked,
+        // not its target.
         String resolved;
-        const PathError resolveError = Resolve(lexical, resolved);
+        const PathError resolveError = ActsOnLinkItself(op) && lexical.componentCount > 0
+                                           ? ResolveParent(lexical, resolved)
+                                           : Resolve(lexical, resolved);
 
         if (resolveError == PathError::ShortName)
         {
@@ -858,7 +949,7 @@ public:
             return Refuse<CheckedPath>(op, denial, Denial::Kind::NotGranted, resolved.View());
         }
 
-        if (!Audit(op, resolved.View(), Denial::Kind::None))
+        if (!Audit(op, AuditPermissionName(op, access), resolved.View(), Denial::Kind::None))
         {
             denial.kind = Denial::Kind::AuditFailed;
             denial.target.Append(resolved.View()).Ignore();
@@ -876,6 +967,7 @@ public:
         checked.path_ = std::move(path.Value());
         checked.text_.Swap(resolved);
         checked.op_ = op;
+        checked.access_ = access;
         return Result<CheckedPath>(std::move(checked));
     }
 };
@@ -1018,7 +1110,57 @@ Result<CheckedPath> CheckPath(
     StringView path,
     Denial& denial) noexcept
 {
-    return Checker::Check(op, path, denial);
+    const Access access =
+        GetOpInfo(op).permission == Permission::Write ? Access::Write : Access::Read;
+    return Checker::Check(op, access, path, denial);
+}
+
+Result<CheckedPath> CheckPath(
+    Op op,
+    Access access,
+    StringView path,
+    Denial& denial) noexcept
+{
+    return Checker::Check(op, access, path, denial);
+}
+
+bool VerifyOpenedPath(
+    const CheckedPath& checked,
+    StringView finalPath,
+    Denial& denial) noexcept
+{
+    denial = Denial();
+    denial.access = checked.GetAccess();
+
+    if (IsProtected(finalPath))
+    {
+        RecordLateDenial(checked, denial, Denial::Kind::Protected, finalPath);
+        return false;
+    }
+
+    const Vector<Grant>& grants =
+        checked.GetAccess() == Access::Write ? g_state.writeGrants : g_state.readGrants;
+
+    if (!CoveredByResolved(grants, finalPath))
+    {
+        RecordLateDenial(checked, denial, Denial::Kind::Changed, finalPath);
+        return false;
+    }
+
+    return true;
+}
+
+void RecordLateDenial(
+    const CheckedPath& checked,
+    Denial& denial,
+    Denial::Kind kind,
+    StringView target) noexcept
+{
+    denial.kind = kind;
+    denial.access = checked.GetAccess();
+    denial.target.Clear();
+    denial.target.Append(target).Ignore();
+    Audit(checked.GetOp(), AuditPermissionName(checked.GetOp(), checked.GetAccess()), target, kind);
 }
 
 Result<void> CheckEnv(
@@ -1045,7 +1187,7 @@ Result<void> CheckEnv(
         return Refuse<void>(op, denial, Denial::Kind::NotGranted, name);
     }
 
-    if (!Audit(op, name, Denial::Kind::None))
+    if (!Audit(op, PermissionName(Permission::Env), name, Denial::Kind::None))
     {
         denial.kind = Denial::Kind::AuditFailed;
         denial.target.Append(name).Ignore();
@@ -1071,7 +1213,7 @@ Result<void> CheckEnvAll(
         return Refuse<void>(op, denial, Denial::Kind::NotGranted, "*");
     }
 
-    if (!Audit(op, "*", Denial::Kind::None))
+    if (!Audit(op, PermissionName(Permission::EnvAll), "*", Denial::Kind::None))
     {
         denial.kind = Denial::Kind::AuditFailed;
         return Result<void>(Failure{ Error(ErrorCode::PermissionDenied) });
@@ -1112,13 +1254,14 @@ void FormatDenial(
         Append(message, "Permission denied: ");
         Append(message, info.name);
 
-        if (info.permission == Permission::Read || info.permission == Permission::Write)
+        if (info.permission == Permission::Read || info.permission == Permission::Write ||
+            info.permission == Permission::ReadWrite)
         {
-            Append(message, info.permission == Permission::Read ? " needs read access to "
-                                                                : " needs write access to ");
+            const bool read = denial.access == Access::Read;
+            Append(message, read ? " needs read access to " : " needs write access to ");
             Append(message, target);
             Append(message, ".\nTo allow it, run Forge with ");
-            Append(message, info.permission == Permission::Read ? "--allow-read=" : "--allow-write=");
+            Append(message, read ? "--allow-read=" : "--allow-write=");
             Append(message, target);
             Append(message, " (or a folder that contains it).");
         }
@@ -1142,6 +1285,33 @@ void FormatDenial(
         Append(message, info.name);
         Append(message, " was refused because the audit log could not be written (Kavach fails "
                         "closed).");
+        return;
+
+    case Denial::Kind::Link:
+        Append(message, "Permission denied: ");
+        Append(message, info.name);
+        Append(message, " will not write through ");
+        Append(message, target);
+        Append(message, ", which is a symbolic link or junction. Write to the real location "
+                        "instead (Forge never writes or deletes through links).");
+        return;
+
+    case Denial::Kind::HardLink:
+        Append(message, "Permission denied: ");
+        Append(message, info.name);
+        Append(message, " will not change ");
+        Append(message, target);
+        Append(message, ", which has more than one hard link: the same file may also be reachable "
+                        "from outside the granted folders.");
+        return;
+
+    case Denial::Kind::Changed:
+        Append(message, "Permission denied: ");
+        Append(message, info.name);
+        Append(message, " found that the path led to ");
+        Append(message, target);
+        Append(message, " when it was opened, which no grant covers. A link or folder may have "
+                        "been changed after the check.");
         return;
 
     case Denial::Kind::Internal:

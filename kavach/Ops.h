@@ -26,7 +26,22 @@ enum class Permission : uint8_t
     Write,   // create, change or delete under a granted path
     Env,     // read one granted environment variable
     EnvAll,  // read every environment variable
+    ReadWrite,  // read one path and write another (fs.copyFile: source, destination)
 };
+
+/// What a filesystem check asks for. An op with Permission::Read or Write
+/// asks for that; Permission::ReadWrite asks for Read on one path and Write
+/// on another (Phase 8.3).
+enum class Access : uint8_t
+{
+    Read,
+    Write,
+};
+
+/// True if `op`'s permission includes `access`.
+bool OpAllows(
+    Permission permission,
+    Access access) noexcept;
 
 // X(Id, "JavaScript name", Permission)
 #define FORGE_KAVACH_OPS(X)                                      \
@@ -50,6 +65,16 @@ enum class Permission : uint8_t
     X(FsRm, "fs.rm", Write)                                      \
     X(FsStatSync, "fs.statSync", Read)                           \
     X(FsStat, "fs.stat", Read)                                   \
+    X(FsLstatSync, "fs.lstatSync", Read)                         \
+    X(FsLstat, "fs.lstat", Read)                                 \
+    X(FsReaddirSync, "fs.readdirSync", Read)                     \
+    X(FsReaddir, "fs.readdir", Read)                             \
+    X(FsRealpathSync, "fs.realpathSync", Read)                   \
+    X(FsRealpath, "fs.realpath", Read)                           \
+    X(FsRenameSync, "fs.renameSync", Write)                      \
+    X(FsRename, "fs.rename", Write)                              \
+    X(FsCopyFileSync, "fs.copyFileSync", ReadWrite)              \
+    X(FsCopyFile, "fs.copyFile", ReadWrite)                      \
     X(ForgeExit, "Forge.exit", None)                             \
     X(ForgeExitCode, "Forge.exitCode", None)                     \
     X(ForgeAddSignalListener, "Forge.addSignalListener", None)   \
