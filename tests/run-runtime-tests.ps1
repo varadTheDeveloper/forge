@@ -27,8 +27,24 @@ $check = [string][char]0x2713
 $fire = [char]::ConvertFromUtf32(0x1F525)
 $uUmlaut = [string][char]0x00FC
 
+# Phase 8.2: a scratch tree for the Kavach tests. "link" is a junction
+# from inside the granted folder to a folder outside it; following it must
+# not escape the grant. Junctions need no administrator rights.
+$kRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-kavach-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$kGranted = Join-Path $kRoot "granted"
+$kOutside = Join-Path $kRoot "outside"
+$kLink = Join-Path $kGranted "link"
+$kAudit = Join-Path $kRoot "audit.jsonl"
+New-Item -ItemType Directory -Force -Path $kGranted, $kOutside | Out-Null
+Set-Content -NoNewline -Path (Join-Path $kGranted "ok.txt") -Value "ok-content"
+Set-Content -NoNewline -Path (Join-Path $kOutside "secret.txt") -Value "secret-content"
+cmd /c mklink /J "$kLink" "$kOutside" | Out-Null
+$env:FORGE_KAVACH_TEST = "env-ok"
+
 # File, expected exit code, text that must appear (stdout+stderr), text that
-# must not appear, and optional arguments for the script (Phase 8).
+# must not appear, optional script arguments (Args, Phase 8), optional
+# options placed before the script (Pre, Phase 8.2) and an optional Check
+# script block returning a list of problems (Phase 8.2).
 $cases = @(
   @{ File = "clean-exit.js";             Exit = 0; Has = @("ok");                                   Not = @() },
   @{ File = "set-timeout-no-delay.js";   Exit = 0; Has = @("fired");                                Not = @() },
@@ -56,7 +72,29 @@ $cases = @(
      Args = @("a b", "--flag", $uUmlaut) },
   @{ File = "forge-exit.js";             Exit = 7; Has = @("before exit");                          Not = @("SHOULD NOT RUN") },
   @{ File = "forge-exit-code.js";        Exit = 5; Has = @("timer ran");                            Not = @() },
-  @{ File = "forge-exit-in-timer.js";    Exit = 3; Has = @("first timer");                          Not = @("SHOULD NOT RUN") }
+  @{ File = "forge-exit-in-timer.js";    Exit = 3; Has = @("first timer");                          Not = @("SHOULD NOT RUN") },
+  @{ File = "kavach-read.js";            Exit = 0; Has = @("allowed: ok-content", "denied: PermissionDenied read"); Not = @("SHOULD NOT READ", "secret-content");
+     Pre = @("--allow-read=$kGranted"); Args = @((Join-Path $kGranted "ok.txt"), (Join-Path $kOutside "secret.txt")) },
+  @{ File = "kavach-read.js";            Exit = 0; Has = @("allowed: ok-content", "denied: PermissionDenied read"); Not = @("SHOULD NOT READ", "secret-content");
+     Pre = @("--allow-read=$kGranted"); Args = @((Join-Path $kGranted "ok.txt"), (Join-Path $kLink "secret.txt")) },
+  @{ File = "kavach-no-grant.js";        Exit = 1; Has = @("needs read access to", "--allow-read="); Not = @("SHOULD NOT RUN");
+     Args = @((Join-Path $kGranted "ok.txt")) },
+  @{ File = "kavach-read.js";            Exit = 0; Has = @("allowed: ok-content", "denied: PermissionDenied read"); Not = @();
+     Pre = @("--allow-read=$kGranted", "--audit-log=$kAudit"); Args = @((Join-Path $kGranted "ok.txt"), (Join-Path $kLink "secret.txt"));
+     Check = {
+       $log = Get-Content -Raw -Encoding UTF8 $kAudit
+       $p = @()
+       foreach ($t in @('"event":"start"', '"decision":"allow"', '"decision":"deny"', '"reason":"not-granted"', '"event":"stop"')) {
+         if (-not $log.Contains($t)) { $p += "audit log lacks $t" }
+       }
+       $p
+     } },
+  @{ File = "clean-exit.js";             Exit = 2; Has = @("refused", "whole drive"); Not = @("ok");
+     Pre = @("--allow-read=C:\\") },  # doubled: a "\" before the closing quote would escape it
+  @{ File = "clean-exit.js";             Exit = 2; Has = @("refused", "home folder"); Not = @();
+     Pre = @("--allow-write=$env:USERPROFILE") },
+  @{ File = "kavach-env.js";             Exit = 0; Has = @("env: env-ok", "env denied: PermissionDenied"); Not = @("SHOULD NOT READ");
+     Pre = @("--allow-env=FORGE_KAVACH_TEST") }
 )
 
 $failures = 0
@@ -67,7 +105,9 @@ foreach ($c in $cases) {
   $errFile = [System.IO.Path]::GetTempFileName()
 
   # Start-Process joins arguments with spaces, so quote each one here.
-  $argLine = "`"$script`""
+  $argLine = ""
+  if ($c.Pre) { foreach ($a in $c.Pre) { $argLine += "`"$a`" " } }
+  $argLine += "`"$script`""
   if ($c.Args) { foreach ($a in $c.Args) { $argLine += " `"$a`"" } }
 
   $p = Start-Process -FilePath $ForgePath -ArgumentList $argLine -NoNewWindow -Wait -PassThru `
@@ -82,6 +122,7 @@ foreach ($c in $cases) {
   if ($p.ExitCode -ne $c.Exit) { $problems += "exit code $($p.ExitCode), expected $($c.Exit)" }
   foreach ($t in $c.Has) { if (-not $output.Contains($t)) { $problems += "missing '$t'" } }
   foreach ($t in $c.Not) { if ($output.Contains($t)) { $problems += "unexpected '$t'" } }
+  if ($c.Check) { $problems += @(& $c.Check) }
 
   if ($problems.Count -eq 0) {
     Write-Host ("[runtime-test] {0,-30} PASS" -f $c.File)
@@ -92,6 +133,11 @@ foreach ($c in $cases) {
     Write-Host $output
   }
 }
+
+# Remove the junction first (rmdir removes the link, not its target).
+cmd /c rmdir "$kLink" 2>$null
+Remove-Item -Recurse -Force $kRoot -ErrorAction SilentlyContinue
+Remove-Item Env:\FORGE_KAVACH_TEST -ErrorAction SilentlyContinue
 
 if ($failures -eq 0) {
   Write-Host "[runtime-test] ALL PASSED"
