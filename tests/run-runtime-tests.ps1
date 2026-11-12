@@ -44,10 +44,46 @@ $kHardLink = Join-Path $kGranted "hardlink.txt"
 cmd /c mklink /H "$kHardLink" (Join-Path $kOutside "secret.txt") | Out-Null
 $env:FORGE_KAVACH_TEST = "env-ok"
 
+# Phase 8.4: a tree for the bypass replays (tests/bypass-replays.js, see
+# BYPASS-REPLAYS.md). Everything in "granted" is granted for reading and
+# writing; the protected files, the links and the audit log are inside it.
+$rRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-replay-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$rGranted = Join-Path $rRoot "granted"
+$rOutside = Join-Path $rRoot "outside"
+$rAudit = Join-Path $rGranted "audit.jsonl"
+$rOutLink = Join-Path $rGranted "out-link"
+$rGitLink = Join-Path $rGranted "git-link"
+New-Item -ItemType Directory -Force -Path $rOutside, (Join-Path $rGranted ".git\hooks"), (Join-Path $rGranted "victim") | Out-Null
+Set-Content -NoNewline -Path (Join-Path $rGranted ".git\config") -Value "[core]"
+Set-Content -NoNewline -Path (Join-Path $rGranted "forge.json") -Value "{}"
+Set-Content -NoNewline -Path (Join-Path $rGranted "ok.txt") -Value "ok-content"
+Set-Content -NoNewline -Path (Join-Path $rGranted "victim\keep.txt") -Value "keep"
+Set-Content -NoNewline -Path (Join-Path $rOutside "secret.txt") -Value "secret-content"
+cmd /c mklink /J "$rOutLink" "$rOutside" | Out-Null
+cmd /c mklink /J "$rGitLink" (Join-Path $rGranted ".git") | Out-Null
+cmd /c mklink /H (Join-Path $rGranted "hard.txt") (Join-Path $rOutside "secret.txt") | Out-Null
+$env:FORGE_REPLAY_GRANTED = "granted-value"
+
+# Phase 8.4: a scratch folder for the native fuzzer (tests/fuzz-natives.js).
+# It runs with this folder as its current folder and the only grant.
+$fRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-fuzz-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$fScratch = Join-Path $fRoot "scratch"
+$fOutside = Join-Path $fRoot "outside"
+New-Item -ItemType Directory -Force -Path $fScratch, $fOutside | Out-Null
+Set-Content -NoNewline -Path (Join-Path $fOutside "secret.txt") -Value "secret-content"
+
+# What a folder holds, for "nothing changed" checks.
+function Get-TreeListing([string]$Path) {
+  (Get-ChildItem -LiteralPath $Path -Recurse -Force -Attributes !ReparsePoint |
+     ForEach-Object { $_.FullName.Substring($Path.Length) + "|" + $(if ($_.PSIsContainer) { "d" } else { $_.Length }) }) -join "`n"
+}
+$rOutsideBefore = Get-TreeListing $rOutside
+
 # File, expected exit code, text that must appear (stdout+stderr), text that
 # must not appear, optional script arguments (Args, Phase 8), optional
 # options placed before the script (Pre, Phase 8.2) and an optional Check
-# script block returning a list of problems (Phase 8.2).
+# script block returning a list of problems (Phase 8.2), and an optional
+# current folder for Forge (Cwd, Phase 8.4).
 $cases = @(
   @{ File = "clean-exit.js";             Exit = 0; Has = @("ok");                                   Not = @() },
   @{ File = "set-timeout-no-delay.js";   Exit = 0; Has = @("fired");                                Not = @() },
@@ -103,6 +139,38 @@ $cases = @(
                                                            "async denied: PermissionDenied"); Not = @("SHOULD NOT READ");
      Pre = @("--allow-read=$kGranted", "--allow-write=$kGranted");
      Args = @((Join-Path $kGranted "async"), (Join-Path $kOutside "secret.txt")) },
+  @{ File = "bypass-replays.js";         Exit = 0; Has = @("replays done:", " 0 bypassed", "replay R16 async functions refuse the same way: blocked",
+                                                           "replay R11b no module loading: blocked");
+     Not = @("BYPASSED", "Uncaught");
+     Pre = @("--allow-read=$rGranted", "--allow-write=$rGranted", "--allow-env=FORGE_REPLAY_GRANTED", "--audit-log=$rAudit");
+     Args = @($rGranted, $rOutside, $rAudit); Cwd = $rGranted;
+     Check = {
+       $p = @()
+       if ((Get-TreeListing $rOutside) -ne $rOutsideBefore) { $p += "the outside folder changed" }
+       if ((Get-Content -Raw (Join-Path $rOutside "secret.txt")) -ne "secret-content") { $p += "secret.txt changed" }
+       if ((Get-Content -Raw (Join-Path $rGranted ".git\config")) -ne "[core]") { $p += ".git\config changed" }
+       if ((Get-ChildItem -Force (Join-Path $rGranted ".git\hooks")).Count -ne 0) { $p += "a git hook was written" }
+       if ((Get-Content -Raw (Join-Path $rGranted "forge.json")) -ne "{}") { $p += "forge.json changed" }
+       if (-not (Test-Path (Join-Path $rGranted "victim\keep.txt"))) { $p += "victim\keep.txt was deleted" }
+       foreach ($n in @("forge.lock", "stolen.txt", "moved.jsonl", "not-git")) {
+         if (Test-Path -LiteralPath (Join-Path $rGranted $n)) { $p += "$n was created" }
+       }
+       $log = Get-Content -Raw -Encoding UTF8 $rAudit
+       foreach ($t in @('"event":"start"', '"reason":"protected"', '"reason":"not-granted"', '"reason":"invalid-path"', '"event":"stop"')) {
+         if (-not $log.Contains($t)) { $p += "audit log lacks $t" }
+       }
+       $p
+     } },
+  @{ File = "fuzz-natives.js";           Exit = 0; Has = @("fuzz: seed", "natives called", "fuzz done"); Not = @("FUZZ VIOLATION", "Uncaught");
+     Pre = @("--allow-read=$fScratch", "--allow-write=$fScratch", "--allow-env=FORGE_KAVACH_TEST");
+     Args = @($fScratch); Cwd = $fScratch;
+     Check = {
+       $p = @()
+       if ((Get-Content -Raw (Join-Path $fOutside "secret.txt")) -ne "secret-content") { $p += "the outside file changed" }
+       $top = @(Get-ChildItem -Force -LiteralPath $fRoot | ForEach-Object { $_.Name } | Sort-Object) -join ","
+       if ($top -ne "outside,scratch") { $p += "the fuzzer created $top next to its scratch folder" }
+       $p
+     } },
   # Last: it removes the junction the earlier cases use.
   @{ File = "kavach-links.js";           Exit = 0; Has = @("hardlink: PermissionDenied explained", "junction removed: true", "plain: plain-ok");
      Not = @("SHOULD NOT WRITE");
@@ -130,8 +198,12 @@ foreach ($c in $cases) {
   $argLine += "`"$script`""
   if ($c.Args) { foreach ($a in $c.Args) { $argLine += " `"$a`"" } }
 
-  $p = Start-Process -FilePath $ForgePath -ArgumentList $argLine -NoNewWindow -Wait -PassThru `
-         -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+  $startArgs = @{
+    FilePath = $ForgePath; ArgumentList = $argLine; NoNewWindow = $true; Wait = $true; PassThru = $true
+    RedirectStandardOutput = $outFile; RedirectStandardError = $errFile
+  }
+  if ($c.Cwd) { $startArgs.WorkingDirectory = $c.Cwd }
+  $p = Start-Process @startArgs
   # Forge writes UTF-8 to pipes and files.
   $output = (Get-Content -Raw -Encoding UTF8 $outFile) + (Get-Content -Raw -Encoding UTF8 $errFile)
   Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
@@ -159,9 +231,13 @@ foreach ($c in $cases) {
 # `cmd /c rmdir` here wrote "cannot find the file" to stderr once the
 # kavach-links test had removed it, and with $ErrorActionPreference = "Stop"
 # that ended the script before it reported success.)
-if (Test-Path -LiteralPath $kLink) { [System.IO.Directory]::Delete($kLink) }
-Remove-Item -Recurse -Force $kRoot -ErrorAction SilentlyContinue
-Remove-Item Env:\FORGE_KAVACH_TEST -ErrorAction SilentlyContinue
+# Windows PowerShell 5.1's Remove-Item -Recurse can follow a junction, so
+# every junction goes before the trees are removed.
+foreach ($j in @($kLink, $rOutLink, $rGitLink)) {
+  if (Test-Path -LiteralPath $j) { [System.IO.Directory]::Delete($j) }
+}
+Remove-Item -Recurse -Force $kRoot, $rRoot, $fRoot -ErrorAction SilentlyContinue
+Remove-Item Env:\FORGE_KAVACH_TEST, Env:\FORGE_REPLAY_GRANTED -ErrorAction SilentlyContinue
 
 if ($failures -eq 0) {
   Write-Host "[runtime-test] ALL PASSED"
