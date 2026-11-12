@@ -44,7 +44,9 @@ Without `--allow-read`, the file read is refused with a message that names the e
 - **Protected paths.** `.git`, `forge.json`, `forge.lock`, the audit log and Forge's install folder can never be granted, and neither can a whole drive or your home folder.
 - **Audit log.** `--audit-log=<file>` records every decision as JSON lines.
 
-Status: **preview.** Per-package permissions come with modules (Phase 9) and an OS sandbox later. Details and known limits: [Kavach.md](Kavach.md).
+- **Tested against known bypasses.** Published bypasses of other runtimes' permission systems are replayed against Kavach on every build ([BYPASS-REPLAYS.md](BYPASS-REPLAYS.md)), and every native function is fuzzed.
+
+Status: **preview.** Per-package permissions come with modules (Phase 9) and an OS sandbox later. Details and known limits: [Kavach.md](Kavach.md). TypeScript declarations: [types/forge.d.ts](types/forge.d.ts).
 
 ---
 

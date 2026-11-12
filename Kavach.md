@@ -1,7 +1,7 @@
 # Kavach: permissions in Forge
 
 Kavach is Forge's permission system. This file describes what exists today
-(Phase 8.3), how to use it, and the user-experience rules every later
+(Phase 8.4), how to use it, and the user-experience rules every later
 permission feature must follow (gap G38 in the master plan).
 
 Status: **preview**. Until packages are isolated from each other (Phase 9)
@@ -74,6 +74,16 @@ instead of guessing (the error has `code: "InvalidArgument"`):
 Every native function Forge exposes to JavaScript is listed, with the
 permission it needs, in `kavach/Ops.h` (rule R2). `forge --self-test` fails
 if a function exists without a row, or a row without a function.
+
+Options such as `{ recursive: true }` are read from the object's own data
+properties only (Phase 8.4): a property inherited from a prototype is
+ignored, so prototype pollution cannot make an operation do more, and an
+options object with a getter, or a Proxy, is refused.
+
+Kavach is tested against published bypasses of other runtimes' permission
+systems on every build: see [BYPASS-REPLAYS.md](BYPASS-REPLAYS.md). Every
+place where Forge's C++ runs script code is listed in
+[CallSites.md](CallSites.md).
 
 ## Messages (permission UX, G38)
 

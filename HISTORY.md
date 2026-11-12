@@ -3683,3 +3683,66 @@ had already removed, which is fixed.
   (6 of 25 global entries done, 1 partial, 4 provided by the engine but not
   yet tested; the 53 interfaces are WebAssembly-only so far), the phase that
   adds each missing entry, and the planned documented deviations.
+
+## Phase 8.4: types, native fuzzing, bypass replays, call sites (2026-11-12)
+
+The last part of Phase 8.
+
+**Two bugs found while listing call sites (R24), both fixed:**
+- `fs` options were read with `JS_GetProperty`, which walks the prototype
+  chain. After `Object.prototype.recursive = true`, `rmSync(folder, {})`
+  would have deleted a whole folder. `ParseFlag` now reads own data
+  properties only; inherited ones are ignored, and an accessor property or
+  a Proxy is refused with `InvalidArgument`, so reading options never runs
+  script code.
+- `ThrowJsError` set `code`, `syscall`, `path` and `nativeCode` with
+  `JS_SetProperty`, which would call a setter a script placed on
+  `Error.prototype`, inside the native and with an exception pending. The
+  fields are now defined as own properties with the exception taken off the
+  context meanwhile (`DefineStringOnPendingError` does the same).
+- Invalid environment variable names and non-string names now carry
+  `code: "InvalidArgument"` like Forge's other argument errors.
+
+**One bug found by the first run of the bypass replays, fixed:** Forge set
+no module load hook, so the engine left every `import()` Promise pending
+forever (with its error left pending on the context). `await import("x")`
+silently stopped the rest of an async function, and the replay run never
+printed its summary. Forge now installs a hook that refuses every request,
+so `import()` rejects with a TypeError, `code: "NotSupported"`, until
+modules arrive in Phase 9.
+
+**New files**
+- `types/forge.d.ts`: TypeScript declarations for `Forge`, `fs`, `console`,
+  the timers, `queueMicrotask` and `print`, with `types/test/` compiled in
+  CI by a pinned TypeScript.
+- `tests/fuzz-natives.js`: a seeded, deterministic fuzzer that finds every
+  native by walking the objects Forge defines (58 today) and calls them
+  with adversarial values: odd numbers and strings, Windows path tricks,
+  detached and resizable buffers, cyclic and deep objects, revoked
+  Proxies, and values whose getters, conversions and Proxy traps count
+  their own calls. It fails if a native crashes, throws a non-Error, gives
+  an unknown error code, throws synchronously from a Promise-returning
+  function, or runs script code of an argument when `CallSites.md` says it
+  never does. It runs with its scratch folder as the only grant and the
+  current folder.
+- `tests/bypass-replays.js` and `BYPASS-REPLAYS.md`: 16 groups of replays
+  of published bypasses (Node CVE-2023-30584, CVE-2023-32004,
+  CVE-2023-39332; Deno CVE-2024-34346) and Windows path tricks (network
+  paths without a connection, device paths, short names, protected-name
+  spellings, junctions out of the grant and to `.git`, prototype pollution,
+  the audit log, the frozen namespace, hard links), each also through the
+  Promise-returning functions. The runner checks from outside that nothing
+  outside the grant and no protected file changed.
+- `CallSites.md`: every place C++ calls into JavaScript, the state of the
+  native at that moment, and whose authority applies (open item for Phase
+  9: a `then` added to a shared prototype runs when another package's async
+  operation settles; per-package realms answer it).
+
+**Verified** on Varad's machine. The first run passed 64 self-tests and
+every replay group blocked, but the summary line was missing because of the
+`import()` bug above. The second run passed all 64 self-tests and all 26
+runtime tests, including the replays and the fuzzer.
+
+**Also:** self-tests for the two fixes; the runtime test runner can set
+Forge's current folder (`Cwd`); a CI job checks the types and parses every
+test script with Node.

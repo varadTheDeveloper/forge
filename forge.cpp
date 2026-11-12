@@ -46,6 +46,7 @@
 // 142 Nightly engine, where the embedder owned the queue, is no longer
 // supported; see HISTORY.md, "Phase 7.95".
 #include "js/friend/MicroTask.h"
+#include "js/Modules.h"
 
 // Phase 8: Forge.args (arrays), the interrupt callback that lets Ctrl+C stop
 // a script stuck in a loop, and property specs for the Forge namespace.
@@ -204,6 +205,40 @@ static const JSSecurityCallbacks kForgeSecurityCallbacks = {
     nullptr,                     // codeForEvalGets (spec default)
     nullptr,                     // subsumes (single principal for now)
 };
+
+// Phase 8.4: Forge has no module loader yet (modules arrive in Phase 9).
+// With no hook installed, the engine reports an error but leaves the
+// import() Promise pending forever (and the error pending on the context),
+// so `await import("x")` silently stopped the rest of an async function.
+// This hook refuses every request instead; returning false with an error
+// pending makes the engine reject the import() Promise with it.
+static bool RefuseModuleLoad(JSContext* cx, JS::Handle<JSScript*> referrer,
+                             JS::Handle<JSObject*> moduleRequest, JS::Handle<JS::Value> hostDefined,
+                             JS::Handle<JS::Value> payload, uint32_t lineNumber,
+                             JS::ColumnNumberOneOrigin columnNumber) {
+  (void)referrer;
+  (void)hostDefined;
+  (void)payload;
+  (void)lineNumber;
+  (void)columnNumber;
+
+  forge::core::String message;
+  JS::RootedString specifier(cx, JS::GetModuleRequestSpecifier(cx, moduleRequest));
+
+  if (!specifier || message.Append("import(\"").HasError() ||
+      !forge::runtime::AppendStringUtf8(cx, specifier, message) ||
+      message.Append("\"): Forge cannot load modules yet; they arrive in Phase 9").HasError()) {
+    if (!JS_IsExceptionPending(cx)) {
+      JS_ReportOutOfMemory(cx);
+    }
+
+    return false;
+  }
+
+  ThrowTypeError(cx, message.CStr());
+  DefineStringOnPendingError(cx, "code", "NotSupported");
+  return false;
+}
 
 // Appends a saved-frame stack (the stack captured when an exception was
 // thrown) to `out`, one indented frame per line. Appends nothing if there is
@@ -1978,7 +2013,9 @@ static bool RequireStringArg(JSContext* cx, const JS::CallArgs& args, unsigned i
   if (!args.get(index).isString()) {
     char message[128];
     snprintf(message, sizeof(message), "%s must be a string", what);
-    return ThrowTypeError(cx, message);
+    ThrowTypeError(cx, message);
+    DefineStringOnPendingError(cx, "code", "InvalidArgument");
+    return false;
   }
 
   return forge::runtime::AppendStringUtf8(cx, args[index].toString(), out);
@@ -1997,7 +2034,9 @@ static bool RequireEnvName(JSContext* cx, const JS::CallArgs& args, const char* 
     char message[128];
     snprintf(message, sizeof(message),
              "%s: the variable name must not be empty or contain '=' or NUL", function);
-    return ThrowTypeError(cx, message);
+    ThrowTypeError(cx, message);
+    DefineStringOnPendingError(cx, "code", "InvalidArgument");
+    return false;
   }
 
   return true;
@@ -3439,6 +3478,80 @@ static bool SelfTest_FsPhase83Apis(JSContext* cx) {
       "})()");
 }
 
+// Phase 8.4 (R24): options are read from own data properties only, so a
+// polluted Object.prototype cannot widen an operation, and reading them
+// never calls a getter or a proxy trap.
+static bool SelfTest_FsOptionsOwnPropertiesOnly(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "fs: options ignore Object.prototype, getters and proxies",
+      "(() => {"
+      "  const d = 'forge-selftest-fs-scratch/v84';"
+      "  if (fs.existsSync(d)) fs.rmSync(d, { recursive: true });"
+      "  fs.mkdirSync(d + '/inner', { recursive: true });"
+      "  fs.writeFileSync(d + '/inner/keep.txt', 'k');"
+      "  let result = 'ok';"
+      "  Object.prototype.recursive = true;"
+      "  Object.prototype.withFileTypes = true;"
+      "  try {"
+      "    try { fs.rmSync(d, {}); result = 'inherited recursive was used'; }"
+      "    catch (e) { if (e.code !== 'InvalidOperation') result = 'rm code ' + e.code; }"
+      "    if (!fs.existsSync(d + '/inner/keep.txt')) result = 'folder was deleted';"
+      "    const names = fs.readdirSync(d, {});"
+      "    if (typeof names[0] !== 'string') result = 'inherited withFileTypes was used';"
+      "  } finally {"
+      "    delete Object.prototype.recursive;"
+      "    delete Object.prototype.withFileTypes;"
+      "  }"
+      "  if (result !== 'ok') return result;"
+      "  let called = false;"
+      "  const getter = { get recursive() { called = true; return true; } };"
+      "  try { fs.rmSync(d, getter); return 'getter options accepted'; }"
+      "  catch (e) { if (e.code !== 'InvalidArgument') return 'getter code ' + e.code; }"
+      "  if (called) return 'getter was called';"
+      "  const proxy = new Proxy({ recursive: true }, {"
+      "    getOwnPropertyDescriptor() { called = true; return undefined; },"
+      "    get() { called = true; return true; } });"
+      "  try { fs.rmSync(d, proxy); return 'proxy options accepted'; }"
+      "  catch (e) { if (e.code !== 'InvalidArgument') return 'proxy code ' + e.code; }"
+      "  if (called) return 'proxy trap was called';"
+      "  fs.rmSync(d, { recursive: true });"
+      "  if (fs.existsSync(d)) return 'own recursive ignored';"
+      "  return 'ok';"
+      "})()");
+}
+
+// Phase 8.4 (R24): the fields of a thrown error (code, path, op, ...) are
+// defined on it, so setters placed on the prototypes never run.
+static bool SelfTest_ErrorFieldsNoSetters(JSContext* cx) {
+  return ExpectScriptReturnsOk(
+      cx, "errors: fields are defined, prototype setters never run",
+      "(() => {"
+      "  const names = ['code', 'syscall', 'path', 'op', 'permission', 'nativeCode'];"
+      "  let called = '';"
+      "  for (const n of names) {"
+      "    Object.defineProperty(Error.prototype, n, { configurable: true,"
+      "      get() { return 'inherited'; }, set(v) { called += n + ' '; } });"
+      "  }"
+      "  let result = 'ok';"
+      "  try {"
+      "    try { fs.readFileSync('forge-selftest-fs-scratch/does-not-exist.txt');"
+      "          result = 'read of a missing file'; }"
+      "    catch (e) {"
+      "      if (e.code !== 'NotFound' || !Object.hasOwn(e, 'code')) result = 'missing code ' + e.code;"
+      "    }"
+      "    try { fs.readFileSync('forge-selftest-not-granted.txt'); result = 'not refused'; }"
+      "    catch (e) {"
+      "      if (e.code !== 'PermissionDenied' || e.permission !== 'read' ||"
+      "          e.op !== 'fs.readFileSync') result = 'denial fields ' + e.code + ' ' + e.op;"
+      "    }"
+      "  } finally {"
+      "    for (const n of names) delete Error.prototype[n];"
+      "  }"
+      "  if (called) return 'setter ran: ' + called;"
+      "  return result;"
+      "})()");
+}
+
 static bool SelfTest_KavachProtectedPaths(JSContext* cx) {
   return ExpectScriptReturnsOk(
       cx, "Kavach: protected paths (R13)",
@@ -3721,6 +3834,10 @@ static bool RunConsoleAndForgeSmokeTests(JSContext* cx) {
       {"Kavach: ambiguous paths refused", SelfTest_KavachInvalidPaths},
       {"Kavach: only strings are paths", SelfTest_KavachPathTypes},
       {"fs: readdir/rename/copyFile/lstat/realpath/rm", SelfTest_FsPhase83Apis},
+      {"fs: options ignore Object.prototype, getters and proxies",
+       SelfTest_FsOptionsOwnPropertiesOnly},
+      {"errors: fields are defined, prototype setters never run",
+       SelfTest_ErrorFieldsNoSetters},
       {"Forge.exitCode / Forge.exit checks", SelfTest_ForgeExitCode},
       {"Forge.stdout / Forge.stderr", SelfTest_ForgeStdStreams},
       {"Forge signal listeners", SelfTest_ForgeSignalListeners},
@@ -3963,6 +4080,7 @@ static int ForgeMain(int argc, char* argv[]) {
   // Phase 7.9: every eval/new Function/WebAssembly compilation now passes
   // through ForgeCodeGenerationAllowed, so policy has a place to live.
   JS_SetSecurityCallbacks(cx, &kForgeSecurityCallbacks);
+  JS::SetModuleLoadHook(JS_GetRuntime(cx), RefuseModuleLoad);
 
   if (!JS::InitSelfHostedCode(cx)) {
     return 1;
