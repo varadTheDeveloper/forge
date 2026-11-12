@@ -20,7 +20,9 @@
 // Stats: { size, type, isFile, isDirectory, isSymbolicLink, nlink, mtimeMs,
 // atimeMs, ctimeMs, birthtimeMs }; type is "file", "directory", "symlink" or
 // "other". Every path goes through Kavach; a refusal from a Promise-returning
-// function is a rejected Promise, never a synchronous throw.
+// function is a rejected Promise, never a synchronous throw. Options are read
+// from own data properties only (Phase 8.4): inherited properties are
+// ignored, and getters and Proxies are refused (CallSites.md).
 
 #include "js/RootingAPI.h"
 #include "js/TypeDecls.h"

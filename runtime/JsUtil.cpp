@@ -124,20 +124,30 @@ void ThrowJsError(JSContext* cx,
     return;
   }
 
+  // Phase 8.4 (R24): the fields are defined as own data properties with
+  // the exception taken off the context meanwhile. JS_SetProperty would
+  // run a setter that a script placed on Error.prototype or
+  // Object.prototype, in the middle of this native, with an exception
+  // pending; JS_DefineProperty on an ordinary Error object runs no script.
+  // Each field is best effort: a failure (out of memory) keeps the
+  // original error rather than replacing it.
   JS::RootedObject excObj(cx, &excVal.toObject());
+  JS_ClearPendingException(cx);
 
-  // Every JS_SetProperty call below is best-effort: if one fails (e.g.
-  // OOM allocating the property string), the base thrown Error --
-  // already pending -- is left intact rather than compounding the
-  // original failure with a second, unrelated OOM report.
+  auto defineValue = [&](const char* name, JS::HandleValue value) {
+    if (!JS_DefineProperty(cx, excObj, name, value, JSPROP_ENUMERATE)) {
+      JS_ClearPendingException(cx);
+    }
+  };
+
   if (JSString* codeJsStr = JS_NewStringCopyZ(cx, codeStr)) {
     JS::RootedValue codeVal(cx, JS::StringValue(codeJsStr));
-    JS_SetProperty(cx, excObj, "code", codeVal);
+    defineValue("code", codeVal);
   }
 
   if (JSString* syscallJsStr = JS_NewStringCopyZ(cx, context)) {
     JS::RootedValue syscallVal(cx, JS::StringValue(syscallJsStr));
-    JS_SetProperty(cx, excObj, "syscall", syscallVal);
+    defineValue("syscall", syscallVal);
   }
 
   if (path != nullptr) {
@@ -145,19 +155,17 @@ void ThrowJsError(JSContext* cx,
     if (JSString* pathJsStr = JS_NewStringCopyUTF8N(
             cx, JS::UTF8Chars(pathView.Data(), pathView.Size()))) {
       JS::RootedValue pathVal(cx, JS::StringValue(pathJsStr));
-      JS_SetProperty(cx, excObj, "path", pathVal);
+      defineValue("path", pathVal);
     }
   }
 
   if (error.Code() == forge::core::ErrorCode::PlatformError) {
     JS::RootedValue nativeCodeVal(cx, JS::NumberValue(error.NativeCode()));
-    JS_SetProperty(cx, excObj, "nativeCode", nativeCodeVal);
+    defineValue("nativeCode", nativeCodeVal);
   }
 
-  // `excObj` is the very heap object already set as cx's pending
-  // exception (JS_GetPendingException returned it, not a copy) -- setting
-  // properties on it in place is visible to whatever eventually catches
-  // it without needing a second JS_SetPendingException call.
+  JS_ClearPendingException(cx);  // an out-of-memory report from a string
+  JS_SetPendingException(cx, excVal);
 }
 
 // Converts an arbitrary JS value to a forge::core::String via ToString
@@ -358,20 +366,19 @@ void DefineStringOnPendingError(JSContext* cx, const char* name,
     return;
   }
 
+  // Defined (never set) with the exception off the context, so no setter
+  // runs (R24); the original error stays pending whatever happens.
   JS::RootedObject error(cx, &exception.toObject());
+  JS_ClearPendingException(cx);
   JS::RootedString str(cx, JS_NewStringCopyUTF8N(cx, JS::UTF8Chars(value.Data(), value.Size())));
 
-  if (!str) {
-    // Keep the original error, not an out-of-memory one, pending.
-    JS_SetPendingException(cx, exception);
-    return;
+  if (str) {
+    JS::RootedValue strValue(cx, JS::StringValue(str));
+    (void)JS_DefineProperty(cx, error, name, strValue, JSPROP_ENUMERATE);
   }
 
-  JS::RootedValue strValue(cx, JS::StringValue(str));
-
-  if (!JS_DefineProperty(cx, error, name, strValue, JSPROP_ENUMERATE)) {
-    JS_SetPendingException(cx, exception);
-  }
+  JS_ClearPendingException(cx);
+  JS_SetPendingException(cx, exception);
 }
 
 bool ThrowKavachDenial(JSContext* cx, forge::kavach::Op op,

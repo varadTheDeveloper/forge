@@ -24,6 +24,7 @@
 #include "js/PropertyAndElement.h"
 #include "js/PropertyDescriptor.h"
 #include "js/PropertySpec.h"
+#include "js/Proxy.h"
 #include "js/RootingAPI.h"
 #include "js/TracingAPI.h"
 #include "js/ValueArray.h"
@@ -120,6 +121,12 @@ bool ParseEncoding(JSContext* cx, Op op, JS::HandleValue value, const CheckedPat
 
 /// `{ name: true }` options: undefined means false; anything that is not an
 /// object is an InvalidArgument error.
+///
+/// Only an own data property counts (Phase 8.4, R24). Inherited properties
+/// are ignored, so `Object.prototype.recursive = true` cannot turn rmSync
+/// into a recursive delete; getters are never called and proxies are
+/// refused, so reading the options never runs script code. JS::ToBoolean
+/// runs no script either.
 bool ParseFlag(JSContext* cx, Op op, JS::HandleValue options, const char* name,
                const CheckedPath& path, bool* flag)
 {
@@ -130,20 +137,31 @@ bool ParseFlag(JSContext* cx, Op op, JS::HandleValue options, const char* name,
         return true;
     }
 
-    if (!options.isObject())
+    if (!options.isObject() || js::IsProxy(&options.toObject()))
     {
         return ThrowInvalidArgument(cx, op, &path);
     }
 
     JS::RootedObject object(cx, &options.toObject());
-    JS::RootedValue value(cx);
+    JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(cx);
 
-    if (!JS_GetProperty(cx, object, name, &value))
+    if (!JS_GetOwnPropertyDescriptor(cx, object, name, &desc))
     {
         return false;
     }
 
-    *flag = !value.isUndefined() && JS::ToBoolean(value);
+    if (desc.isNothing())
+    {
+        return true;
+    }
+
+    if (!desc->isDataDescriptor())
+    {
+        return ThrowInvalidArgument(cx, op, &path);
+    }
+
+    JS::RootedValue value(cx, desc->value());
+    *flag = JS::ToBoolean(value);
     return true;
 }
 
