@@ -4,6 +4,8 @@
 #   * forge-core unit tests on Linux under ASan + UBSan (g++), built as both
 #     C++17 and C++20, plus Kavach's portable path-rule tests (Phase 8.2);
 #   * a one-minute libFuzzer run of the Kavach path rules (Phase 8.2, R24);
+#   * types/forge.d.ts checked with the TypeScript compiler, and every test
+#     script checked for syntax errors with Node (Phase 8.4);
 #   * forge-core unit and smoke tests on Windows with MSVC, including the
 #     Windows-only File, Socket, thread, timer and IOCP tests;
 #   * forge.exe itself (Phase 7.95): fetch the SpiderMonkey commit pinned in
@@ -59,6 +61,20 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev
       - name: Fuzz kavach/PathRules (60 s)
         run: CXX=clang++-18 bash tools/ci/fuzz.sh 60
+
+  # Phase 8.4: the type declarations compile, and the JavaScript tests
+  # (which otherwise only run in the long engine job) parse.
+  types-and-scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Check types/forge.d.ts (TypeScript 5.9.3, pinned)
+        run: npx --yes typescript@5.9.3 -p types/test
+      - name: Check test scripts for syntax errors
+        run: for f in tests/*.js tests/manual/*.js; do node --check "$f" || exit 1; done
 
   forge-core-windows-msvc:
     runs-on: windows-2022
