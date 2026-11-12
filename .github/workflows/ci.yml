@@ -72,7 +72,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check types/forge.d.ts (TypeScript 5.9.3, pinned)
-        run: npx --yes typescript@5.9.3 -p types/test
+        run: npx --yes --package=typescript@5.9.3 -- tsc -p types/test
       - name: Check test scripts for syntax errors
         run: for f in tests/*.js tests/manual/*.js; do node --check "$f" || exit 1; done
 
