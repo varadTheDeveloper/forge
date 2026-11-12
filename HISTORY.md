@@ -3671,3 +3671,15 @@ second found the checker following the last link for `rm`. The third passed
 all 62 self-tests and 24 runtime tests; the runner's final cleanup then
 stopped on an error message from `cmd /c rmdir` for the junction the test
 had already removed, which is fixed.
+
+## README: Kavach, standards status, honest benchmark note (2026-11-12)
+
+- `README.md` now leads with the security goal, shows the permission flags in
+  the first example (instead of `print`), summarizes Kavach, and states that
+  Forge **targets** the WinterTC Minimum Common Web API but does not conform
+  yet (rule R11: claims never exceed proof). It notes that the benchmark
+  numbers predate Kavach's checks.
+- New `WinterTC.md`: the entry-by-entry status against the specification
+  (6 of 25 global entries done, 1 partial, 4 provided by the engine but not
+  yet tested; the 53 interfaces are WebAssembly-only so far), the phase that
+  adds each missing entry, and the planned documented deviations.
