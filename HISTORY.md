@@ -3746,3 +3746,73 @@ runtime tests, including the replays and the fuzzer.
 **Also:** self-tests for the two fixes; the runtime test runner can set
 Forge's current folder (`Cwd`); a CI job checks the types and parses every
 test script with Node.
+
+## Phase 9 design, and Phase 9.1: ES modules (2026-11-14)
+
+**Design.** `PHASE9_DESIGN.md` records the inputs required by D17 and the
+Phase 9 plan. ShadowRealm (TC39 stage 2.7) is not in SpiderMonkey ESR 153,
+so Forge cannot build on it, but its callable-boundary rule shapes Forge's
+wrapper policy (Forge's own host objects never cross into another
+package). LavaMoat's published escapes (`ses` CVE-2023-39532, CVE-2025-32792,
+and the 2024 OtterSec bypasses) all came from source rewriting, a shared
+global lexical scope, or an uncovered way to make a new realm; each gets a
+Forge rule. New decisions D22 to D26: ES modules only; loading code is not
+a filesystem permission (module roots); caller identity is the realm that
+owns the native (rule R14, gap G06); the hybrid compartment layout; and
+effective permission = declared ∩ granted ∩ command line.
+
+**Built in 9.1**
+- `runtime/Modules.cpp`: the module loader on the engine's load hook. The
+  file given on the command line runs as a module (D22). Static imports
+  load synchronously while the graph is built; `import()` finishes in a
+  promise job, so it is always asynchronous. JSON modules need
+  `with { type: "json" }`. Top-level `await` works; a rejected one is
+  reported as an uncaught exception (exit code 1). `import.meta.url`,
+  `import.meta.main` and `import.meta.resolve()` (strings only).
+- `runtime/ModuleSpecifier.cpp`: specifier resolution with URL rules
+  (relative paths, `file:` URLs, percent escapes, `\` as `/`), refusing bare
+  names (until 9.2), `node:`, network and other schemes, Windows paths,
+  queries, fragments, escaped separators and control characters. Portable,
+  with a unit test (65 checks) in both CI test jobs and a libFuzzer target
+  in the CI fuzz job.
+- Kavach: a new permission `module` and op `import` (rule R2), checked
+  against **module roots** instead of read grants (D23).
+  `SetUpProgramModules` finds the root: the nearest folder with
+  `forge.json` at or above the entry, else the entry's folder; never the
+  home folder or a drive root. Module files are read with `SecureFs` from a
+  `CheckedPath`, so links, junctions, short names and protected paths are
+  handled as for `fs`, and every load is audited.
+- The Phase 8.4 hook that refused every `import()` is replaced by the
+  loader.
+
+**Changed behaviour**
+- Programs are strict-mode modules. A thrown value that is not an `Error`,
+  at a module's top level, prints without its throw-site stack: the engine
+  keeps only the value. `tests/uncaught-non-error.js` now throws from a
+  timer, where the stack is still printed.
+- A missing program file now prints `Forge: cannot find the program ...`.
+
+**Tests.** A module tree (`tests/modules/`), copied to Temp by the runner,
+covers relative and `../` imports inside the root, live bindings, one
+evaluation per module, JSON modules, a byte-order mark, `import.meta`,
+top-level `await`, dynamic `import()` (and that it is asynchronous), a
+module that throws, a syntax error, and refusals: `node:`, bare names,
+`https:`, queries, Windows paths, JSON without `type`, unsupported types,
+a missing file, `..` out of the root, a `file:` URL out of the root, a
+junction out of the root, and a module inside `.git`; the audit log must
+record allowed and refused imports. New tests for a rejected top-level
+`await` and a missing static import. The native fuzzer covers
+`import.meta.resolve` (59 natives). Types: `ImportMeta` in
+`types/forge.d.ts`.
+
+**Verified** on Varad's machine: all 64 self-tests and all 29 runtime
+tests passed on the first run. The runner's final cleanup then stopped
+with "The system cannot find the file specified": the native fuzzer had
+created folders nested deeper than 260 characters (Forge supports long
+paths), which Windows PowerShell 5.1's `Remove-Item` cannot delete. The
+runner now removes its temporary folders with `rd /s /q \\?\...`, also
+removes folders left by earlier runs, and reports a cleanup problem
+without failing the run. The next run ended with `ALL PASSED`.
+
+**Also:** "Forge™" and "Kavach™" in the README and `Kavach.md` (unregistered
+trademarks; ® is never used without a registration).

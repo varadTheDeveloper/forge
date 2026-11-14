@@ -23,6 +23,8 @@ SOURCES += [
     "runtime/Fs.cpp",
     "runtime/Inspect.cpp",
     "runtime/JsUtil.cpp",
+    "runtime/Modules.cpp",
+    "runtime/ModuleSpecifier.cpp",
 ]
 
 # Socket.cpp (Phase 5) links against Winsock's WSAStartup/socket/connect/

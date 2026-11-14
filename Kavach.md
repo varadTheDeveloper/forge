@@ -1,7 +1,7 @@
 # Kavach: permissions in Forge
 
-Kavach is Forge's permission system. This file describes what exists today
-(Phase 8.4), how to use it, and the user-experience rules every later
+Kavach™ is the permission system of Forge™. This file describes what exists today
+(Phase 9.1), how to use it, and the user-experience rules every later
 permission feature must follow (gap G38 in the master plan).
 
 Status: **preview**. Until packages are isolated from each other (Phase 9)
@@ -75,6 +75,21 @@ Every native function Forge exposes to JavaScript is listed, with the
 permission it needs, in `kavach/Ops.h` (rule R2). `forge --self-test` fails
 if a function exists without a row, or a row without a function.
 
+### Loading modules (Phase 9.1)
+
+Loading a program's own code is not a filesystem permission (decision D23
+in `PHASE9_DESIGN.md`). Forge finds the program's **module root**, the
+nearest folder at or above the file you run that holds `forge.json`, or
+else that file's folder, and the program may import modules only from
+there. No option widens it, and `--allow-read` is neither needed nor used
+for it. The home folder and a drive or share root are never module roots.
+
+Every module path goes through the same checks as `fs`: the path rules
+above, the as-written check, link resolution and the protected paths, then
+a handle-based read. Each decision is audited with op `import` and
+permission `module`, so a junction from the program's folder to somewhere
+else, or an import of a file in `.git`, is refused and recorded.
+
 Options such as `{ recursive: true }` are read from the object's own data
 properties only (Phase 8.4): a property inherited from a prototype is
 ignored, so prototype pollution cannot make an operation do more, and an
@@ -108,7 +123,7 @@ The rules every message follows:
    numbers in the first line.
 5. **Machine-readable fields** for programs: `code` (`PermissionDenied` or
    `InvalidArgument`), `permission` (`read`, `write`, `env`, `env (every
-   variable)`), `op`, and `path` or `variable`.
+   variable)`, `module`), `op`, and `path` or `variable`.
 6. **Startup refusals** (an option Forge will not accept) exit with code 2
    before any script runs, and name the option exactly as typed.
 

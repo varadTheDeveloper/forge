@@ -4,11 +4,11 @@
 
 <h1 align="center">Forge</h1>
 
-Forge is an experimental JavaScript runtime built on Mozilla's SpiderMonkey engine.
+Forge™ is an experimental JavaScript runtime built on Mozilla's SpiderMonkey engine.
 
 The project focuses on building a modern JavaScript runtime from the ground up with a native, high-performance architecture instead of layering new APIs over existing runtimes.
 
-Its goal is security: **a program can touch nothing outside itself unless you allow it**, and later each package will get only the permissions it declares. Forge's permission system is called **Kavach**.
+Its goal is security: **a program can touch nothing outside itself unless you allow it**, and later each package will get only the permissions it declares. Forge's permission system is called **Kavach™**.
 
 ## Current Platform
 
@@ -34,6 +34,8 @@ forge.exe --allow-read=data hello.js
 ```
 
 Without `--allow-read`, the file read is refused with a message that names the exact option that would allow it.
+
+Every program is an ES module, so `import`, top-level `await`, JSON modules (`with { type: "json" }`) and `import()` work. A program loads its own modules without any permission, but only from its own folder (the nearest folder with a `forge.json`, or the folder of the file you run); nothing is ever loaded from the network. Packages arrive in Phase 9.2; the plan is in [PHASE9_DESIGN.md](PHASE9_DESIGN.md).
 
 ---
 
@@ -89,3 +91,7 @@ Forge is a much smaller runtime than Bun or Node today, which is part of why it 
 ## License
 
 MIT
+
+---
+
+Forge™ and Kavach™ are trademarks used by the Forge project.

@@ -28,6 +28,7 @@ if a native outside the "may run script code" rows below ran any of them.
 | Promise results of async `fs` functions (`runtime/Fs.cpp`) | If the result is an object (stats, an array, a `Uint8Array`), the engine looks up `then` on it and calls it if a script added one to a prototype | As a Promise job, after the native returned | The operation is finished; nothing depends on the result any more | The program / **open item for Phase 9:** a `then` added to a shared prototype by one package would run when another package's operation finishes. Per-package realms (D17) give each package its own prototypes. |
 | `setTimeout` / `setInterval` delay (`JS::ToNumber`) | `valueOf` / `Symbol.toPrimitive` of the delay argument | Inside the native, **before** the timer is created | Nothing has been changed yet; a throw leaves no timer | The caller |
 | `clearTimeout` / `clearInterval` id (`JS::ToInt32`) | `valueOf` / `Symbol.toPrimitive` of the id | Inside the native, before any timer is looked up | Nothing has been changed yet | The caller |
+| Module evaluation (`runtime/Modules.cpp`, `RunEntryModule`) | The program's modules, including top-level `await` continuations | The entry module runs once, after its whole static graph is loaded and linked; a dynamic `import()` evaluates its module in a promise job | No native is running; a rejected top-level `await` is reported as an uncaught exception by a handler Forge adds | The program / the package that owns the module |
 | `print` (`JS::ToString`) | `toString` / `Symbol.toPrimitive` of each value | Inside the native, while the line is built, before anything is written | A throw leaves nothing written | The caller |
 
 `print` and the timer functions are the only natives that run script code
@@ -48,7 +49,9 @@ with the web; none of them makes a Kavach decision.
 | `Forge.env` names, signal names | Only a string is accepted; nothing is converted. |
 | `Forge.stdout.write`, `Forge.stderr.write` | Same as write data. |
 | Uncaught exceptions | Reported with `JS::ErrorReportBuilder::NoSideEffects`, so a thrown object's `toString` or `message` getter is not called. |
-| `import()` (module load hook, `forge.cpp`) | Phase 8.4: the hook refuses every request and runs no script; the engine then rejects the Promise. (Converting the specifier to a string happens in the engine, as part of `import()` itself, before Forge is asked.) |
+| Module loading (`runtime/Modules.cpp`, the load hook) | Phase 9.1: resolving a specifier, the Kavach check, reading and compiling a file run no script. The specifier string comes from the engine (`JS::GetModuleRequestSpecifier`); for `import(x)` the engine converts `x` to a string itself, as part of `import()`, in the caller's own code, before Forge is asked. A dynamic import finishes in a promise job that reads only the array Forge made for it, which script never sees. |
+| `import.meta` (`runtime/Modules.cpp`, the metadata hook) | Defines `url`, `main` and `resolve` on the object the engine creates; runs no script. |
+| `import.meta.resolve` | Only a string is accepted; nothing is converted. |
 | Self-test natives (`__asyncSelfTestRecord`) | Exist only while `forge --self-test` runs, which runs no user script. |
 
 ## Rules for new code

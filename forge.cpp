@@ -99,6 +99,7 @@
 // Phase 8.3: shared binding helpers and the fs namespace, moved out of this
 // file.
 #include "runtime/Fs.h"
+#include "runtime/Modules.h"
 #include "runtime/JsUtil.h"
 
 using forge::runtime::AsByteSpan;
@@ -205,40 +206,6 @@ static const JSSecurityCallbacks kForgeSecurityCallbacks = {
     nullptr,                     // codeForEvalGets (spec default)
     nullptr,                     // subsumes (single principal for now)
 };
-
-// Phase 8.4: Forge has no module loader yet (modules arrive in Phase 9).
-// With no hook installed, the engine reports an error but leaves the
-// import() Promise pending forever (and the error pending on the context),
-// so `await import("x")` silently stopped the rest of an async function.
-// This hook refuses every request instead; returning false with an error
-// pending makes the engine reject the import() Promise with it.
-static bool RefuseModuleLoad(JSContext* cx, JS::Handle<JSScript*> referrer,
-                             JS::Handle<JSObject*> moduleRequest, JS::Handle<JS::Value> hostDefined,
-                             JS::Handle<JS::Value> payload, uint32_t lineNumber,
-                             JS::ColumnNumberOneOrigin columnNumber) {
-  (void)referrer;
-  (void)hostDefined;
-  (void)payload;
-  (void)lineNumber;
-  (void)columnNumber;
-
-  forge::core::String message;
-  JS::RootedString specifier(cx, JS::GetModuleRequestSpecifier(cx, moduleRequest));
-
-  if (!specifier || message.Append("import(\"").HasError() ||
-      !forge::runtime::AppendStringUtf8(cx, specifier, message) ||
-      message.Append("\"): Forge cannot load modules yet; they arrive in Phase 9").HasError()) {
-    if (!JS_IsExceptionPending(cx)) {
-      JS_ReportOutOfMemory(cx);
-    }
-
-    return false;
-  }
-
-  ThrowTypeError(cx, message.CStr());
-  DefineStringOnPendingError(cx, "code", "NotSupported");
-  return false;
-}
 
 // Appends a saved-frame stack (the stack captured when an exception was
 // thrown) to `out`, one indented frame per line. Appends nothing if there is
@@ -1149,6 +1116,12 @@ forge::core::platform::IoLoop& HostIoLoop(JSContext* cx) { return GetRuntime(cx)
 void HostAsyncStarted(JSContext* cx) { GetRuntime(cx)->OnAsyncOperationStarted(); }
 
 void HostAsyncFinished(JSContext* cx) { GetRuntime(cx)->OnAsyncOperationFinished(); }
+// Phase 9.1 (runtime/Modules.h).
+bool HostExitRequested(JSContext* cx) {
+  (void)cx;
+  return g_exitRequested;
+}
+void HostReportFatal(JSContext* cx, const char* context) { ReportFatalException(cx, context); }
 
 }  // namespace forge::runtime
 
@@ -3759,6 +3732,16 @@ static bool SelfTest_OpTableCoversNatives(JSContext* cx) {
     ok = WalkHostObject(cx, holder, noPrefix, seen, 0) && ok;
   }
 
+  // Phase 9.1: rows for syntax (`import`, `import.meta.resolve`) are not on
+  // the global; the module runtime tests exercise them.
+  for (size_t i = 0; i < forge::kavach::kOpCount; ++i) {
+    const char* rowName = forge::kavach::GetOpInfo(static_cast<forge::kavach::Op>(i)).name;
+
+    if (strncmp(rowName, "import", 6) == 0) {
+      seen[i] = true;
+    }
+  }
+
   for (size_t i = 0; i < forge::kavach::kOpCount; ++i) {
     if (!seen[i]) {
       fprintf(stderr, "  FAIL op table: row %s has no function reachable from JavaScript\n",
@@ -4080,7 +4063,12 @@ static int ForgeMain(int argc, char* argv[]) {
   // Phase 7.9: every eval/new Function/WebAssembly compilation now passes
   // through ForgeCodeGenerationAllowed, so policy has a place to live.
   JS_SetSecurityCallbacks(cx, &kForgeSecurityCallbacks);
-  JS::SetModuleLoadHook(JS_GetRuntime(cx), RefuseModuleLoad);
+  // Phase 9.1: the module loader (runtime/Modules.cpp). Phase 8.4 installed
+  // a hook that refused every import() here, because without one the engine
+  // leaves the import() Promise pending forever.
+  if (!forge::runtime::InitModules(cx)) {
+    return 1;
+  }
 
   if (!JS::InitSelfHostedCode(cx)) {
     return 1;
@@ -4249,43 +4237,32 @@ static int ForgeMain(int argc, char* argv[]) {
 
       const char* scriptArg = argv[argIndex];
 
-      forge::core::Result<forge::core::Path> scriptPath =
-          forge::core::Path::Create(forge::core::StringView(scriptArg));
+      // Phase 9.1 (D22): the program is an ES module. Its module root is
+      // found first; a module outside it can never be loaded (D23).
+      forge::core::String entryPath;
+      forge::core::String setupMessage;
 
-      if (scriptPath.HasError()) {
-        fprintf(stderr, "Forge: invalid script path %s\n", scriptArg);
-        return 1;
-      }
-
-      forge::core::Result<forge::core::String> source =
-          forge::core::File::ReadAllText(scriptPath.Value());
-
-      if (source.HasError()) {
-        fprintf(stderr, "Forge: cannot read %s (error code %d)\n", scriptArg,
-                static_cast<int>(source.Error().Code()));
-        return 1;
-      }
-
-      JS::SourceText<mozilla::Utf8Unit> src;
-
-      if (!src.init(cx, source.Value().Data(), source.Value().Size(),
-                    JS::SourceOwnership::Borrowed)) {
-        return 1;
-      }
-
-      JS::RootedValue rval(cx);
-
-      JS::CompileOptions opts(cx);
-      opts.setFileAndLine(scriptArg, 1);
-
-      if (!JS::Evaluate(cx, opts, src, &rval)) {
-        ReportFatalException(cx, scriptArg);
-        // The script may have already called setTimeout/setInterval before
-        // failing — release those before cx goes away, same reasoning as
-        // the runtime.Shutdown() call after the event loop below.
+      if (!forge::kavach::SetUpProgramModules(forge::core::StringView(scriptArg), entryPath,
+                                              setupMessage)) {
+        forge::core::String line;
+        line.Append("Forge: ").Ignore();
+        line.Append(setupMessage.View()).Ignore();
+        line.Append("\n").Ignore();
+        WriteStderr(line.View());
         StopSignalHandling();
         runtime.Shutdown();
-        // Phase 8: Forge.exit(n) in the main script is not a failure.
+        return 1;
+      }
+
+      if (forge::runtime::RunEntryModule(cx, entryPath.View()) ==
+          forge::runtime::EntryResult::Threw) {
+        ReportFatalException(cx, scriptArg);
+        // The module may have already called setTimeout/setInterval before
+        // failing; release those before cx goes away, same reasoning as the
+        // runtime.Shutdown() call after the event loop below.
+        StopSignalHandling();
+        runtime.Shutdown();
+        // Phase 8: Forge.exit(n) in the main module is not a failure.
         return g_exitRequested ? g_exitCode : 1;
       }
 
@@ -4297,6 +4274,7 @@ static int ForgeMain(int argc, char* argv[]) {
   } // end of the `global`-owning scope — global is destroyed here, cx is still alive.
 
   StopSignalHandling();
+  forge::runtime::ShutdownModules(cx);
   runtime.Shutdown();
   JS_DestroyContext(cx);
   JS_ShutDown();
