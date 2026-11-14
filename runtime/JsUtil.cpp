@@ -405,9 +405,11 @@ bool ThrowKavachDenial(JSContext* cx, forge::kavach::Op op,
   DefineStringOnPendingError(cx, "code", invalidPath ? "InvalidArgument" : "PermissionDenied");
   // For filesystem ops, the access that was refused (Phase 8.3: fs.copyFile
   // reads one path and writes another).
-  const char* permission = isEnv ? forge::kavach::PermissionName(info.permission)
-                           : denial.access == forge::kavach::Access::Write ? "write"
-                                                                           : "read";
+  const char* permission =
+      isEnv || info.permission == forge::kavach::Permission::Module
+          ? forge::kavach::PermissionName(info.permission)
+          : denial.access == forge::kavach::Access::Write ? "write"
+                                                          : "read";
   DefineStringOnPendingError(cx, "permission", permission);
   DefineStringOnPendingError(cx, "op", info.name);
   DefineStringOnPendingError(cx, isEnv ? "variable" : "path", denial.target.View());
