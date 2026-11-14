@@ -280,6 +280,28 @@ declare global {
   function clearInterval(id?: number): void;
   function queueMicrotask(callback: () => void): void;
 
+  // ----------------------------------------------------------- modules ----
+
+  /**
+   * Phase 9.1: every program file is an ES module. Modules load only from
+   * the program's module root (the nearest folder with forge.json, or the
+   * entry's folder); no permission is needed for that, and no read grant
+   * extends it.
+   */
+  interface ImportMeta {
+    /** The module's file: URL, for example "file:///C:/app/src/main.js". */
+    url: string;
+    /** True in the module Forge was started with, false in every other. */
+    main: boolean;
+    /**
+     * The URL `specifier` would load from this module, without loading it.
+     * Throws a ForgeError for a specifier Forge never loads (`node:`, a
+     * package name before Phase 9.2, a network URL). Only strings are
+     * accepted.
+     */
+    resolve(specifier: string): string;
+  }
+
   /**
    * The engine shell's print, kept for older scripts: converts each value
    * with String() (which may run its toString) and writes them on one line.
