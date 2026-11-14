@@ -36,6 +36,7 @@ const char* PermissionName(
     case Permission::Env: return "env";
     case Permission::EnvAll: return "env (every variable)";
     case Permission::ReadWrite: return "read and write";
+    case Permission::Module: return "module";
     }
 
     return "unknown";
@@ -50,6 +51,7 @@ bool OpAllows(
     case Permission::Read: return access == Access::Read;
     case Permission::Write: return access == Access::Write;
     case Permission::ReadWrite: return true;
+    case Permission::Module: return access == Access::Read;
     default: return false;
     }
 }

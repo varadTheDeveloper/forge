@@ -9,6 +9,9 @@
 //     so a missing row is a compile error.
 //   * `forge --self-test` walks every object Forge adds to the global and
 //     fails if it finds a function with no row, or a row with no function.
+// Rows whose name starts with "import" are reached through syntax (`import`,
+// `import()`, `import.meta`), not through the global object; the self-test
+// counts them as present and the module runtime tests exercise them.
 // "None" means the operation touches nothing outside the process (timers,
 // console output, exit). It is still listed, so adding a new native without
 // thinking about its permission is impossible.
@@ -27,6 +30,7 @@ enum class Permission : uint8_t
     Env,     // read one granted environment variable
     EnvAll,  // read every environment variable
     ReadWrite,  // read one path and write another (fs.copyFile: source, destination)
+    Module,  // Phase 9.1: load a module from the program's module root (D23)
 };
 
 /// What a filesystem check asks for. An op with Permission::Read or Write
@@ -103,7 +107,9 @@ bool OpAllows(
     X(ConsoleTimeEnd, "console.timeEnd", None)                   \
     X(ConsoleGroup, "console.group", None)                       \
     X(ConsoleGroupCollapsed, "console.groupCollapsed", None)     \
-    X(ConsoleGroupEnd, "console.groupEnd", None)
+    X(ConsoleGroupEnd, "console.groupEnd", None)                 \
+    X(ModuleImport, "import", Module)                            \
+    X(ImportMetaResolve, "import.meta.resolve", None)
 
 enum class Op : uint16_t
 {

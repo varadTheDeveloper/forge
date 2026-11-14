@@ -59,6 +59,7 @@ struct State
 
     Vector<Grant> readGrants;
     Vector<Grant> writeGrants;
+    Vector<Grant> moduleRoots;  // Phase 9.1 (D23): only Op::ModuleImport uses these
     Vector<String> envNames;
     bool allEnv = false;
 
@@ -74,6 +75,18 @@ State g_state;
 // to record a late refusal. Every audit write holds this lock. The policy
 // itself never changes after Initialize(), so reading it needs no lock.
 forge::core::Mutex g_auditMutex;
+
+/// The grants that decide `op` with `access` (Phase 9.1: module loads use
+/// the module roots, never the read grants).
+const Vector<Grant>& GrantsFor(Op op, Access access) noexcept
+{
+    if (GetOpInfo(op).permission == Permission::Module)
+    {
+        return g_state.moduleRoots;
+    }
+
+    return access == Access::Write ? g_state.writeGrants : g_state.readGrants;
+}
 
 /// The permission an audit record names: the access for filesystem ops,
 /// otherwise the op's own permission.
@@ -905,8 +918,7 @@ public:
 
         // Decide on the path as written first: nothing is opened (and no
         // network share is contacted) for a path no grant could cover.
-        const Vector<Grant>& grants =
-            access == Access::Write ? g_state.writeGrants : g_state.readGrants;
+        const Vector<Grant>& grants = GrantsFor(op, access);
 
         if (IsProtected(lexical.text.View()))
         {
@@ -1086,6 +1098,162 @@ bool Initialize(
     return true;
 }
 
+bool AddModuleRoot(
+    StringView path,
+    String& message) noexcept
+{
+    if (!g_state.initialized)
+    {
+        Append(message, "internal error: module root added before Kavach was initialized");
+        return false;
+    }
+
+    Grant root;
+
+    if (!CanonicalizeOptionPath(path, "the program's folder", root, message))
+    {
+        return false;
+    }
+
+    const StringView resolved = root.resolved.View();
+    const char* refusal = nullptr;
+
+    if (IsRootPath(resolved) || IsRootPath(root.asTyped.View()))
+    {
+        refusal = "it is a whole drive or network share";
+    }
+    else if (!g_state.homeDir.Empty() && PathCovers(resolved, g_state.homeDir.View()))
+    {
+        refusal = "it contains your whole home folder";
+    }
+    else if (IsProtected(resolved))
+    {
+        refusal = "it is a protected path";
+    }
+
+    if (refusal != nullptr)
+    {
+        Append(message, "Forge will not load modules from ");
+        Append(message, resolved);
+        Append(message, ": ");
+        Append(message, refusal);
+        Append(message, ". Move the program into a folder of its own.");
+        return false;
+    }
+
+    if (g_state.moduleRoots.PushBack(std::move(root)).HasError())
+    {
+        Append(message, "out of memory while setting up module loading");
+        return false;
+    }
+
+    return true;
+}
+
+namespace
+{
+
+/// GetFileAttributesW on a canonical path; INVALID_FILE_ATTRIBUTES if it
+/// does not exist or cannot be asked about.
+DWORD AttributesOf(StringView canonical) noexcept
+{
+    Vector<wchar_t> wide;
+
+    if (!ToNtStyleWide(canonical, wide))
+    {
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    return GetFileAttributesW(wide.Data());
+}
+
+bool IsHomeOrAbove(StringView folder) noexcept
+{
+    return !g_state.homeDir.Empty() && PathCovers(folder, g_state.homeDir.View());
+}
+
+} // namespace
+
+bool SetUpProgramModules(
+    StringView entry,
+    String& entryResolved,
+    String& message) noexcept
+{
+    entryResolved.Clear();
+    Grant program;
+
+    if (!CanonicalizeOptionPath(entry, "the program", program, message))
+    {
+        return false;
+    }
+
+    const DWORD attributes = AttributesOf(program.resolved.View());
+
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+    {
+        Append(message, "cannot find the program ");
+        Append(message, program.resolved.View());
+        return false;
+    }
+
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        Append(message, program.resolved.View());
+        Append(message, " is a folder; give the file to run");
+        return false;
+    }
+
+    const StringView folder = ParentPath(program.resolved.View());
+    String root;
+
+    for (StringView f = folder; !IsRootPath(f) && !IsHomeOrAbove(f);)
+    {
+        String manifest;
+
+        if (!Append(manifest, f) || !Append(manifest, "\\") || !Append(manifest, "forge.json"))
+        {
+            Append(message, "out of memory while setting up module loading");
+            return false;
+        }
+
+        const DWORD manifestAttributes = AttributesOf(manifest.View());
+
+        if (manifestAttributes != INVALID_FILE_ATTRIBUTES &&
+            (manifestAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            Append(root, f);
+            break;
+        }
+
+        const StringView parent = ParentPath(f);
+
+        if (parent.Size() == f.Size())
+        {
+            break;
+        }
+
+        f = parent;
+    }
+
+    if (root.Empty())
+    {
+        Append(root, IsRootPath(folder) || IsHomeOrAbove(folder) ? program.resolved.View() : folder);
+    }
+
+    if (!AddModuleRoot(root.View(), message))
+    {
+        return false;
+    }
+
+    entryResolved.Swap(program.resolved);
+    return true;
+}
+
+StringView FirstModuleRoot() noexcept
+{
+    return g_state.moduleRoots.Empty() ? StringView() : g_state.moduleRoots[0].resolved.View();
+}
+
 void Shutdown() noexcept
 {
     if (g_state.audit != INVALID_HANDLE_VALUE)
@@ -1138,8 +1306,7 @@ bool VerifyOpenedPath(
         return false;
     }
 
-    const Vector<Grant>& grants =
-        checked.GetAccess() == Access::Write ? g_state.writeGrants : g_state.readGrants;
+    const Vector<Grant>& grants = GrantsFor(checked.GetOp(), checked.GetAccess());
 
     if (!CoveredByResolved(grants, finalPath))
     {
@@ -1254,7 +1421,15 @@ void FormatDenial(
         Append(message, "Permission denied: ");
         Append(message, info.name);
 
-        if (info.permission == Permission::Read || info.permission == Permission::Write ||
+        if (info.permission == Permission::Module)
+        {
+            Append(message, " cannot load ");
+            Append(message, target);
+            Append(message, ": a program loads modules only from its own folder (");
+            Append(message, FirstModuleRoot());
+            Append(message, "). No option allows other modules; packages arrive in Phase 9.2.");
+        }
+        else if (info.permission == Permission::Read || info.permission == Permission::Write ||
             info.permission == Permission::ReadWrite)
         {
             const bool read = denial.access == Access::Read;

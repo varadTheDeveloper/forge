@@ -71,6 +71,35 @@ bool Initialize(
     const PolicyOptions& options,
     forge::core::String& message) noexcept;
 
+/// Phase 9.1 (D23): adds a module root, the folder (or single file) the
+/// program may load modules from. Loading code is not a filesystem
+/// permission: --allow-read neither adds nor is needed for module roots,
+/// and only Op::ModuleImport checks against them. Call after Initialize and
+/// before any module loads. The same refusals as for grants apply (a drive
+/// or share root, the home folder, a protected path); on failure `message`
+/// explains why.
+[[nodiscard]]
+bool AddModuleRoot(
+    forge::core::StringView path,
+    forge::core::String& message) noexcept;
+
+/// Phase 9.1: sets up module loading for the program `entry` (the script
+/// argument, as typed). The module root is the nearest folder at or above
+/// the entry that contains forge.json, else the entry's folder; never the
+/// home folder or a drive or share root (then the entry file alone is the
+/// root, PHASE9_DESIGN.md section 3). `entryResolved` receives the entry's
+/// canonical, resolved path. On failure `message` explains why, in plain
+/// language, and the program must not start.
+[[nodiscard]]
+bool SetUpProgramModules(
+    forge::core::StringView entry,
+    forge::core::String& entryResolved,
+    forge::core::String& message) noexcept;
+
+/// The first module root, canonical and resolved, for messages; empty when
+/// there is none.
+forge::core::StringView FirstModuleRoot() noexcept;
+
 /// Writes any pending audit summary and closes the audit log.
 void Shutdown() noexcept;
 
