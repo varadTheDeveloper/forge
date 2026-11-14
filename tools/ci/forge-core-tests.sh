@@ -52,6 +52,21 @@ for std in c++17 c++20; do
   fi
 done
 
+# Phase 9.1: module specifier resolution (runtime/ModuleSpecifier.cpp),
+# portable string code like the path rules.
+for std in c++17 c++20; do
+  exe="$out/ModuleSpecifierTest-$std"
+  if (cd .. && g++ -std=$std "${common[@]}" -iquote . runtime/ModuleSpecifierTest.cpp runtime/ModuleSpecifier.cpp \
+        forge-core/memory/DefaultAllocator.cpp forge-core/memory/detail/AllocationBackend.cpp \
+        -o "$exe") && "$exe" > "$exe.log" 2>&1; then
+    echo "[runtime] ModuleSpecifierTest ($std) PASS"
+  else
+    echo "[runtime] ModuleSpecifierTest ($std) FAIL"
+    cat "$exe.log" 2>/dev/null || true
+    failures=$((failures + 1))
+  fi
+done
+
 if [ "$failures" -ne 0 ]; then
   echo "[forge-core] $failures FAILED"
   exit 1

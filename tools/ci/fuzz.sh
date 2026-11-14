@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs Forge's libFuzzer targets for a fixed time each (rule R24). Phase 8.2:
-# the Kavach path rules. A crash or a broken invariant fails the job and
+# the Kavach path rules; Phase 9.1: module specifier resolution. A crash or a broken invariant fails the job and
 # leaves the input that caused it in the working folder ("crash-...").
 #
 # Needs clang with compiler-rt (libFuzzer, ASan, UBSan).
@@ -22,3 +22,15 @@ cp kavach/fuzz/corpus/* "$out/corpus-pathrules/"
 "$out/PathRulesFuzz" -max_total_time="$seconds" -dict=kavach/fuzz/pathrules.dict \
   -print_final_stats=1 "$out/corpus-pathrules"
 echo "[fuzz] PathRulesFuzz: no crash in $seconds s"
+
+mkdir -p "$out/corpus-specifiers"
+cp runtime/fuzz/corpus/* "$out/corpus-specifiers/"
+
+"${CXX:-clang++}" -std=c++17 -g -O1 -fno-exceptions -fsanitize=fuzzer,address,undefined \
+  -fno-sanitize-recover=all -iquote . \
+  runtime/fuzz/ModuleSpecifierFuzz.cpp runtime/ModuleSpecifier.cpp \
+  forge-core/memory/DefaultAllocator.cpp forge-core/memory/detail/AllocationBackend.cpp \
+  -o "$out/ModuleSpecifierFuzz"
+
+"$out/ModuleSpecifierFuzz" -max_total_time="$seconds" -print_final_stats=1 "$out/corpus-specifiers"
+echo "[fuzz] ModuleSpecifierFuzz: no crash in $seconds s"

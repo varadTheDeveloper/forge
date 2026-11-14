@@ -42,6 +42,7 @@ $tests = @(
   @{ Name = "IocpCrossThreadSmokeTest"; Src = "..\IocpCrossThreadSmokeTest.cpp platform\IocpLoop.cpp platform\TimerScheduler.cpp $sync ThreadPool.cpp $mem" },
   @{ Name = "SocketSmokeTest";    Src = "SocketSmokeTest.cpp Socket.cpp $sync $mem"; Link = "ws2_32.lib" },
   @{ Name = "PathRulesTest";      Src = "..\kavach\PathRulesTest.cpp ..\kavach\PathRules.cpp $mem"; Inc = ".." },
+  @{ Name = "ModuleSpecifierTest"; Src = "..\runtime\ModuleSpecifierTest.cpp ..\runtime\ModuleSpecifier.cpp $mem"; Inc = ".." },
   @{ Name = "HostTest";           Src = "platform\HostTest.cpp platform\Unicode.cpp platform\Environment.cpp platform\Stdio.cpp platform\Win32Error.cpp $mem" }
 )
 
