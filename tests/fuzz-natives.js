@@ -1,5 +1,6 @@
 // Phase 8.4 (rule R24): a deterministic fuzzer for every native function
-// Forge exposes to JavaScript.
+// Forge exposes to JavaScript (Phase 9.1: it runs as an ES module, like
+// every program, and also covers import.meta.resolve).
 //
 //   forge --allow-read=<scratch> --allow-write=<scratch> tests/fuzz-natives.js <scratch> [seed] [calls]
 //
@@ -308,6 +309,8 @@ for (const g of ["setTimeout", "setInterval", "clearTimeout", "clearInterval",
   natives.push({ name: g, fn: globalThis[g], self: globalThis });
 }
 natives.push({ name: "Forge.exitCode=", fn(v) { Forge.exitCode = v; }, self: undefined });
+// Phase 9.1: this file is a module, so import.meta.resolve is reachable.
+natives.push({ name: "import.meta.resolve", fn: import.meta.resolve, self: import.meta });
 
 // These may run script code by design (CallSites.md): print converts with
 // ToString and the timer functions convert the delay or id with ToNumber.
@@ -406,8 +409,8 @@ function describe(args) {
 
 out(`fuzz: seed ${seed}, ${totalCalls} calls over ${natives.length} natives`);
 
-if (natives.length < 57) {
-  violation(`only ${natives.length} natives were found; expected at least 57`);
+if (natives.length < 59) {
+  violation(`only ${natives.length} natives were found; expected at least 59`);
 }
 
 for (let i = 0; i < totalCalls; i++) {

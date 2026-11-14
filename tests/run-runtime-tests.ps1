@@ -72,6 +72,22 @@ $fOutside = Join-Path $fRoot "outside"
 New-Item -ItemType Directory -Force -Path $fScratch, $fOutside | Out-Null
 Set-Content -NoNewline -Path (Join-Path $fOutside "secret.txt") -Value "secret-content"
 
+# Phase 9.1: a copy of tests\modules\app in Temp, plus what cannot live in
+# the repository: a junction out of the module root, a .git folder with a
+# module in it, and modules next to the root that must never load.
+$mRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-module-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$mApp = Join-Path $mRoot "app"
+$mOutside = Join-Path $mRoot "outside"
+$mOutLink = Join-Path $mApp "out-link"
+$mAudit = Join-Path $mRoot "audit.jsonl"
+New-Item -ItemType Directory -Force -Path $mRoot, $mOutside | Out-Null
+Copy-Item -Recurse -Path (Join-Path $here "modules\app") -Destination $mApp
+New-Item -ItemType Directory -Force -Path (Join-Path $mApp ".git") | Out-Null
+Set-Content -NoNewline -Path (Join-Path $mApp ".git\hook.js") -Value "export default 'SHOULD NOT LOAD hook';"
+Set-Content -NoNewline -Path (Join-Path $mOutside "evil.js") -Value "export default 'SHOULD NOT LOAD evil';"
+Set-Content -NoNewline -Path (Join-Path $mRoot "outside.js") -Value "export default 'SHOULD NOT LOAD outside';"
+cmd /c mklink /J "$mOutLink" "$mOutside" | Out-Null
+
 # What a folder holds, for "nothing changed" checks.
 function Get-TreeListing([string]$Path) {
   (Get-ChildItem -LiteralPath $Path -Recurse -Force -Attributes !ReparsePoint |
@@ -171,6 +187,28 @@ $cases = @(
        if ($top -ne "outside,scratch") { $p += "the fuzzer created $top next to its scratch folder" }
        $p
      } },
+  @{ Name = "modules (9.1)"; File = (Join-Path $mApp "src\main.js"); Exit = 0;
+     Has = @("add: 5", "live binding: 1", "same module: true", "side effect runs: 1", "json: forge 3",
+             "shared: ROOT", "bom: bom-ok", "meta url: true true", "meta main: true", "resolve: true",
+             "strict: true", "tla: tla-ok", "dynamic: dyn-ok main=false", "import is async: sync,after,import",
+             "refused node: NotSupported", "refused bare: NotSupported", "refused https: NotSupported",
+             "refused query: InvalidArgument", "refused windows path: InvalidArgument",
+             "refused json without type: InvalidArgument", "refused css type: ",
+             "refused missing: NotFound", "refused escape: PermissionDenied", "refused file url: PermissionDenied",
+             "refused junction: PermissionDenied", "refused protected: PermissionDenied",
+             "refused syntax: SyntaxError", "throws: module threw", "resolve number: InvalidArgument",
+             "modules done");
+     Not = @("SHOULD NOT"); Pre = @("--audit-log=$mAudit");
+     Check = {
+       $log = Get-Content -Raw -Encoding UTF8 $mAudit
+       $p = @()
+       foreach ($t in @('"op":"import"', '"permission":"module"', '"decision":"allow"', '"decision":"deny"', '"reason":"protected"', '"reason":"not-granted"')) {
+         if (-not $log.Contains($t)) { $p += "audit log lacks $t" }
+       }
+       $p
+     } },
+  @{ File = "tla-reject.js";             Exit = 1; Has = @("before await", "late boom from top-level await", "the main module"); Not = @() },
+  @{ File = "import-missing.js";         Exit = 1; Has = @("Cannot find module", "does-not-exist.js"); Not = @("SHOULD NOT RUN") },
   # Last: it removes the junction the earlier cases use.
   @{ File = "kavach-links.js";           Exit = 0; Has = @("hardlink: PermissionDenied explained", "junction removed: true", "plain: plain-ok");
      Not = @("SHOULD NOT WRITE");
@@ -188,7 +226,9 @@ $cases = @(
 $failures = 0
 
 foreach ($c in $cases) {
-  $script = Join-Path $here $c.File
+  # Phase 9.1: File may be a full path (the module tree is copied to Temp).
+  $script = if ([System.IO.Path]::IsPathRooted($c.File)) { $c.File } else { Join-Path $here $c.File }
+  $label = if ($c.Name) { $c.Name } else { $c.File }
   $outFile = [System.IO.Path]::GetTempFileName()
   $errFile = [System.IO.Path]::GetTempFileName()
 
@@ -217,10 +257,10 @@ foreach ($c in $cases) {
   if ($c.Check) { $problems += @(& $c.Check) }
 
   if ($problems.Count -eq 0) {
-    Write-Host ("[runtime-test] {0,-30} PASS" -f $c.File)
+    Write-Host ("[runtime-test] {0,-30} PASS" -f $label)
   } else {
     $failures++
-    Write-Host ("[runtime-test] {0,-30} FAIL: {1}" -f $c.File, ($problems -join "; "))
+    Write-Host ("[runtime-test] {0,-30} FAIL: {1}" -f $label, ($problems -join "; "))
     Write-Host "  output was:"
     Write-Host $output
   }
@@ -233,10 +273,36 @@ foreach ($c in $cases) {
 # that ended the script before it reported success.)
 # Windows PowerShell 5.1's Remove-Item -Recurse can follow a junction, so
 # every junction goes before the trees are removed.
-foreach ($j in @($kLink, $rOutLink, $rGitLink)) {
-  if (Test-Path -LiteralPath $j) { [System.IO.Directory]::Delete($j) }
+foreach ($j in @($kLink, $rOutLink, $rGitLink, $mOutLink)) {
+  try {
+    if (Test-Path -LiteralPath $j) { [System.IO.Directory]::Delete($j) }
+  } catch {
+    Write-Host "[runtime-test] note: could not remove the junction $j ($($_.Exception.Message))"
+  }
 }
-Remove-Item -Recurse -Force $kRoot, $rRoot, $fRoot -ErrorAction SilentlyContinue
+
+# Phase 9.1: the native fuzzer can create folders nested deeper than 260
+# characters (Forge supports long paths), which Windows PowerShell 5.1's
+# Remove-Item cannot delete ("The system cannot find the file specified",
+# a terminating error that -ErrorAction does not catch). rd with the \\?\
+# prefix handles long paths. Folders left by earlier runs are removed too.
+# A cleanup problem is reported but never fails the run, so from here on
+# errors do not stop the script (rd writes to stderr for files in use).
+$ErrorActionPreference = "Continue"
+$roots = @($kRoot, $rRoot, $fRoot, $mRoot)
+$roots += @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module)-test-[0-9a-f]{8}$' } |
+            ForEach-Object { $_.FullName })
+foreach ($root in ($roots | Select-Object -Unique)) {
+  try {
+    if (Test-Path -LiteralPath $root) {
+      cmd /c rd /s /q "\\?\$root" 2>&1 | Out-Null
+      if (Test-Path -LiteralPath $root) { Write-Host "[runtime-test] note: could not remove $root" }
+    }
+  } catch {
+    Write-Host "[runtime-test] note: could not remove $root ($($_.Exception.Message))"
+  }
+}
 Remove-Item Env:\FORGE_KAVACH_TEST, Env:\FORGE_REPLAY_GRANTED -ErrorAction SilentlyContinue
 
 if ($failures -eq 0) {
