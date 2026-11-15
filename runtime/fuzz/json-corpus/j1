@@ -1,0 +1,1 @@
+{"name":"greet","version":"1.0.0","exports":{".":"./index.js","./extra":{"forge":"./a.js","default":"./b.js"}},"dependencies":{"u":"file:../u"}}
