@@ -88,6 +88,19 @@ Set-Content -NoNewline -Path (Join-Path $mOutside "evil.js") -Value "export defa
 Set-Content -NoNewline -Path (Join-Path $mRoot "outside.js") -Value "export default 'SHOULD NOT LOAD outside';"
 cmd /c mklink /J "$mOutLink" "$mOutside" | Out-Null
 
+# Phase 9.2: a copy of tests\packages\app in Temp, a package outside it that
+# only the program itself may use, and a program with an invalid forge.json.
+$pRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-package-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$pApp = Join-Path $pRoot "app"
+$pOutside = Join-Path $pRoot "outside-pkg"
+$pBad = Join-Path $pRoot "bad-app"
+New-Item -ItemType Directory -Force -Path $pRoot, $pOutside, $pBad | Out-Null
+Copy-Item -Recurse -Path (Join-Path $here "packages\app") -Destination $pApp
+Set-Content -NoNewline -Path (Join-Path $pOutside "forge.json") -Value '{ "name": "outside", "exports": "./index.js" }'
+Set-Content -NoNewline -Path (Join-Path $pOutside "index.js") -Value 'export default "outside-ok";'
+Set-Content -NoNewline -Path (Join-Path $pBad "forge.json") -Value '{ "dependancies": {} }'
+Set-Content -NoNewline -Path (Join-Path $pBad "main.js") -Value 'console.log("SHOULD NOT RUN");'
+
 # What a folder holds, for "nothing changed" checks.
 function Get-TreeListing([string]$Path) {
   (Get-ChildItem -LiteralPath $Path -Recurse -Force -Attributes !ReparsePoint |
@@ -191,7 +204,7 @@ $cases = @(
      Has = @("add: 5", "live binding: 1", "same module: true", "side effect runs: 1", "json: forge 3",
              "shared: ROOT", "bom: bom-ok", "meta url: true true", "meta main: true", "resolve: true",
              "strict: true", "tla: tla-ok", "dynamic: dyn-ok main=false", "import is async: sync,after,import",
-             "refused node: NotSupported", "refused bare: NotSupported", "refused https: NotSupported",
+             "refused node: NotSupported", "refused bare: NotFound", "refused https: NotSupported",
              "refused query: InvalidArgument", "refused windows path: InvalidArgument",
              "refused json without type: InvalidArgument", "refused css type: ",
              "refused missing: NotFound", "refused escape: PermissionDenied", "refused file url: PermissionDenied",
@@ -209,6 +222,19 @@ $cases = @(
      } },
   @{ File = "tla-reject.js";             Exit = 1; Has = @("before await", "late boom from top-level await", "the main module"); Not = @() },
   @{ File = "import-missing.js";         Exit = 1; Has = @("Cannot find module", "does-not-exist.js"); Not = @("SHOULD NOT RUN") },
+  @{ Name = "packages (9.2)"; File = (Join-Path $pApp "src\main.js"); Exit = 0;
+     Has = @("greet: HELLO FROM GREET", "condition: forge self: forge", "pattern: alpha",
+             "one util instance: true", "outside: outside-ok", "resolve: true",
+             "refused not exported: PermissionDenied", "refused private: PermissionDenied",
+             "refused into a package by path: PermissionDenied", "refused package escaping by path: PermissionDenied",
+             "refused undeclared: NotFound", "refused dependency outside the program: PermissionDenied",
+             "refused duplicate key: InvalidData", "refused misnamed: InvalidData", "refused phantom: NotFound",
+             "refused no exports: PermissionDenied", "refused invalid name: InvalidArgument",
+             "refused unsafe subpath: InvalidArgument", "refused self without exports: PermissionDenied",
+             "resolve not exported: PermissionDenied", "packages done");
+     Not = @("SHOULD NOT") },
+  @{ Name = "bad forge.json (9.2)"; File = (Join-Path $pBad "main.js"); Exit = 1;
+     Has = @("forge.json is not valid", "unknown field ""dependancies"""); Not = @("SHOULD NOT RUN") },
   # Last: it removes the junction the earlier cases use.
   @{ File = "kavach-links.js";           Exit = 0; Has = @("hardlink: PermissionDenied explained", "junction removed: true", "plain: plain-ok");
      Not = @("SHOULD NOT WRITE");
@@ -289,9 +315,9 @@ foreach ($j in @($kLink, $rOutLink, $rGitLink, $mOutLink)) {
 # A cleanup problem is reported but never fails the run, so from here on
 # errors do not stop the script (rd writes to stderr for files in use).
 $ErrorActionPreference = "Continue"
-$roots = @($kRoot, $rRoot, $fRoot, $mRoot)
+$roots = @($kRoot, $rRoot, $fRoot, $mRoot, $pRoot)
 $roots += @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module)-test-[0-9a-f]{8}$' } |
+            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module|package)-test-[0-9a-f]{8}$' } |
             ForEach-Object { $_.FullName })
 foreach ($root in ($roots | Select-Object -Unique)) {
   try {
