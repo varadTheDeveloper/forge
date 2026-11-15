@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs Forge's libFuzzer targets for a fixed time each (rule R24). Phase 8.2:
-# the Kavach path rules; Phase 9.1: module specifier resolution. A crash or a broken invariant fails the job and
+# the Kavach path rules; Phase 9.1: module specifier resolution; Phase 9.2:
+# the JSON parser and forge.json. A crash or a broken invariant fails the job and
 # leaves the input that caused it in the working folder ("crash-...").
 #
 # Needs clang with compiler-rt (libFuzzer, ASan, UBSan).
@@ -34,3 +35,20 @@ cp runtime/fuzz/corpus/* "$out/corpus-specifiers/"
 
 "$out/ModuleSpecifierFuzz" -max_total_time="$seconds" -print_final_stats=1 "$out/corpus-specifiers"
 echo "[fuzz] ModuleSpecifierFuzz: no crash in $seconds s"
+
+for target in JsonFuzz:json ManifestFuzz:manifest; do
+  name="${target%%:*}"
+  corpus="$out/corpus-${target##*:}"
+  mkdir -p "$corpus"
+  cp "runtime/fuzz/${target##*:}-corpus/"* "$corpus/"
+  extra=runtime/Json.cpp
+  [ "$name" = "ManifestFuzz" ] && extra="runtime/Manifest.cpp runtime/Json.cpp"
+  # shellcheck disable=SC2086
+  "${CXX:-clang++}" -std=c++17 -g -O1 -fno-exceptions -fsanitize=fuzzer,address,undefined \
+    -fno-sanitize-recover=all -iquote . \
+    "runtime/fuzz/$name.cpp" $extra \
+    forge-core/memory/DefaultAllocator.cpp forge-core/memory/detail/AllocationBackend.cpp \
+    -o "$out/$name"
+  "$out/$name" -max_total_time="$seconds" -print_final_stats=1 "$corpus"
+  echo "[fuzz] $name: no crash in $seconds s"
+done

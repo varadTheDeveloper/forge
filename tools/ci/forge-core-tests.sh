@@ -52,20 +52,27 @@ for std in c++17 c++20; do
   fi
 done
 
-# Phase 9.1: module specifier resolution (runtime/ModuleSpecifier.cpp),
-# portable string code like the path rules.
-for std in c++17 c++20; do
-  exe="$out/ModuleSpecifierTest-$std"
-  if (cd .. && g++ -std=$std "${common[@]}" -iquote . runtime/ModuleSpecifierTest.cpp runtime/ModuleSpecifier.cpp \
-        forge-core/memory/DefaultAllocator.cpp forge-core/memory/detail/AllocationBackend.cpp \
-        -o "$exe") && "$exe" > "$exe.log" 2>&1; then
-    echo "[runtime] ModuleSpecifierTest ($std) PASS"
-  else
-    echo "[runtime] ModuleSpecifierTest ($std) FAIL"
-    cat "$exe.log" 2>/dev/null || true
-    failures=$((failures + 1))
-  fi
-done
+# Phase 9.1 and 9.2: portable runtime code (module specifiers, the JSON
+# parser, forge.json), string code like the path rules.
+runtime_test() {
+  local name="$1"; shift
+  for std in c++17 c++20; do
+    exe="$out/$name-$std"
+    if (cd .. && g++ -std=$std "${common[@]}" -iquote . "runtime/$name.cpp" "$@" \
+          forge-core/memory/DefaultAllocator.cpp forge-core/memory/detail/AllocationBackend.cpp \
+          -o "$exe") && "$exe" > "$exe.log" 2>&1; then
+      echo "[runtime] $name ($std) PASS"
+    else
+      echo "[runtime] $name ($std) FAIL"
+      cat "$exe.log" 2>/dev/null || true
+      failures=$((failures + 1))
+    fi
+  done
+}
+
+runtime_test ModuleSpecifierTest runtime/ModuleSpecifier.cpp
+runtime_test JsonTest runtime/Json.cpp
+runtime_test ManifestTest runtime/Manifest.cpp runtime/Json.cpp
 
 if [ "$failures" -ne 0 ]; then
   echo "[forge-core] $failures FAILED"

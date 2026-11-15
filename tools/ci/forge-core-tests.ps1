@@ -43,6 +43,8 @@ $tests = @(
   @{ Name = "SocketSmokeTest";    Src = "SocketSmokeTest.cpp Socket.cpp $sync $mem"; Link = "ws2_32.lib" },
   @{ Name = "PathRulesTest";      Src = "..\kavach\PathRulesTest.cpp ..\kavach\PathRules.cpp $mem"; Inc = ".." },
   @{ Name = "ModuleSpecifierTest"; Src = "..\runtime\ModuleSpecifierTest.cpp ..\runtime\ModuleSpecifier.cpp $mem"; Inc = ".." },
+  @{ Name = "JsonTest";           Src = "..\runtime\JsonTest.cpp ..\runtime\Json.cpp $mem"; Inc = ".." },
+  @{ Name = "ManifestTest";       Src = "..\runtime\ManifestTest.cpp ..\runtime\Manifest.cpp ..\runtime\Json.cpp $mem"; Inc = ".." },
   @{ Name = "HostTest";           Src = "platform\HostTest.cpp platform\Unicode.cpp platform\Environment.cpp platform\Stdio.cpp platform\Win32Error.cpp $mem" }
 )
 
