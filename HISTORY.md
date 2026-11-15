@@ -3816,3 +3816,63 @@ without failing the run. The next run ended with `ALL PASSED`.
 
 **Also:** "Forge™" and "Kavach™" in the README and `Kavach.md` (unregistered
 trademarks; ® is never used without a registration).
+
+## Phase 9.2: packages (2026-11-15)
+
+A program can now be made of packages: folders with `forge.json`, imported
+by name. PHASE9_DESIGN.md section 4 has the rules; this entry records what
+was built.
+
+**New portable code (unit-tested in both CI test jobs, fuzzed in the CI
+fuzz job):**
+- `runtime/Json.cpp`: a strict JSON parser for untrusted configuration
+  (D5). Refuses duplicate keys, invalid UTF-8, lone surrogates, comments,
+  trailing commas, nesting deeper than 64 levels and files over 1 MiB, so a
+  manifest cannot mean two things to two parsers. Keeps member order.
+  49 unit checks; the fuzzer writes every accepted document back out and
+  checks it parses to the same structure.
+- `runtime/Manifest.cpp`: forge.json validation (unknown fields refused,
+  npm-style names, `file:` dependencies only until Phase 14), bare
+  specifier splitting, and `exports` resolution with Node.js semantics
+  (subpath maps, one `*` per key with the longest-prefix rule, conditions
+  `forge`/`import`/`default` in object order, `null` for private subpaths,
+  targets that can never leave the package). 79 unit checks; the fuzzer
+  checks that no resolved target ever leaves the package.
+
+**Kavach:** `CheckManifest` (forge.json stays protected; the loader reads
+it only from a module root, never through a link, and audits the read),
+`ResolvePackageFolder`, and `FindInnerPackageRoot` (the package a file
+belongs to).
+
+**Loader (`runtime/Modules.cpp`):**
+- The program is package 0; each dependency becomes a package, and its
+  folder a module root, when first imported.
+- Bare specifiers resolve only to the package itself or to a declared
+  dependency, through `exports`. Undeclared (phantom) dependencies, private
+  or unexported subpaths, packages without `exports`, invalid names and
+  unsafe subpaths are refused with plain messages and error codes.
+- Every module belongs to exactly one package. A relative or `file:` import
+  that reaches into another package (or out of a dependency into the
+  program) is refused, including when the module was already loaded.
+- Only the program's own forge.json may name a folder outside the
+  program's folder; this is checked before the package cache, so a folder
+  the program named does not become reachable from a dependency.
+- An invalid forge.json in the program stops it at startup with the reason.
+- `import.meta.resolve()` resolves package names too.
+
+**Tests.** A package tree (`tests/packages/`) copied to Temp by the
+runner: an exports map with a condition, a pattern, a private entry and a
+self-reference; a scoped package shared by two importers (one instance);
+an app-declared package outside the program's folder; and refusals for a
+dependency naming an outside folder, an undeclared package, a duplicate
+key, a mismatched name, a phantom import, a package without exports, an
+invalid name, an unsafe subpath, importing into a package by path and a
+package escaping by path. A second case checks that a misspelt field in
+the program's forge.json stops it with a clear message. The 9.1 test now
+expects `NotFound` for an undeclared package name.
+
+**Verified** on Varad's machine: all 64 self-tests and all 31 runtime tests
+passed on the first run. The build reported two `-Wcomma` warnings in
+`Manifest.cpp` (an error message joined to `return false` with a comma);
+they were rewritten as two statements, with no change in behaviour, and
+checked with `-Wcomma` against the engine headers.

@@ -1,8 +1,8 @@
 # Phase 9 design: modules, packages and per-package permissions
 
-Status: design, 2026-11-14. Step 9.1 is being built; 9.2 to 9.4 follow this
-document and may refine it, with every change recorded here and in
-`HISTORY.md`.
+Status: 2026-11-15. Step 9.1 is done; 9.2 is being built; 9.3 and 9.4
+follow this document and may refine it, with every change recorded here
+and in `HISTORY.md`.
 
 Phase 9 turns Forge from "one script with one policy" into "an app made of
 packages, each holding only the permissions it was given". It is the step
@@ -136,20 +136,71 @@ be written in full, as in browsers.
 
 ## 4. Packages and resolution (step 9.2)
 
-- A package is a folder with `forge.json`: `name`, `version`, `exports`,
-  `dependencies`, `permissions` (9.4). The file name is one constant in the
-  code (`kManifestName`), so the D1 naming decision stays a one-line change.
-- A bare specifier resolves only to a package listed in the importing
-  package's `dependencies` (no phantom dependencies). Until the package
-  manager exists (Phase 14), a dependency is a local folder:
-  `"dependencies": { "b": "file:./vendor/b" }`.
-- Subpaths only through the dependency's `exports` (conditions `forge`,
-  `import`, `default`, in that order); a path not exported is refused.
-- `forge.json` is parsed in C++ (D5: Rust later for untrusted parsers), not
-  by evaluating JavaScript.
-- Each package's folder becomes a module root for its own modules only: a
-  package cannot import a file of another package except through that
-  package's `exports`.
+**The manifest.** A package is a folder with `forge.json`:
+
+```json
+{
+  "name": "greet",
+  "version": "1.0.0",
+  "exports": {
+    ".": "./index.js",
+    "./extra": { "forge": "./extra-forge.js", "default": "./extra.js" },
+    "./features/*": "./features/*.js",
+    "./internal": null
+  },
+  "dependencies": { "@acme/util": "file:../util" },
+  "permissions": {}
+}
+```
+
+- Fields: `name` (required for a dependency; npm-style lower-case names,
+  optionally `@scope/`), `version`, `description`, `license`, `author`,
+  `exports`, `dependencies`, and `permissions` / `grants` (structure only;
+  their meaning comes in 9.4). **Any other field is refused** with a plain
+  message, so a misspelt `dependancies` or a `scripts` field Forge would
+  never run is not silently ignored. `main`, `module` and `type` get a hint
+  to use `exports`.
+- Parsed by `runtime/Json.cpp`, a small strict JSON parser (D5: fuzzed C++,
+  not the engine): duplicate keys, invalid UTF-8, lone surrogates, comments,
+  trailing commas, more than 64 levels or more than 1 MiB are refused,
+  because another parser could read such a file differently. The file name
+  is one constant (`kManifestName`), so the D1 naming decision stays a
+  one-line change.
+- forge.json is a protected path (R13): no grant covers it. The loader
+  reads it through `kavach::CheckManifest`, which requires the folder to be
+  a module root and forge.json to be a plain file there (not a link), and
+  audits the read.
+
+**Resolution.**
+
+- A bare specifier resolves only to the package itself (a self-reference
+  through its own `exports`) or to a package listed in the importing
+  package's `dependencies`: no phantom dependencies. Until the package
+  manager exists (Phase 14), a dependency is a local folder,
+  `"file:<folder>"`, relative to the declaring package.
+- **Only the program's own forge.json may name a folder outside the
+  program's folder.** A dependency's `file:` folder must be inside it, so a
+  dependency cannot pull code from elsewhere on the disk. The folder must
+  hold a forge.json whose `name` matches the dependency's name.
+- Subpaths only through `exports`, with Node.js semantics: a string, a
+  subpath map (`"."`, `"./x"`, one `*` per key), condition objects, and
+  `null` for a private subpath. Forge's conditions are `forge`, `import` and
+  `default`, chosen in the order the object lists them (as Node.js does), so
+  `{ "default": ..., "forge": ... }` picks `default`. Targets must start
+  with `./` and contain no `.`, `..`, `node_modules`, `\`, `%` or `:`
+  segment; a pattern substitution that would produce one is refused.
+  Arrays of fallbacks are refused for now. A package without `exports`
+  exposes nothing.
+- **Every module belongs to exactly one package:** the nearest folder with
+  forge.json above it. A relative or `file:` import must stay in the
+  importing module's package. Reaching into another package by path (the
+  program importing `./vendor/greet/internal.js`, or a dependency importing
+  `../../src/main.js`) is refused; the only way in is the package's name and
+  `exports`. A module already loaded for one package is never handed to
+  another by path.
+- Each dependency folder becomes a Kavach module root when it is first
+  used, with the same refusals as any module root (not a drive root, not
+  the home folder, not protected).
 
 ## 5. Isolation (step 9.3)
 

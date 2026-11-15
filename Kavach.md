@@ -1,7 +1,7 @@
 # Kavach: permissions in Forge
 
 Kavach™ is the permission system of Forge™. This file describes what exists today
-(Phase 9.1), how to use it, and the user-experience rules every later
+(Phase 9.2), how to use it, and the user-experience rules every later
 permission feature must follow (gap G38 in the master plan).
 
 Status: **preview**. Until packages are isolated from each other (Phase 9)
@@ -83,6 +83,13 @@ nearest folder at or above the file you run that holds `forge.json`, or
 else that file's folder, and the program may import modules only from
 there. No option widens it, and `--allow-read` is neither needed nor used
 for it. The home folder and a drive or share root are never module roots.
+
+Phase 9.2: each package the program uses (a folder with forge.json named
+in `"dependencies"`) becomes a module root too, the first time it is
+imported. Only the program's own forge.json may name a folder outside the
+program's folder. forge.json itself stays protected; the loader reads it
+through a dedicated check that refuses a forge.json that is a link and
+records the read in the audit log.
 
 Every module path goes through the same checks as `fs`: the path rules
 above, the as-written check, link resolution and the protected paths, then

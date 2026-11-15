@@ -22,7 +22,9 @@ SOURCES += [
     "runtime/Console.cpp",
     "runtime/Fs.cpp",
     "runtime/Inspect.cpp",
+    "runtime/Json.cpp",
     "runtime/JsUtil.cpp",
+    "runtime/Manifest.cpp",
     "runtime/Modules.cpp",
     "runtime/ModuleSpecifier.cpp",
 ]
