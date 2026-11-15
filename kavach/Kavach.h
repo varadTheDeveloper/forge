@@ -15,9 +15,11 @@
 //       forge.lock, the audit log or Forge's install folder; a grant of a
 //       drive root, a share root or the home folder is refused.
 //
-// Until packages exist (Phase 9) there is one policy, for the whole
-// program, built once from the command line before any script runs.
-// It never changes afterwards.
+// The program's policy is built once from the command line before any
+// script runs, and never changes afterwards. Phase 9.4: each package gets a
+// policy of its own (AddPackagePolicy) when it is first loaded; a package
+// may use a path or variable only if its forge.json declares it, the
+// program's forge.json grants it, and the command line allows it (D26).
 //
 // Known limits of this step (documented in HISTORY.md, "Phase 8.2"):
 //   * Paths are checked, then opened by name. A link swapped in between can
@@ -121,6 +123,56 @@ void FindInnerPackageRoot(
 /// there is none.
 forge::core::StringView FirstModuleRoot() noexcept;
 
+/// Phase 9.4: one package's permissions, what it declared in its forge.json
+/// "permissions" and what the program's forge.json "grants" it. Made by
+/// AddPackagePolicy and never changed or freed before Shutdown, so a
+/// pointer to it is a stable identity: the realm of the package's natives
+/// and every CheckedPath made for it keep one. A null policy is the
+/// program's own (the command line alone).
+class PackagePolicy;
+
+/// Lists as written in forge.json; paths are relative to the program's
+/// folder (only a grant may be absolute).
+struct PermissionLists
+{
+    forge::core::Vector<forge::core::String> read;
+    forge::core::Vector<forge::core::String> write;
+    forge::core::Vector<forge::core::String> env;
+};
+
+/// Registers the policy of the package `name`. Paths are resolved against
+/// `programRoot`, with the same refusals as a command-line grant (a drive
+/// or share root, the home folder, a protected path). The policy is
+/// recorded in the audit log. On failure `message` says which entry is
+/// wrong and why.
+[[nodiscard]]
+bool AddPackagePolicy(
+    forge::core::StringView name,
+    forge::core::StringView programRoot,
+    const PermissionLists& declared,
+    const PermissionLists& granted,
+    const PackagePolicy*& out,
+    forge::core::String& message) noexcept;
+
+/// True if something the package declared is also granted to it (it then
+/// runs in a compartment of its own, with Forge's natives bound to it).
+bool HoldsPermission(
+    const PackagePolicy* policy) noexcept;
+
+/// The package's name; empty for the program and for NoPermissionPolicy.
+forge::core::StringView PolicyPackageName(
+    const PackagePolicy* policy) noexcept;
+
+/// What the package declared that the program did not grant, as
+/// "read C:\app\data, env HOME"; empty if nothing.
+void DescribeUngranted(
+    const PackagePolicy* policy,
+    forge::core::String& out) noexcept;
+
+/// The policy of code that holds no permission (the shared compartment of
+/// the permission-free packages): every check is refused.
+const PackagePolicy* NoPermissionPolicy() noexcept;
+
 /// Writes any pending audit summary and closes the audit log.
 void Shutdown() noexcept;
 
@@ -151,6 +203,11 @@ public:
     /// (CheckManifest), the one case where a protected file is opened.
     bool IsManifest() const noexcept { return manifest_; }
 
+    /// Phase 9.4: the policy the path was checked against (null for the
+    /// program). The re-check on the opened handle uses the same one, so
+    /// async work keeps the authority of the code that started it.
+    const PackagePolicy* Policy() const noexcept { return policy_; }
+
 private:
     friend class Checker;
 
@@ -159,6 +216,7 @@ private:
     Op op_ = Op::Count;
     Access access_ = Access::Read;
     bool manifest_ = false;
+    const PackagePolicy* policy_ = nullptr;
 };
 
 /// Why an operation was refused; turned into a message by FormatDenial.
@@ -177,9 +235,23 @@ struct Denial
         Changed,       // 8.3: the path led somewhere else when it was opened
     };
 
+    /// Phase 9.4: for a package's NotGranted, which of the three layers
+    /// (D26) refused.
+    enum class Layer
+    {
+        None,         // the program's own check
+        NotDeclared,  // the package's forge.json does not ask for it
+        NotGranted,   // the program's forge.json does not grant it
+        CommandLine,  // granted, but the command line does not allow it
+    };
+
     Kind kind = Kind::None;
     PathError pathError = PathError::None;
     Access access = Access::Read;
+    Layer layer = Layer::None;
+
+    /// Phase 9.4: the package whose policy refused; empty for the program.
+    forge::core::String package;
 
     /// The canonical path (or the variable name); the input as typed when
     /// it could not be canonicalized.
@@ -199,6 +271,16 @@ forge::core::Result<CheckedPath> CheckPath(
 /// access (fs.copyFile reads its source and writes its destination).
 [[nodiscard]]
 forge::core::Result<CheckedPath> CheckPath(
+    Op op,
+    Access access,
+    forge::core::StringView path,
+    Denial& denial) noexcept;
+
+/// Phase 9.4: the same, for code that runs under `policy` (null: the
+/// program). Module loading (Op::ModuleImport) ignores the policy.
+[[nodiscard]]
+forge::core::Result<CheckedPath> CheckPath(
+    const PackagePolicy* policy,
     Op op,
     Access access,
     forge::core::StringView path,
@@ -233,16 +315,20 @@ void RecordLateDenial(
     Denial::Kind kind,
     forge::core::StringView target) noexcept;
 
-/// Checks that `op` may read the environment variable `name`.
+/// Checks that `op` may read the environment variable `name`, for code
+/// that runs under `policy` (null: the program).
 [[nodiscard]]
 forge::core::Result<void> CheckEnv(
+    const PackagePolicy* policy,
     Op op,
     forge::core::StringView name,
     Denial& denial) noexcept;
 
-/// Checks that `op` may read every environment variable.
+/// Checks that `op` may read every environment variable. A package never
+/// may (Phase 9.4): it reads only the variables it names.
 [[nodiscard]]
 forge::core::Result<void> CheckEnvAll(
+    const PackagePolicy* policy,
     Op op,
     Denial& denial) noexcept;
 
