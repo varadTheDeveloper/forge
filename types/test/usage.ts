@@ -12,6 +12,7 @@ Forge.exitCode = 3;
 const v: string | undefined = Forge.env.get("PATH");
 Forge.addSignalListener("SIGINT", (s) => { Forge.stdout.write(s); });
 try { fs.rmSync("d", { recursive: true }); } catch (err) { const fe = err as ForgeError; if (fe.code === "PermissionDenied") print(fe.permission); }
+try { fs.readFileSync("x"); } catch (err) { const fe = err as ForgeError; const who: string | undefined = fe.package; print(who ?? "the program"); }
 queueMicrotask(() => {});
 // @ts-expect-error  Forge is frozen
 Forge.version = "x";
