@@ -3,8 +3,10 @@
 // Compartments (Phase 9.3, PHASE9_DESIGN.md section 5, decision D25).
 //
 // The program runs in the app compartment. Every dependency runs in another
-// compartment of the same zone; in 9.3 that is one shared "pure"
-// compartment, because no dependency can hold a permission before 9.4.
+// compartment of the same zone: one shared "pure" compartment for the
+// packages that hold no permission, and (Phase 9.4) one compartment per
+// package that holds one, whose Forge natives act with that package's
+// policy alone (D24).
 //
 // What this file enforces:
 //   - Lockdown: in a dependency compartment every intrinsic (every object
@@ -30,6 +32,11 @@
 #include "forge-core/Types.h"
 #include "forge-core/memory/Vector.h"
 
+namespace forge::kavach
+{
+class PackagePolicy;
+}
+
 namespace forge::runtime
 {
 
@@ -50,6 +57,11 @@ struct CompartmentHooks
     /// Defines the globals a dependency gets: console, the timer functions
     /// and queueMicrotask. Called inside the new global's realm.
     bool (*defineDependencyGlobals)(JSContext* cx, JS::HandleObject global) = nullptr;
+
+    /// Phase 9.4: the same plus the natives a permission-holding package
+    /// gets (fs, and Forge.env, version and platform), bound to the realm's
+    /// policy through CurrentPolicy. Called inside the new global's realm.
+    bool (*definePackageGlobals)(JSContext* cx, JS::HandleObject global) = nullptr;
 };
 
 /// Installs the wrapper policy and starts tracing. Call once, right after
@@ -91,6 +103,19 @@ JSObject* CompartmentGlobal(
 
 /// True if the current realm belongs to a dependency.
 bool IsDependencyRealm(
+    JSContext* cx);
+
+/// Phase 9.4: adds the compartment of a package that holds a permission
+/// (its global is created on first use) and returns its number.
+[[nodiscard]]
+bool AddPackageCompartment(
+    const forge::kavach::PackagePolicy* policy,
+    forge::core::Size& index);
+
+/// Phase 9.4 (D24): the policy of the current realm, which is the realm of
+/// the native being called (a native never leaves its compartment). Null
+/// for the program; kavach::NoPermissionPolicy for the pure compartment.
+const forge::kavach::PackagePolicy* CurrentPolicy(
     JSContext* cx);
 
 /// Marks `obj`, an object of the current realm, as one of Forge's own

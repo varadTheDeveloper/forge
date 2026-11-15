@@ -20,6 +20,8 @@ namespace
 constexpr Size kMaxNameLength = 214;
 constexpr Size kMaxFieldLength = 4096;
 constexpr Size kMaxDependencies = 1000;
+constexpr Size kMaxPermissionEntries = 64;  // per list
+constexpr Size kMaxEnvNameLength = 256;
 
 bool StartsWith(StringView text, StringView prefix) noexcept
 {
@@ -177,6 +179,121 @@ bool AppendMessage(String& message, StringView a, StringView b = StringView(),
 {
     return message.Append(a).HasValue() && message.Append(b).HasValue() &&
            message.Append(c).HasValue();
+}
+
+/// Phase 9.4: one list of "permissions" or of a grant ("read", "write" or
+/// "env"). `where` names the list in messages.
+bool ParsePermissionList(const json::Document& doc, const Node& node, StringView where,
+                         StringView kind, bool allowAbsolute,
+                         forge::core::Vector<String>& out, String& message) noexcept
+{
+    if (node.kind != Kind::Array)
+    {
+        AppendMessage(message, where, StringView("."), kind);
+        AppendMessage(message, StringView(" must be an array of strings"));
+        return false;
+    }
+
+    if (node.children.Size() > kMaxPermissionEntries)
+    {
+        AppendMessage(message, where, StringView("."), kind);
+        AppendMessage(message, StringView(" lists more than 64 entries"));
+        return false;
+    }
+
+    const bool isEnv = kind == StringView("env");
+
+    for (Size i = 0; i < node.children.Size(); ++i)
+    {
+        const Node& item = doc.At(node.children[i]);
+        const char* problem = nullptr;
+
+        if (item.kind != Kind::String || item.text.Empty())
+        {
+            problem = " must hold only non-empty strings";
+        }
+        else if (item.text.Size() > (isEnv ? kMaxEnvNameLength : kMaxFieldLength))
+        {
+            problem = isEnv ? " holds a variable name longer than 256 bytes"
+                            : " holds a path longer than 4096 bytes";
+        }
+        else
+        {
+            const StringView text = item.text.View();
+
+            for (Size c = 0; c < text.Size() && problem == nullptr; ++c)
+            {
+                const unsigned char ch = static_cast<unsigned char>(text.Data()[c]);
+
+                if (ch < 0x20 || ch == 0x7F || (isEnv && ch == '='))
+                {
+                    problem = isEnv ? " holds an invalid variable name"
+                                    : " holds a path with a control character";
+                }
+            }
+
+            const bool absolute = text.Data()[0] == '/' || text.Data()[0] == '\\' ||
+                                  (text.Size() >= 2 && text.Data()[1] == ':');
+
+            if (problem == nullptr && !isEnv && absolute && !allowAbsolute)
+            {
+                problem = " must hold paths relative to the program's folder (such as \"./data\"); "
+                          "only the program's \"grants\" may name an absolute path";
+            }
+        }
+
+        if (problem != nullptr)
+        {
+            AppendMessage(message, where, StringView("."), kind);
+            AppendMessage(message, StringView(problem));
+            return false;
+        }
+
+        String copy;
+
+        if (copy.Append(item.text.View()).HasError() || out.PushBack(std::move(copy)).HasError())
+        {
+            AppendMessage(message, StringView("out of memory"));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// Phase 9.4: a permission set: an object with "read", "write" and "env".
+bool ParsePermissionSet(const json::Document& doc, const Node& node, StringView where,
+                        bool allowAbsolute, PermissionSet& out, String& message) noexcept
+{
+    if (node.kind != Kind::Object)
+    {
+        AppendMessage(message, where, StringView(" must be an object"));
+        return false;
+    }
+
+    for (Size i = 0; i < node.keys.Size(); ++i)
+    {
+        const StringView kind = node.keys[i].View();
+        const Node& list = doc.At(node.children[i]);
+        forge::core::Vector<String>* target = kind == StringView("read")    ? &out.read
+                                              : kind == StringView("write") ? &out.write
+                                              : kind == StringView("env")   ? &out.env
+                                                                            : nullptr;
+
+        if (target == nullptr)
+        {
+            AppendMessage(message, where, StringView(": unknown permission \""), kind);
+            AppendMessage(message, StringView("\" (Forge knows read, write and env)"));
+            return false;
+        }
+
+        if (!ParsePermissionList(doc, list, where, kind, allowAbsolute, *target, message))
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool IsConditionsObject(const Node& node) noexcept
@@ -523,12 +640,63 @@ bool ParseManifest(StringView bytes, bool isApp, Manifest& out, String& message)
                 return false;
             }
         }
-        else if (key == StringView("permissions") || key == StringView("grants"))
+        else if (key == StringView("permissions"))
         {
+            // Phase 9.4: what this package asks for, relative to the program.
+            if (!ParsePermissionSet(doc, value, StringView("\"permissions\""), false,
+                                    out.permissions, message))
+            {
+                return false;
+            }
+        }
+        else if (key == StringView("grants"))
+        {
+            // Phase 9.4: what the program grants each package, by name.
             if (value.kind != Kind::Object)
             {
-                AppendMessage(message, StringView("\""), key, StringView("\" must be an object"));
+                AppendMessage(message, StringView("\"grants\" must be an object"));
                 return false;
+            }
+
+            if (value.keys.Size() > kMaxDependencies)
+            {
+                AppendMessage(message, StringView("\"grants\" names more than 1000 packages"));
+                return false;
+            }
+
+            for (Size g = 0; g < value.keys.Size(); ++g)
+            {
+                const StringView grantee = value.keys[g].View();
+
+                if (!IsValidPackageName(grantee))
+                {
+                    AppendMessage(message, StringView("\"grants\": \""), grantee,
+                                  StringView("\" is not a valid package name"));
+                    return false;
+                }
+
+                String where;
+                PackageGrant grant;
+
+                if (where.Append(StringView("\"grants\".\"")).HasError() ||
+                    where.Append(grantee).HasError() || where.Append('"').HasError() ||
+                    grant.name.Append(grantee).HasError())
+                {
+                    AppendMessage(message, StringView("out of memory"));
+                    return false;
+                }
+
+                if (!ParsePermissionSet(doc, doc.At(value.children[g]), where.View(), true,
+                                        grant.permissions, message))
+                {
+                    return false;
+                }
+
+                if (out.grants.PushBack(std::move(grant)).HasError())
+                {
+                    AppendMessage(message, StringView("out of memory"));
+                    return false;
+                }
             }
         }
         else if (key == StringView("dependencies"))

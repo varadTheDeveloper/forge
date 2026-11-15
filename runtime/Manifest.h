@@ -14,9 +14,19 @@
 //       "./internal": null
 //     },
 //     "dependencies": { "@acme/util": "file:../util" },
-//     "permissions": { ... },                // checked in Phase 9.4
-//     "grants": { ... }                      // the app's grants, Phase 9.4
+//     "permissions": {                       // Phase 9.4: what the package asks for
+//       "read": ["./data"], "write": [], "env": ["HOME"]
+//     },
+//     "grants": {                            // Phase 9.4: the program's grants
+//       "greet": { "read": ["./data"] }
+//     }
 //   }
+//
+// Paths in "permissions" and "grants" are relative to the program's folder
+// (the only place a person decides what a program may touch); only a grant
+// may be absolute. Only the program's "grants" count, and "permissions"
+// matter only for a dependency; both are validated wherever they appear,
+// so the same forge.json works as a program and as a package.
 //
 // Any other top-level field is refused, so a misspelt field ("dependancies")
 // or one Forge never honours ("scripts") is never silently ignored.
@@ -42,12 +52,33 @@ struct Dependency
     forge::core::String path;
 };
 
+/// Phase 9.4: what a package asks for ("permissions") or what the program
+/// grants it (one entry of "grants"). Kept as written; Kavach resolves the
+/// paths against the program's folder and checks the variable names.
+struct PermissionSet
+{
+    forge::core::Vector<forge::core::String> read;
+    forge::core::Vector<forge::core::String> write;
+    forge::core::Vector<forge::core::String> env;
+
+    bool Empty() const noexcept { return read.Empty() && write.Empty() && env.Empty(); }
+};
+
+struct PackageGrant
+{
+    forge::core::String name;
+    PermissionSet permissions;
+};
+
 struct Manifest
 {
     forge::core::String name;  // empty only for an app without a name
     forge::core::String version;
     forge::core::Vector<Dependency> dependencies;
     bool hasExports = false;
+
+    PermissionSet permissions;                     // Phase 9.4
+    forge::core::Vector<PackageGrant> grants;      // Phase 9.4
 
     /// The parsed file, kept for resolving "exports".
     json::Document document;

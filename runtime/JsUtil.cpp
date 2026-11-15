@@ -20,6 +20,7 @@
 #include "js/experimental/TypedData.h"
 #include "jsapi.h"
 
+#include "runtime/Compartments.h"
 #include "runtime/Inspect.h"
 
 namespace forge::runtime
@@ -413,6 +414,12 @@ bool ThrowKavachDenial(JSContext* cx, forge::kavach::Op op,
   DefineStringOnPendingError(cx, "permission", permission);
   DefineStringOnPendingError(cx, "op", info.name);
   DefineStringOnPendingError(cx, isEnv ? "variable" : "path", denial.target.View());
+
+  // Phase 9.4: the package whose policy refused.
+  if (!denial.package.Empty()) {
+    DefineStringOnPendingError(cx, "package", denial.package.View());
+  }
+
   return false;
 }
 
@@ -457,8 +464,11 @@ forge::core::Result<forge::kavach::CheckedPath> CheckPathArg(JSContext* cx,
     return forge::core::Result<Checked>(failure);
   }
 
+  // Phase 9.4 (D24): the authority is the policy of the realm the native
+  // belongs to (the current realm while it runs).
   forge::kavach::Denial denial;
-  forge::core::Result<Checked> checked = forge::kavach::CheckPath(op, access, utf8.View(), denial);
+  forge::core::Result<Checked> checked = forge::kavach::CheckPath(
+      forge::runtime::CurrentPolicy(cx), op, access, utf8.View(), denial);
 
   if (checked.HasError()) {
     ThrowKavachDenial(cx, op, denial);

@@ -199,6 +199,60 @@ int main()
         ExpectExport(m, "./x", ExportResult::NotExported);
     }
 
+    // Phase 9.4: permissions and grants.
+    {
+        Manifest m;
+        Check(ParseOk("{\"name\":\"p\",\"permissions\":{\"read\":[\"./data\",\"./more\"],"
+                      "\"write\":[\"./out\"],\"env\":[\"HOME\"]}}",
+                      m),
+              "permissions parse");
+        Check(m.permissions.read.Size() == 2 && m.permissions.read[1].View() == StringView("./more"),
+              "permissions.read kept as written");
+        Check(m.permissions.write.Size() == 1 && m.permissions.env.Size() == 1 &&
+                  m.permissions.env[0].View() == StringView("HOME"),
+              "permissions.write and env kept");
+        Check(m.grants.Empty() && !m.permissions.Empty(), "no grants in a package");
+    }
+
+    {
+        Manifest m;
+        Check(ParseOk("{\"grants\":{\"greet\":{\"read\":[\"./data\",\"C:\\\\shared\"]},"
+                      "\"@acme/util\":{\"env\":[\"X\"],\"write\":[]}}}",
+                      m, true),
+              "grants parse");
+        Check(m.grants.Size() == 2 && m.grants[0].name.View() == StringView("greet") &&
+                  m.grants[0].permissions.read.Size() == 2 &&
+                  m.grants[0].permissions.read[1].View() == StringView("C:\\shared"),
+              "a grant may be absolute");
+        Check(m.grants[1].name.View() == StringView("@acme/util") &&
+                  m.grants[1].permissions.env.Size() == 1 && m.grants[1].permissions.write.Empty(),
+              "grants keep their order and lists");
+        Check(m.permissions.Empty(), "no permissions in the app");
+    }
+
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"net\":[]}}", "unknown permission \"net\"");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"read\":\"./x\"}}", "must be an array");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"read\":[1]}}", "non-empty strings");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"read\":[\"\"]}}", "non-empty strings");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"read\":[\"C:/x\"]}}", "relative to the program");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"write\":[\"\\\\server\\\\x\"]}}",
+                  "relative to the program");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"env\":[\"A=B\"]}}", "invalid variable name");
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"read\":[\"./a\\u0001\"]}}", "control character");
+    ExpectRefused("{\"grants\":[]}", "\"grants\" must be an object", true);
+    ExpectRefused("{\"grants\":{\"Bad\":{}}}", "not a valid package name", true);
+    ExpectRefused("{\"grants\":{\"good\":[]}}", "\"grants\".\"good\" must be an object", true);
+    ExpectRefused("{\"grants\":{\"good\":{\"env\":[7]}}}", "non-empty strings", true);
+    ExpectRefused("{\"name\":\"a\",\"permissions\":{\"read\":[\"./1\",\"./2\",\"./3\",\"./4\",\"./5\","
+                  "\"./6\",\"./7\",\"./8\",\"./9\",\"./10\",\"./11\",\"./12\",\"./13\",\"./14\",\"./15\","
+                  "\"./16\",\"./17\",\"./18\",\"./19\",\"./20\",\"./21\",\"./22\",\"./23\",\"./24\","
+                  "\"./25\",\"./26\",\"./27\",\"./28\",\"./29\",\"./30\",\"./31\",\"./32\",\"./33\","
+                  "\"./34\",\"./35\",\"./36\",\"./37\",\"./38\",\"./39\",\"./40\",\"./41\",\"./42\","
+                  "\"./43\",\"./44\",\"./45\",\"./46\",\"./47\",\"./48\",\"./49\",\"./50\",\"./51\","
+                  "\"./52\",\"./53\",\"./54\",\"./55\",\"./56\",\"./57\",\"./58\",\"./59\",\"./60\","
+                  "\"./61\",\"./62\",\"./63\",\"./64\",\"./65\"]}}",
+                  "more than 64 entries");
+
     // Refused manifests.
     ExpectRefused("[]", "top level");
     ExpectRefused("{\"name\":\"a\",\"name\":\"b\"}", "twice");

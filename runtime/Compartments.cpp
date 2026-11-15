@@ -24,6 +24,7 @@
 
 #include "forge-core/memory/MakeUnique.h"
 #include "forge-core/memory/UniquePtr.h"
+#include "kavach/Kavach.h"
 #include "runtime/Inspect.h"
 #include "runtime/JsUtil.h"
 
@@ -47,10 +48,16 @@ enum class RealmKind
     Dependency,
 };
 
-/// Kept in the realm's private slot (JS::SetRealmPrivate).
+/// Kept in the realm's private slot (JS::SetRealmPrivate). Phase 9.4: a
+/// package compartment's record exists (with its policy) before its global
+/// is created on first use.
 struct RealmInfo
 {
     RealmKind kind = RealmKind::App;
+    /// Phase 9.4 (D24): the authority of every Forge native created in this
+    /// realm. Null for the program; NoPermissionPolicy for the pure
+    /// compartment; the package's policy for a package compartment.
+    const forge::kavach::PackagePolicy* policy = nullptr;
     bool walked = false;  // `kinds` and `intrinsics` are filled in
     bool frozen = false;  // every intrinsic is frozen
     JS::Heap<JSObject*> global;
@@ -67,13 +74,15 @@ struct RealmInfo
 
 constexpr int32_t kForgeObject = -1;
 constexpr int32_t kUnknown = -2;
-constexpr Size kRealmCount = 2;
 
 struct State
 {
     CompartmentHooks hooks;
     Vector<String> standardNames;
-    UniquePtr<RealmInfo> realms[kRealmCount];
+    /// Index = compartment number: kAppCompartment, kPureCompartment, then
+    /// one per permission-holding package (Phase 9.4). A slot may be empty
+    /// until its compartment is set up.
+    Vector<UniquePtr<RealmInfo>> realms;
     bool tracing = false;
 };
 
@@ -88,7 +97,7 @@ void TraceCompartments(JSTracer* trc, void* data)
         return;
     }
 
-    for (Size i = 0; i < kRealmCount; ++i)
+    for (Size i = 0; i < g_state->realms.Size(); ++i)
     {
         RealmInfo* info = g_state->realms[i].Get();
 
@@ -955,38 +964,85 @@ void RethrowInCurrentRealm(JSContext* cx, JS::HandleValue exception)
     }
 }
 
-bool InstallRealmInfo(JSContext* cx, JS::HandleObject global, RealmKind kind, Size index)
+/// Makes sure compartment slot `index` exists (empty until filled).
+bool EnsureSlot(Size index)
 {
-    Result<UniquePtr<RealmInfo>> made = forge::core::memory::MakeUnique<RealmInfo>();
-
-    if (made.HasError())
+    while (g_state->realms.Size() <= index)
     {
-        JS_ReportOutOfMemory(cx);
-        return false;
+        if (g_state->realms.PushBack(UniquePtr<RealmInfo>()).HasError())
+        {
+            return false;
+        }
     }
 
-    made.Value()->kind = kind;
-    made.Value()->global = global;
-    JS::SetRealmPrivate(js::GetNonCCWObjectRealm(global), made.Value().Get());
-    g_state->realms[index] = std::move(made.Value());
     return true;
 }
 
-/// Creates the shared compartment of the permission-free dependencies.
-JSObject* CreatePureGlobal(JSContext* cx)
+/// A new record in slot `index`, replacing any.
+RealmInfo* NewRealmInfo(JSContext* cx, Size index, RealmKind kind,
+                        const forge::kavach::PackagePolicy* policy)
 {
-    RealmInfo* app = g_state->realms[kAppCompartment].Get();
+    Result<UniquePtr<RealmInfo>> made = forge::core::memory::MakeUnique<RealmInfo>();
+
+    if (made.HasError() || !EnsureSlot(index))
+    {
+        JS_ReportOutOfMemory(cx);
+        return nullptr;
+    }
+
+    made.Value()->kind = kind;
+    made.Value()->policy = policy;
+    RealmInfo* info = made.Value().Get();
+    g_state->realms[index] = std::move(made.Value());
+    return info;
+}
+
+bool InstallRealmInfo(JSContext* cx, JS::HandleObject global, RealmKind kind, Size index)
+{
+    RealmInfo* info = NewRealmInfo(cx, index, kind, nullptr);
+
+    if (info == nullptr)
+    {
+        return false;
+    }
+
+    info->global = global;
+    JS::SetRealmPrivate(js::GetNonCCWObjectRealm(global), info);
+    return true;
+}
+
+/// Creates the global of dependency compartment `index`: the shared pure
+/// compartment, or (Phase 9.4) a permission-holding package's, whose
+/// record already holds its policy.
+JSObject* CreateDependencyGlobal(JSContext* cx, Size index)
+{
+    RealmInfo* app = g_state->realms.Size() > kAppCompartment
+                         ? g_state->realms[kAppCompartment].Get()
+                         : nullptr;
+    const bool pure = index == kPureCompartment;
+    bool (*defineGlobals)(JSContext*, JS::HandleObject) =
+        pure ? g_state->hooks.defineDependencyGlobals : g_state->hooks.definePackageGlobals;
 
     // The program's intrinsics must be known before a package exists, or one
     // of them could reach the package as an ordinary wrapper.
     if (app == nullptr || !app->walked || g_state->hooks.newGlobal == nullptr ||
-        g_state->hooks.defineDependencyGlobals == nullptr)
+        defineGlobals == nullptr)
     {
         JS_ReportErrorASCII(cx, "Forge: dependencies can be loaded only by a program whose "
                                 "forge.json lists them");
         return nullptr;
     }
 
+    RealmInfo* info = pure ? NewRealmInfo(cx, index, RealmKind::Dependency,
+                                          forge::kavach::NoPermissionPolicy())
+                           : g_state->realms[index].Get();
+
+    if (info == nullptr)
+    {
+        return nullptr;
+    }
+
+    const forge::kavach::PackagePolicy* policy = info->policy;
     JS::RootedObject appGlobal(cx, app->global);
     JS::RootedObject global(cx, g_state->hooks.newGlobal(cx, appGlobal));
 
@@ -995,22 +1051,17 @@ JSObject* CreatePureGlobal(JSContext* cx)
         return nullptr;
     }
 
-    if (!InstallRealmInfo(cx, global, RealmKind::Dependency, kPureCompartment))
-    {
-        return nullptr;
-    }
-
-    RealmInfo& info = *g_state->realms[kPureCompartment];
+    info->global = global;
+    JS::SetRealmPrivate(js::GetNonCCWObjectRealm(global), info);
     bool ok = false;
     bool thrown = false;
     JS::RootedValue exception(cx);
 
     {
         JSAutoRealm ar(cx, global);
-        ok = JS::InitRealmStandardClasses(cx) && Walk(cx, info, global) &&
-             FreezeIntrinsics(cx, info, global) &&
-             g_state->hooks.defineDependencyGlobals(cx, global) &&
-             MarkForgeGlobals(cx, info, global, true) && JS_FreezeObject(cx, global);
+        ok = JS::InitRealmStandardClasses(cx) && Walk(cx, *info, global) &&
+             FreezeIntrinsics(cx, *info, global) && defineGlobals(cx, global) &&
+             MarkForgeGlobals(cx, *info, global, true) && JS_FreezeObject(cx, global);
 
         if (!ok)
         {
@@ -1020,9 +1071,18 @@ JSObject* CreatePureGlobal(JSContext* cx)
 
     if (!ok)
     {
-        // The realm is unusable; forget it so nothing runs in it.
+        // The realm is unusable; forget it so nothing runs in it. A package
+        // keeps an empty record with its policy.
         JS::SetRealmPrivate(js::GetNonCCWObjectRealm(global), nullptr);
-        g_state->realms[kPureCompartment] = UniquePtr<RealmInfo>();
+
+        if (pure)
+        {
+            g_state->realms[index] = UniquePtr<RealmInfo>();
+        }
+        else
+        {
+            NewRealmInfo(cx, index, RealmKind::Dependency, policy);
+        }
 
         if (thrown)
         {
@@ -1270,7 +1330,7 @@ void ShutdownCompartments(JSContext* cx)
         return;
     }
 
-    for (Size i = 0; i < kRealmCount; ++i)
+    for (Size i = 0; i < g_state->realms.Size(); ++i)
     {
         RealmInfo* info = g_state->realms[i].Get();
 
@@ -1320,7 +1380,8 @@ bool PrepareAppRealm(JSContext* cx, JS::HandleObject global, bool isolate, bool 
         return false;
     }
 
-    if (g_state->realms[kAppCompartment].Get() == nullptr &&
+    if ((g_state->realms.Size() <= kAppCompartment ||
+         g_state->realms[kAppCompartment].Get() == nullptr) &&
         !InstallRealmInfo(cx, global, RealmKind::App, kAppCompartment))
     {
         return false;
@@ -1341,24 +1402,61 @@ bool PrepareAppRealm(JSContext* cx, JS::HandleObject global, bool isolate, bool 
 
 JSObject* CompartmentGlobal(JSContext* cx, Size index)
 {
-    if (g_state == nullptr || index >= kRealmCount)
+    if (g_state == nullptr || index >= g_state->realms.Size() + (index == kPureCompartment ? 1 : 0))
     {
         JS_ReportErrorASCII(cx, "Forge: unknown compartment");
         return nullptr;
     }
 
-    if (RealmInfo* info = g_state->realms[index].Get())
+    RealmInfo* info = index < g_state->realms.Size() ? g_state->realms[index].Get() : nullptr;
+
+    if (info != nullptr && info->global.unbarrieredGet() != nullptr)
     {
         return info->global;
     }
 
-    if (index == kPureCompartment)
+    if (index == kPureCompartment || (info != nullptr && info->kind == RealmKind::Dependency))
     {
-        return CreatePureGlobal(cx);
+        return CreateDependencyGlobal(cx, index);
     }
 
     JS_ReportErrorASCII(cx, "Forge: the program's compartment is not set up");
     return nullptr;
+}
+
+bool AddPackageCompartment(const forge::kavach::PackagePolicy* policy, Size& index)
+{
+    index = 0;
+
+    if (g_state == nullptr || !EnsureSlot(kPureCompartment))
+    {
+        return false;
+    }
+
+    Result<UniquePtr<RealmInfo>> made = forge::core::memory::MakeUnique<RealmInfo>();
+
+    if (made.HasError())
+    {
+        return false;
+    }
+
+    made.Value()->kind = RealmKind::Dependency;
+    made.Value()->policy = policy;
+    index = g_state->realms.Size();
+
+    if (g_state->realms.PushBack(std::move(made.Value())).HasError())
+    {
+        index = 0;
+        return false;
+    }
+
+    return true;
+}
+
+const forge::kavach::PackagePolicy* CurrentPolicy(JSContext* cx)
+{
+    const RealmInfo* info = InfoOf(JS::GetCurrentRealmOrNull(cx));
+    return info != nullptr ? info->policy : nullptr;
 }
 
 bool IsDependencyRealm(JSContext* cx)

@@ -29,6 +29,7 @@
 #include "kavach/Kavach.h"
 #include "kavach/SecureFs.h"
 #include "runtime/Compartments.h"
+#include "runtime/Console.h"
 #include "runtime/Inspect.h"
 #include "runtime/JsUtil.h"
 #include "runtime/Manifest.h"
@@ -558,8 +559,10 @@ bool ReadManifest(JSContext* cx, StringView root, bool isApp, Manifest& manifest
 }
 
 /// Phase 9.2: registers a package. `root` must be canonical and resolved.
+/// Phase 9.4: `compartment` is the dependency's (the app's is always
+/// kAppCompartment).
 bool AddPackage(JSContext* cx, StringView root, bool isApp, bool rootIsFile, bool hasManifest,
-                Manifest&& manifest, Size& index)
+                Manifest&& manifest, Size& index, Size compartment = kPureCompartment)
 {
     Result<UniquePtr<Package>> made = forge::core::memory::MakeUnique<Package>();
 
@@ -572,9 +575,9 @@ bool AddPackage(JSContext* cx, StringView root, bool isApp, bool rootIsFile, boo
 
     Package& package = *made.Value();
     package.isApp = isApp;
-    // Phase 9.3 (D25): no dependency can hold a permission before 9.4, so
-    // every dependency runs in the shared, frozen "pure" compartment.
-    package.compartment = isApp ? kAppCompartment : kPureCompartment;
+    // D25: the app's own compartment; for a dependency, the shared "pure"
+    // one or (Phase 9.4) its own if it holds a permission.
+    package.compartment = isApp ? kAppCompartment : compartment;
     package.rootIsFile = rootIsFile;
     package.hasManifest = hasManifest;
     package.manifest = std::move(manifest);
@@ -587,6 +590,133 @@ bool AddPackage(JSContext* cx, StringView root, bool isApp, bool rootIsFile, boo
     {
         JS_ReportOutOfMemory(cx);
         return false;
+    }
+
+    return true;
+}
+
+/// Phase 9.4: copies a forge.json permission set into Kavach's form.
+bool CopyPermissions(const PermissionSet& from, forge::kavach::PermissionLists& to)
+{
+    const Vector<String>* sources[3] = {&from.read, &from.write, &from.env};
+    Vector<String>* targets[3] = {&to.read, &to.write, &to.env};
+
+    for (int list = 0; list < 3; ++list)
+    {
+        for (Size i = 0; i < sources[list]->Size(); ++i)
+        {
+            String copy;
+
+            if (copy.Append((*sources[list])[i].View()).HasError() ||
+                targets[list]->PushBack(std::move(copy)).HasError())
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+/// Phase 9.4: registers the policy of the dependency `manifest` (at
+/// `root`): what it declares, intersected with what the program's
+/// forge.json grants it, capped by the command line (D26). A package that
+/// holds a permission gets a compartment of its own, with Forge's natives
+/// bound to its policy (D24, D25); any other stays in the pure compartment.
+bool SetUpPackagePolicy(JSContext* cx, const Manifest& manifest, StringView root,
+                        StringView specifier, StringView referrerUrl, Size& compartment)
+{
+    compartment = kPureCompartment;
+    const Package& app = *g_registry->packages[0];
+    const PackageGrant* grant = nullptr;
+
+    for (Size i = 0; app.hasManifest && i < app.manifest.grants.Size(); ++i)
+    {
+        if (app.manifest.grants[i].name.View() == manifest.name.View())
+        {
+            grant = &app.manifest.grants[i];
+        }
+    }
+
+    if (manifest.permissions.Empty() && grant == nullptr)
+    {
+        return true;
+    }
+
+    // A grant names exactly one package. Until forge.lock binds a grant to
+    // a package's identity (Phase 14), a second folder holding a package of
+    // the same name is refused rather than given the same permissions.
+    if (grant != nullptr)
+    {
+        for (Size i = 1; i < g_registry->packages.Size(); ++i)
+        {
+            const Package& other = *g_registry->packages[i];
+
+            if (other.manifest.name.View() == manifest.name.View() &&
+                !forge::kavach::PathEquals(other.root.View(), root))
+            {
+                String text;
+                text.Append(StringView("The program's forge.json grants permissions to \"")).Ignore();
+                text.Append(manifest.name.View()).Ignore();
+                text.Append(StringView("\", but two folders hold a package of that name (")).Ignore();
+                text.Append(other.root.View()).Ignore();
+                text.Append(StringView(" and ")).Ignore();
+                text.Append(root).Ignore();
+                text.Append(StringView("). A grant must name exactly one package.")).Ignore();
+                return ThrowModuleError(cx, "PermissionDenied", text.View(), specifier, referrerUrl);
+            }
+        }
+    }
+
+    forge::kavach::PermissionLists declared;
+    forge::kavach::PermissionLists granted;
+
+    if (!CopyPermissions(manifest.permissions, declared) ||
+        (grant != nullptr && !CopyPermissions(grant->permissions, granted)))
+    {
+        JS_ReportOutOfMemory(cx);
+        return false;
+    }
+
+    const forge::kavach::PackagePolicy* policy = nullptr;
+    String message;
+
+    if (!forge::kavach::AddPackagePolicy(manifest.name.View(), app.root.View(), declared, granted,
+                                         policy, message))
+    {
+        String text;
+        text.Append(StringView("The permissions of the package \"")).Ignore();
+        text.Append(manifest.name.View()).Ignore();
+        text.Append(StringView("\" cannot be used: ")).Ignore();
+        text.Append(message.View()).Ignore();
+        return ThrowModuleError(cx, "InvalidData", text.View(), specifier, referrerUrl);
+    }
+
+    if (forge::kavach::HoldsPermission(policy))
+    {
+        if (!AddPackageCompartment(policy, compartment))
+        {
+            JS_ReportOutOfMemory(cx);
+            return false;
+        }
+
+        return true;
+    }
+
+    // Declared but not granted: the package runs without it. Say so once,
+    // so a failure inside the package is not a mystery.
+    String missing;
+    forge::kavach::DescribeUngranted(policy, missing);
+
+    if (!missing.Empty())
+    {
+        String line;
+        line.Append(StringView("Forge: the package \"")).Ignore();
+        line.Append(manifest.name.View()).Ignore();
+        line.Append(StringView("\" runs without the permissions it declares (")).Ignore();
+        line.Append(missing.View()).Ignore();
+        line.Append(StringView("): the program's forge.json does not grant them.")).Ignore();
+        WriteErrorLine(line.View());
     }
 
     return true;
@@ -681,7 +811,14 @@ bool LoadDependency(JSContext* cx, Size from, const Dependency& dependency, Stri
         return ThrowModuleError(cx, "InvalidData", text.View(), specifier, referrerUrl);
     }
 
-    return AddPackage(cx, resolved.View(), false, false, true, std::move(manifest), out);
+    Size compartment = kPureCompartment;
+
+    if (!SetUpPackagePolicy(cx, manifest, resolved.View(), specifier, referrerUrl, compartment))
+    {
+        return false;
+    }
+
+    return AddPackage(cx, resolved.View(), false, false, true, std::move(manifest), out, compartment);
 }
 
 /// Resolves `specifier`, imported by a module of package `from` whose URL is
