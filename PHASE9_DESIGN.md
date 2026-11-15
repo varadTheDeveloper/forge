@@ -1,7 +1,7 @@
 # Phase 9 design: modules, packages and per-package permissions
 
-Status: 2026-11-15. Step 9.1 is done; 9.2 is being built; 9.3 and 9.4
-follow this document and may refine it, with every change recorded here
+Status: 2026-11-15. Steps 9.1 and 9.2 are done; 9.3 is being built; 9.4
+follows this document and may refine it, with every change recorded here
 and in `HISTORY.md`.
 
 Phase 9 turns Forge from "one script with one policy" into "an app made of
@@ -204,26 +204,156 @@ be written in full, as in browsers.
 
 ## 5. Isolation (step 9.3)
 
-- One compartment for the app, one per permission-holding dependency, one
-  shared "pure" compartment (D25), all in one zone (cheap cross-compartment
-  calls).
-- **Lockdown:** in every dependency compartment the intrinsics are frozen
-  by a C++ walk (R19 lists the engine's mutable state that freezing misses,
-  such as RegExp statics, with tests). The app's own compartment is not
-  frozen by default; `--frozen-intrinsics` freezes it too.
-- **Wrapper policy** (`JS_SetWrapObjectCallbacks`, a
-  `SecurityWrapper<CrossCompartmentWrapper>` subclass): ordinary objects
-  and functions cross as wrappers, so libraries work normally; Forge's own
-  host objects and native functions never cross (an attempt throws a
-  `TypeError` naming the object). This is what makes D24 sound.
-- **Facades:** an ES module graph cannot span compartments. When package A
-  imports package B, A links against a small facade module, generated in
-  C++ from B's export names (validated identifiers only, never B's source),
-  whose exports are wrappers of B's. **Deviation:** A sees B's exports as
-  they were when B finished evaluating; a later reassignment of B's
-  `export let` is not visible in A. Import cycles between packages are a
-  load-time error (cycles inside one package work as usual).
-- `eval` and `new Function` are off in every dependency compartment.
+Built in `runtime/Compartments.cpp` (compartments, lockdown, wrapper
+policy) and `runtime/Modules.cpp` (facades).
+
+**Layout (D25).** The program runs in the app compartment. A dependency
+that holds a permission will get its own compartment in 9.4; until then no
+dependency can hold one (grants arrive in 9.4, and D26 intersects with
+them), so **every dependency runs in one shared "pure" compartment**. All
+compartments are in the program's zone, so calls between them are cheap.
+The pure compartment is created on first use, with the same global class
+and realm options as the program's.
+
+**What a package's compartment has.** The standard JavaScript globals,
+plus `console`, `setTimeout`, `setInterval`, `clearTimeout`,
+`clearInterval` and `queueMicrotask`: the WinterTC minimum that holds no
+authority. No `fs`, no `Forge`, no `print`. *Refinement:* D25 said "no
+Forge natives at all"; these six hold no authority, and without them most
+libraries do not run. A timer belongs to the realm that created it: its
+callback runs there, and only that realm can cancel it, so a package cannot
+clear the program's timers by guessing ids. `console.count` and
+`console.time` labels are per realm too.
+
+**Lockdown.** In a dependency compartment every intrinsic is frozen:
+everything reachable from the standard globals through prototypes,
+property values, getters and setters, plus the hidden intrinsics no
+property path reaches (`%ArrayIteratorPrototype%`, the other iterator
+prototypes, `%GeneratorFunction%`, `%AsyncFunction%`,
+`%AsyncGeneratorFunction%`, the iterator-helper prototypes, Intl segment
+prototypes), found by a fixed script run before any package code. The
+walk starts from the names of the standard globals, captured before Forge
+adds its own, so a Forge object is never taken for an intrinsic. The
+compartment's global object, `console` and the timer functions are frozen
+too: pure packages share the compartment, so nothing on it may change.
+
+- **The override mistake.** Assigning to a property an object inherits
+  from a frozen prototype throws in strict code, which would break
+  `this.name = "MyError"`, `Foo.prototype.toString = ...` and
+  `Child.prototype.constructor = Child`. As in SES, a few data properties
+  become accessors before freezing: the getter returns the original
+  value; the setter defines an own property on the object assigned to and
+  still refuses the built-in itself. The list: `constructor`, `toString`,
+  `toLocaleString` and `valueOf` of `Object.prototype`; `constructor` and
+  `toString` of `Function.prototype`; `constructor`, `name`, `message` and
+  `toString` of `Error.prototype` and of every native error's prototype.
+  The prototypes behind the engine's fast paths (`Array`, `Promise`,
+  `RegExp`, the collections) are left alone, as are hot methods.
+- **R19, engine state that freezing misses.** The legacy RegExp statics
+  (`RegExp.lastMatch`, `RegExp.$1`, `RegExp.input`, ...) are permanent
+  accessors in a release build, so they cannot be removed. They are per
+  realm: the program and the packages never see each other's matches
+  (tested). **Known limit:** pure packages share a realm, so one pure
+  package can read the last match of another. `Math.random` shares one
+  generator per realm in the same way (no secret is involved). The
+  `Symbol.for` registry is shared by every realm, as the language
+  requires; symbols carry no authority.
+- The program's own compartment is not frozen, so programs that patch
+  built-ins keep working. `--frozen-intrinsics` freezes it too (same walk,
+  same accessors); the program keeps its natives and `eval`.
+
+**Wrapper policy** (`JS_SetWrapObjectCallbacks`, the pre-wrap callback).
+Every object that crosses from one compartment to another passes through
+it, whichever way it crosses (argument, return value, property read,
+exception, promise result):
+
+1. A global object never crosses (`TypeError`, code `PermissionDenied`).
+2. Forge's own objects never cross: every native Forge defines on a
+   global (the `fs` functions, `console`'s, `Forge`'s, the timers),
+   every object that holds one (`fs`, `console`, `Forge`, `Forge.env`),
+   `import.meta.resolve`, and a bound function whose target is one of
+   these. Plain data such as `Forge.args` crosses. This is what makes D24
+   sound: a package never holds a function whose authority is another's.
+3. An intrinsic is **replaced by the receiving compartment's own
+   intrinsic of the same identity**. Both compartments' intrinsics are
+   walked in the same canonical order (own keys sorted), so the n-th
+   intrinsic of one is the n-th of the other; a signature (class name,
+   number of own keys, callable) must also match. So a package never holds
+   the program's `Object.prototype`, `Function` constructor or `eval`:
+   `Object.getPrototypeOf(programObject)` gives the package's own frozen
+   `Object.prototype`, and `programObject.constructor.constructor` is the
+   package's `Function`, which cannot compile strings. A useful side
+   effect: `x instanceof Array`, `Object.getPrototypeOf(x) ===
+   Object.prototype` and `err instanceof TypeError` work across
+   compartments. An intrinsic of the (mutable) program with no
+   counterpart is refused rather than wrapped.
+4. Everything else crosses as a **transparent** cross-compartment
+   wrapper, so libraries work normally (`Array.isArray`, `Map` methods,
+   `JSON.stringify` on wrapped values). *Deviation:* the design named a
+   `SecurityWrapper<CrossCompartmentWrapper>` subclass; SpiderMonkey's
+   `SecurityWrapper` answers `Array.isArray` with false and refuses
+   built-in methods on wrapped objects (`Map.prototype.get`), which breaks
+   ordinary libraries. The protection it would add (no writes to the
+   other side's prototypes) is given by rule 3 instead, which also holds
+   for built-in mutators such as `Object.defineProperty` called with the
+   program's own objects.
+
+A closure the program writes (`(p) => fs.readFileSync(p)`) is ordinary
+code and crosses like any function: passing it is the program's decision
+to delegate. `console.log` of a package's object prints the object
+(`runtime/Inspect.cpp` looks through the wrapper without running code).
+
+**Facades.** An ES module graph cannot span compartments, so **every**
+import of another package goes through a facade module, even between two
+pure packages (one rule, one behaviour). The facade is generated in C++
+from the target's export names (read from its namespace's keys, which runs
+no code; every name is written as an escaped string literal, never copied
+from the package's source) and compiled in the importer's compartment:
+
+```js
+await import.meta.load();
+const n = import.meta.namespace;
+const e0 = n["default"];
+export { e0 as "default" };
+```
+
+`import.meta.load` is a Forge function only the facade's own code can
+reach. It evaluates the target in its compartment (once; every facade of
+the same module shares that evaluation) and returns a promise of the
+importer's realm that settles with it. The namespace is handed over as
+`import.meta.namespace`, not as the promise's value, so a package that
+exports `then` is not treated as a thenable. Because the facade awaits, a
+program with dependencies always evaluates asynchronously; the target
+still runs before the importer and in import order. JSON modules of
+another package are reached the same way.
+
+- **Deviation:** an importer sees the target's exports as they were when
+  the target finished evaluating; a later reassignment of an `export let`
+  is not visible to another package (tested).
+- **Import cycles between packages** are a load-time error naming the
+  packages (`cycle-a -> cycle-b -> cycle-a`). Cycles inside one package
+  work as usual.
+- A failure inside a package (a missing file, a syntax error, a refused
+  import, a top-level `throw`) reaches the importer as the package's own
+  error, wrapped.
+
+**Code generation.** `eval`, indirect `eval` and `new Function` throw in
+every dependency compartment (`Error`, code `PermissionDenied`); Forge
+throws its own error because the engine's would mention a "CSP".
+WebAssembly compilation follows `--disallow-wasm` as in the program.
+
+**Known limits.**
+
+- A package that patches built-ins or globals (a polyfill) cannot affect
+  any other package or the program, and setting a global throws. A
+  polyfill must be part of the program.
+- Pure packages share one realm (RegExp statics, see R19 above).
+- An intrinsic the walk does not find (an engine-internal one that script
+  can still obtain) would cross as an ordinary wrapper. None is known; the
+  hidden-intrinsic list is checked by the isolation test.
+- Cold start: the walk records about two thousand objects per
+  compartment. It runs only for programs whose `forge.json` lists
+  dependencies (and for `--frozen-intrinsics`). To benchmark (D21).
 
 ## 6. Per-package permissions (step 9.4)
 
@@ -248,11 +378,19 @@ be written in full, as in browsers.
   module root through `..`, a junction and a short name, importing a
   protected file; unit tests for the specifier code; the fuzzer covers
   `import.meta.resolve`; a realistic cold-start benchmark (D21).
-- 9.3/9.4: prototype pollution across packages; confused deputy (a package
-  passing its `fs` function to another); `then` added to a shared
-  prototype (the open item in `CallSites.md`); a pure package trying to
-  reach any Forge native; cross-package cycles; Wasm imports across
-  compartments; replays of the LavaMoat/SES escapes above.
+- 9.3 (`tests/isolation`, `tests/frozen-intrinsics.js`): prototype
+  pollution from a package, directly and through a program object's
+  prototype; `then` on a frozen `Promise.prototype`; a pure package
+  reaching Forge's natives; Forge's functions, objects, bound functions,
+  `import.meta.resolve` and the global object refused at the boundary;
+  the `Function` constructor reached through `obj.constructor.constructor`;
+  `eval` and `new Function`; the override mistake; RegExp statics; timers
+  and microtasks across compartments; snapshot semantics; a throwing
+  package; a cross-package cycle; replays of the LavaMoat/SES escapes
+  above (a spread `import()`, the app's top-level lexical bindings, a new
+  realm).
+- 9.4: confused deputy (a package passing its `fs` function to another);
+  Wasm imports across compartments; per-package policies.
 
 ## 8. Steps
 

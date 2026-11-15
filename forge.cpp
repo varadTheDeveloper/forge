@@ -98,6 +98,7 @@
 
 // Phase 8.3: shared binding helpers and the fs namespace, moved out of this
 // file.
+#include "runtime/Compartments.h"
 #include "runtime/Fs.h"
 #include "runtime/Modules.h"
 #include "runtime/JsUtil.h"
@@ -196,8 +197,24 @@ static bool ForgeCodeGenerationAllowed(
   (void)parameterArgs;
   (void)bodyArg;
 
-  *outCanCompileStrings =
-      kind == JS::RuntimeCode::WASM ? g_codeGenPolicy.allowWasm : g_codeGenPolicy.allowStrings;
+  if (kind == JS::RuntimeCode::WASM) {
+    *outCanCompileStrings = g_codeGenPolicy.allowWasm;
+    return true;
+  }
+
+  // Phase 9.3: a dependency never turns a string into code. Its code comes
+  // only from its own files, through the module loader. The engine's own
+  // message would mention a "CSP", so Forge throws its own error.
+  if (forge::runtime::IsDependencyRealm(cx)) {
+    JS_ReportErrorASCII(cx,
+                        "eval() and new Function() are turned off in packages: a package's "
+                        "code is loaded only from its own files");
+    forge::runtime::DefineStringOnPendingError(cx, "code",
+                                               forge::core::StringView("PermissionDenied"));
+    return false;
+  }
+
+  *outCanCompileStrings = g_codeGenPolicy.allowStrings;
   return true;
 }
 
@@ -424,7 +441,9 @@ class ForgeJobQueue : public JS::JobQueue {
         // A queueMicrotask() callback.
         JS::RootedObject callback(cx, &next.toObject());
         JS::RootedValue rval(cx);
-        JSAutoRealm ar(cx, callback);
+        // Phase 9.3: the callback may be a wrapper from another compartment.
+        JS::RootedObject entry(cx, forge::runtime::RealmEntryFor(callback));
+        JSAutoRealm ar(cx, entry);
         ok = JS::Call(cx, JS::UndefinedHandleValue, callback, JS::HandleValueArray::empty(),
                       &rval);
       }
@@ -468,6 +487,10 @@ struct JsTimer {
   JSContext* cx;
   JS::Heap<JSObject*> callback;
   JS::PersistentRootedVector<JS::Value> arguments;
+  // Phase 9.3: the realm that created the timer. The callback runs there,
+  // and only that realm can cancel it (a package cannot clear the
+  // program's timers by guessing their ids).
+  JS::Realm* realm{nullptr};
 
   int jsId{0};
   forge::core::platform::TimerId nativeId{0};
@@ -518,10 +541,10 @@ class JsTimerRegistry {
     return jsId;
   }
 
-  void CancelByJsId(int jsId) {
+  void CancelByJsId(int jsId, JS::Realm* realm) {
     forge::core::memory::UniquePtr<JsTimer>* found = timers_.Find(jsId);
 
-    if (found == nullptr) {
+    if (found == nullptr || (*found)->realm != realm) {
       return;
     }
 
@@ -584,12 +607,18 @@ static void ForgeTimerFired(void* userData) noexcept {
   JS::RootedObject callback(cx, timer->callback);
   JS::RootedValue thisValue(cx, JS::UndefinedValue());
   JS::RootedValue rval(cx);
+  JS::RootedObject global(cx, JS::GetRealmGlobalOrNull(timer->realm));
 
-  bool ok = JS::Call(cx, thisValue, callback, timer->arguments,
-                     JS::MutableHandleValue(&rval));
+  if (global) {
+    // Phase 9.3: in the realm that created the timer (a package's timer
+    // callback is not the program's code).
+    JSAutoRealm ar(cx, global);
+    bool ok = JS::Call(cx, thisValue, callback, timer->arguments,
+                       JS::MutableHandleValue(&rval));
 
-  if (!ok) {
-    ReportFatalException(cx, "timer callback");
+    if (!ok) {
+      ReportFatalException(cx, "timer callback");
+    }
   }
 
   // Must be last: on a one-shot timer this destroys *timer (via the
@@ -980,7 +1009,8 @@ class Runtime {
 
       for (size_t i = 0; i < callbacks.length() && !g_stopRequested; ++i) {
         JS::RootedObject callback(cx_, callbacks[i]);
-        JSAutoRealm ar(cx_, callback);
+        JS::RootedObject entry(cx_, forge::runtime::RealmEntryFor(callback));
+        JSAutoRealm ar(cx_, entry);
         JS::RootedValue name(cx_);
         JSString* nameStr = JS_NewStringCopyZ(cx_, kSignalNames[index]);
         bool ok = nameStr != nullptr;
@@ -1201,6 +1231,7 @@ static bool ScheduleJsTimer(JSContext* cx, unsigned argc, JS::Value* vp, bool re
   JS::RootedObject callback(cx, &args[0].toObject());
   timer->callback = callback;
   timer->repeat = repeat;
+  timer->realm = JS::GetCurrentRealmOrNull(cx);
 
   for (unsigned i = 2; i < args.length(); i++) {
     if (!timer->arguments.append(args[i])) {
@@ -1241,7 +1272,7 @@ static bool ClearTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
     return false;
   }
 
-  GetRuntime(cx)->timers().CancelByJsId(id);
+  GetRuntime(cx)->timers().CancelByJsId(id, JS::GetCurrentRealmOrNull(cx));
 
   args.rval().setUndefined();
 
@@ -3837,6 +3868,55 @@ static bool RunConsoleAndForgeSmokeTests(JSContext* cx) {
   return allOk;
 }
 
+//==============================================================================
+// Compartments (Phase 9.3)
+//
+// runtime/Compartments.cpp creates one global per dependency compartment.
+// It must be the same kind of global as the program's (same class, same
+// realm options, the same Runtime pointer for timers), and it gets only the
+// natives that hold no authority.
+//==============================================================================
+
+// The realm options of every Forge global. The program's and each
+// dependency compartment's must match, so their intrinsics line up.
+static void SetForgeRealmOptions(JS::RealmOptions& options) {
+  // Phase 7.9: SharedArrayBuffer (and Atomics on shared memory) is OFF.
+  // Shared memory plus a fine timer is a Spectre-class side channel
+  // (study 15); browsers only allow it in cross-origin-isolated pages.
+  // It will come back behind an explicit permission later.
+  options.creationOptions().setSharedMemoryAndAtomicsEnabled(false);
+}
+
+static JSObject* NewDependencyGlobal(JSContext* cx, JS::HandleObject sameZoneAs) {
+  JS::RealmOptions options;
+  SetForgeRealmOptions(options);
+  // A compartment of its own (so everything that crosses goes through the
+  // wrapper policy) in the program's zone (cheap cross-compartment calls).
+  options.creationOptions().setNewCompartmentInExistingZone(sameZoneAs);
+
+  JS::RootedObject global(
+      cx, JS_NewGlobalObject(cx, &globalClass, nullptr, JS::FireOnNewGlobalHook, options));
+
+  if (!global) {
+    return nullptr;
+  }
+
+  JS::SetReservedSlot(global, RuntimeSlot, JS::GetReservedSlot(sameZoneAs, RuntimeSlot));
+  return global;
+}
+
+// What a dependency compartment gets: console, timers and queueMicrotask.
+// No fs, no Forge namespace, no print (D25: a pure package holds no
+// authority). Timers run and are cancelled per realm (JsTimer::realm).
+static bool DefineDependencyGlobals(JSContext* cx, JS::HandleObject global) {
+  return JS_DefineFunction(cx, global, "setTimeout", SetTimeout, 2, 0) &&
+         JS_DefineFunction(cx, global, "setInterval", SetInterval, 2, 0) &&
+         JS_DefineFunction(cx, global, "clearTimeout", ClearTimeout, 1, 0) &&
+         JS_DefineFunction(cx, global, "clearInterval", ClearTimeout, 1, 0) &&
+         JS_DefineFunction(cx, global, "queueMicrotask", QueueMicrotask, 1, 0) &&
+         forge::runtime::DefineConsole(cx, global);
+}
+
 static void PrintUsage() {
   printf("Forge JavaScript Runtime\n\n");
   printf("Usage:\n");
@@ -3848,6 +3928,7 @@ static void PrintUsage() {
   printf("  --disallow-code-generation-from-strings   Make eval() and new Function() throw\n");
   printf("  --disallow-wasm                           Make WebAssembly compilation throw\n");
   printf("  --async-stacks                            Capture async stack traces (slower)\n");
+  printf("  --frozen-intrinsics                       Freeze the program's built-in objects too\n");
   printf("  --max-heap-mb=N                           Cap the JS heap at N MB (default: no cap)\n\n");
   printf("Permissions (Kavach). Nothing outside the process is allowed unless granted:\n");
   printf("  --allow-read=<path>     Read files and folders under <path> (repeat for more)\n");
@@ -3883,6 +3964,7 @@ static int ForgeMain(int argc, char* argv[]) {
   forge::kavach::PolicyOptions policy;
   bool hasPermissionOptions = false;
   bool asyncStacks = false;
+  bool frozenIntrinsics = false;  // Phase 9.3
   uint32_t maxHeapBytes = 0xffffffff;  // JSGC_MAX_BYTES default: no cap
   int argIndex = 1;
 
@@ -3895,6 +3977,8 @@ static int ForgeMain(int argc, char* argv[]) {
       g_codeGenPolicy.allowWasm = false;
     } else if (strcmp(arg, "--async-stacks") == 0) {
       asyncStacks = true;
+    } else if (strcmp(arg, "--frozen-intrinsics") == 0) {
+      frozenIntrinsics = true;
     } else if (strncmp(arg, "--max-heap-mb=", 14) == 0) {
       char* end = nullptr;
       const unsigned long mb = strtoul(arg + 14, &end, 10);
@@ -4070,6 +4154,17 @@ static int ForgeMain(int argc, char* argv[]) {
     return 1;
   }
 
+  // Phase 9.3: the wrapper policy between compartments (runtime/
+  // Compartments.h). Installed for every program; it only acts once a
+  // second compartment exists.
+  forge::runtime::CompartmentHooks compartmentHooks;
+  compartmentHooks.newGlobal = NewDependencyGlobal;
+  compartmentHooks.defineDependencyGlobals = DefineDependencyGlobals;
+
+  if (!forge::runtime::InitCompartments(cx, compartmentHooks)) {
+    return 1;
+  }
+
   if (!JS::InitSelfHostedCode(cx)) {
     return 1;
   } // SpiderMonkey's own JavaScript library.
@@ -4121,11 +4216,7 @@ static int ForgeMain(int argc, char* argv[]) {
   // first.
   {
     JS::RealmOptions options;
-    // Phase 7.9: SharedArrayBuffer (and Atomics on shared memory) is OFF.
-    // Shared memory plus a fine timer is a Spectre-class side channel
-    // (study 15); browsers only allow it in cross-origin-isolated pages.
-    // It will come back behind an explicit permission later.
-    options.creationOptions().setSharedMemoryAndAtomicsEnabled(false);
+    SetForgeRealmOptions(options);  // Phase 7.9: no shared memory (see there)
 
     JS::RootedObject global(
         cx, JS_NewGlobalObject(cx, &globalClass, nullptr, JS::FireOnNewGlobalHook,
@@ -4143,10 +4234,11 @@ static int ForgeMain(int argc, char* argv[]) {
       }
 
       // Phase 8.2: remember the standard globals, so the op-table self-test
-      // can tell them apart from what Forge adds below.
+      // can tell them apart from what Forge adds below. Phase 9.3: always,
+      // because the lockdown walk starts from them.
       static forge::core::Vector<forge::core::String> standardGlobalNames;
 
-      if (command == "--self-test") {
+      {
         JS::RootedIdVector globalIds(cx);
 
         if (!js::GetPropertyKeys(cx, global, JSITER_OWNONLY | JSITER_HIDDEN, &globalIds)) {
@@ -4163,7 +4255,13 @@ static int ForgeMain(int argc, char* argv[]) {
           }
         }
 
-        g_standardGlobalNames = &standardGlobalNames;
+        if (!forge::runtime::SetStandardGlobalNames(standardGlobalNames)) {
+          return 1;
+        }
+
+        if (command == "--self-test") {
+          g_standardGlobalNames = &standardGlobalNames;
+        }
       } // Initialize standard JS class constructors, prototypes, and any top-level functions and constants associated with the standard classes
       JS_DefineFunction(cx, global, "clearTimeout", ClearTimeout, 1, 0);
       // Phase 8.2: clearInterval (required by the WinterTC minimum common
@@ -4254,7 +4352,7 @@ static int ForgeMain(int argc, char* argv[]) {
         return 1;
       }
 
-      if (forge::runtime::RunEntryModule(cx, entryPath.View()) ==
+      if (forge::runtime::RunEntryModule(cx, entryPath.View(), frozenIntrinsics) ==
           forge::runtime::EntryResult::Threw) {
         ReportFatalException(cx, scriptArg);
         // The module may have already called setTimeout/setInterval before
@@ -4275,6 +4373,7 @@ static int ForgeMain(int argc, char* argv[]) {
 
   StopSignalHandling();
   forge::runtime::ShutdownModules(cx);
+  forge::runtime::ShutdownCompartments(cx);
   runtime.Shutdown();
   JS_DestroyContext(cx);
   JS_ShutDown();

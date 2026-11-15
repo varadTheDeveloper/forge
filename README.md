@@ -37,7 +37,7 @@ Without `--allow-read`, the file read is refused with a message that names the e
 
 Every program is an ES module, so `import`, top-level `await`, JSON modules (`with { type: "json" }`) and `import()` work. A program loads its own modules without any permission, but only from its own folder (the nearest folder with a `forge.json`, or the folder of the file you run); nothing is ever loaded from the network.
 
-Packages are folders with a `forge.json`. A program imports a package by name only if its `forge.json` lists it in `"dependencies"` (as a local `file:` folder for now), and only what the package lists in `"exports"`; reaching into a package by path is refused. Per-package permissions come next; the plan is in [PHASE9_DESIGN.md](PHASE9_DESIGN.md).
+Packages are folders with a `forge.json`. A program imports a package by name only if its `forge.json` lists it in `"dependencies"` (as a local `file:` folder for now), and only what the package lists in `"exports"`; reaching into a package by path is refused. Each package runs isolated from the program, with frozen built-ins and no access at all (no `fs`, no `Forge`, no `eval`); Forge's own functions never cross into it. Per-package permissions come next; the plan is in [PHASE9_DESIGN.md](PHASE9_DESIGN.md).
 
 ---
 

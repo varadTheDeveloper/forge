@@ -19,6 +19,7 @@ SOURCES += [
     "kavach/Ops.cpp",
     "kavach/PathRules.cpp",
     "kavach/SecureFs.cpp",
+    "runtime/Compartments.cpp",
     "runtime/Console.cpp",
     "runtime/Fs.cpp",
     "runtime/Inspect.cpp",

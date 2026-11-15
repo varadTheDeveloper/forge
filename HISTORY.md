@@ -3876,3 +3876,67 @@ passed on the first run. The build reported two `-Wcomma` warnings in
 `Manifest.cpp` (an error message joined to `return false` with a comma);
 they were rewritten as two statements, with no change in behaviour, and
 checked with `-Wcomma` against the engine headers.
+
+## Phase 9.3: packages run isolated (2026-11-15)
+
+Every dependency now runs in a separate compartment with frozen built-ins
+and no access at all. PHASE9_DESIGN.md section 5 has the rules, the
+refinements and the known limits; this entry records what was built.
+
+**Compartments (`runtime/Compartments.cpp`, new):**
+- The program keeps its compartment. Dependencies run in one shared
+  "pure" compartment in the same zone (D25; no dependency can hold a
+  permission before 9.4), created on first use with the program's global
+  class and realm options (`forge.cpp` supplies both through
+  `CompartmentHooks`). It gets the standard globals plus `console`, the
+  timers and `queueMicrotask`; no `fs`, no `Forge`, no `print`.
+- Lockdown: a C++ walk records every intrinsic (from the standard global
+  names, captured before Forge adds its own, plus the hidden ones such as
+  `%ArrayIteratorPrototype%`), in a canonical order. In the pure
+  compartment all of them are frozen, then the global object, `console`
+  and the timer functions. Before freezing, a short list of data
+  properties (`toString`, `constructor`, `name`, `message`, ...) become
+  accessors, so the "override mistake" does not break ordinary code.
+  `--frozen-intrinsics` does the same for the program's own built-ins.
+- The wrapper policy (a pre-wrap callback): a global object and Forge's own
+  objects and functions (also bound ones, and `import.meta.resolve`) never
+  cross; an intrinsic is replaced by the receiving compartment's own
+  intrinsic of the same identity, so a package never holds the program's
+  `Object.prototype`, `Function` or `eval`; everything else crosses as a
+  transparent wrapper. (SpiderMonkey's `SecurityWrapper` was rejected: it
+  breaks `Array.isArray` and built-in methods on wrapped objects.)
+- `eval`, indirect `eval` and `new Function` throw in every dependency
+  compartment, with Forge's own message and code `PermissionDenied`.
+
+**Loader (`runtime/Modules.cpp`):** a module is compiled in its package's
+compartment. Every import of another package goes through a facade module
+generated in C++ from the target's export names and compiled in the
+importer's compartment; `import.meta.load()` (reachable only from the
+facade's own code) evaluates the target in its compartment and hands the
+namespace over as `import.meta.namespace`. Importers see a snapshot of the
+exports (a documented deviation). An import cycle between packages is a
+load-time error naming the packages. Errors raised inside a package's
+compartment reach the importer as the package's own error.
+
+**Runtime:** a timer belongs to the realm that created it (its callback
+runs there; another realm's `clearTimeout` does nothing); `console.count`
+and `console.time` labels are per realm; a microtask or signal listener
+that is a wrapper runs in its compartment; `console.log` of another
+compartment's object prints the object, not `[Proxy]`.
+
+**Tests.** `tests/isolation/` (copied to Temp by the runner) checks, from
+inside a package and across the boundary: no authority globals, no code
+from strings, frozen intrinsics (also the hidden ones) and global, the
+override mistake, prototype pollution directly and through a program
+object, every kind of refused crossing, the `Function` constructor reached
+through `obj.constructor.constructor`, intrinsics mapping both ways,
+errors keeping their type, RegExp statics per compartment, timers and
+microtasks across compartments, snapshot semantics, JSON across packages,
+a dynamic import inside a package, a throwing package, a cross-package
+cycle, and replays of LavaMoat's escapes (a spread `import()`, the
+program's top-level bindings, a new realm). `tests/frozen-intrinsics.js`
+covers the option. The 9.2 package test now runs through facades.
+
+**Verified** on Varad's machine: the build had no warnings, and all 64
+self-tests and all 33 runtime tests (including "isolation (9.3)" and
+"frozen-intrinsics.js") passed on the first run.

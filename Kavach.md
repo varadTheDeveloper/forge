@@ -1,14 +1,14 @@
 # Kavach: permissions in Forge
 
 Kavach™ is the permission system of Forge™. This file describes what exists today
-(Phase 9.2), how to use it, and the user-experience rules every later
+(Phase 9.3), how to use it, and the user-experience rules every later
 permission feature must follow (gap G38 in the master plan).
 
-Status: **preview**. Until packages are isolated from each other (Phase 9)
-and Forge runs inside an operating-system sandbox (Phase 13), Kavach limits
-what a whole program can do; it does not yet stop one package from using
-another package's access, and it cannot stop an exploit of the JavaScript
-engine itself. See "Known limits" below.
+Status: **preview**. Since Phase 9.3 every package runs isolated from the
+program, with no access at all; per-package permissions arrive in 9.4.
+Until Forge runs inside an operating-system sandbox (Phase 13), Kavach
+cannot stop an exploit of the JavaScript engine itself. See "Known limits"
+below.
 
 ## Using it
 
@@ -90,6 +90,16 @@ imported. Only the program's own forge.json may name a folder outside the
 program's folder. forge.json itself stays protected; the loader reads it
 through a dedicated check that refuses a forge.json that is a link and
 records the read in the audit log.
+
+Phase 9.3: packages run isolated. Every dependency runs in a separate
+compartment whose built-in objects and global object are frozen and which
+has no `fs`, no `Forge` namespace and no `eval`; it gets only `console`,
+the timers and `queueMicrotask`. Forge's own functions and objects, and
+the global object, never cross into a package (a `TypeError`), and a
+package never sees the program's built-in objects (it gets its own
+instead), so it cannot pollute the program's prototypes. Details:
+`PHASE9_DESIGN.md` section 5. `--frozen-intrinsics` freezes the program's
+own built-in objects too.
 
 Every module path goes through the same checks as `fs`: the path rules
 above, the as-written check, link resolution and the protected paths, then
@@ -204,8 +214,13 @@ one hard link ..."`) and are audited with the reasons `changed-after-check`,
 
 ## Known limits
 
-- **One policy for the whole program.** Per-package permissions need
-  isolated packages (Phase 9).
+- **One policy for the whole program.** Packages are isolated (9.3) but
+  hold no permission at all; per-package permissions come in 9.4. A
+  closure the program passes to a package can still use the program's
+  access: that is the program's decision.
+- **Pure packages share one compartment.** They cannot change anything
+  they share (it is frozen), but one can read the last RegExp match
+  (`RegExp.lastMatch`) of another (`PHASE9_DESIGN.md`, R19).
 - **Creating links** (`symlink`, `link`) is not offered yet.
 - **Non-ASCII letter case.** Matching ignores the case of ASCII letters
   only. A path whose non-ASCII letters differ in case from the grant, in a
