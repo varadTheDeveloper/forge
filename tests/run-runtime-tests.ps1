@@ -108,6 +108,31 @@ $iApp = Join-Path $iRoot "app"
 New-Item -ItemType Directory -Force -Path $iRoot | Out-Null
 Copy-Item -Recurse -Path (Join-Path $here "isolation\app") -Destination $iApp
 
+# Phase 9.4: a copy of tests\permissions\app in Temp with the files its
+# packages try to read, an audit log, and a program whose grant names a
+# package that two folders hold.
+$gRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-permission-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$gApp = Join-Path $gRoot "app"
+$gAudit = Join-Path $gRoot "audit.jsonl"
+$gDup = Join-Path $gRoot "dup-app"
+New-Item -ItemType Directory -Force -Path $gRoot | Out-Null
+Copy-Item -Recurse -Path (Join-Path $here "permissions\app") -Destination $gApp
+New-Item -ItemType Directory -Force -Path (Join-Path $gApp "data"), (Join-Path $gApp "private"), (Join-Path $gApp "other") | Out-Null
+Set-Content -NoNewline -Path (Join-Path $gApp "data\note.txt") -Value "note-content"
+Set-Content -NoNewline -Path (Join-Path $gApp "private\secret.txt") -Value "secret-content"
+Set-Content -NoNewline -Path (Join-Path $gApp "other\x.txt") -Value "other-content"
+$env:FORGE_PERM_TEST = "perm-value"
+$env:FORGE_PERM_OTHER = "other-value"
+foreach ($d in @("a", "b", "c")) { New-Item -ItemType Directory -Force -Path (Join-Path $gDup $d) | Out-Null }
+Set-Content -NoNewline -Path (Join-Path $gDup "forge.json") -Value '{ "dependencies": { "dup": "file:./a", "other": "file:./b" }, "grants": { "dup": { "read": ["./a"] } } }'
+Set-Content -NoNewline -Path (Join-Path $gDup "main.js") -Value 'import a from "dup"; import o from "other"; console.log("SHOULD NOT RUN " + a + o);'
+Set-Content -NoNewline -Path (Join-Path $gDup "a\forge.json") -Value '{ "name": "dup", "exports": "./i.js", "permissions": { "read": ["./a"] } }'
+Set-Content -NoNewline -Path (Join-Path $gDup "a\i.js") -Value 'export default "a";'
+Set-Content -NoNewline -Path (Join-Path $gDup "b\forge.json") -Value '{ "name": "other", "exports": "./i.js", "dependencies": { "dup": "file:../c" } }'
+Set-Content -NoNewline -Path (Join-Path $gDup "b\i.js") -Value 'import d from "dup"; export default d;'
+Set-Content -NoNewline -Path (Join-Path $gDup "c\forge.json") -Value '{ "name": "dup", "exports": "./i.js" }'
+Set-Content -NoNewline -Path (Join-Path $gDup "c\i.js") -Value 'export default "c";'
+
 # What a folder holds, for "nothing changed" checks.
 function Get-TreeListing([string]$Path) {
   (Get-ChildItem -LiteralPath $Path -Recurse -Force -Attributes !ReparsePoint |
@@ -269,6 +294,39 @@ $cases = @(
              "thrower: true thrower failed at its top level", "cycle: InvalidArgument true",
              "isolation done");
      Not = @("SHOULD NOT", "[Proxy]") },
+  @{ Name = "permissions (9.4)"; File = (Join-Path $gApp "src\main.js"); Exit = 0;
+     Pre = @("--allow-read=$gApp\data", "--allow-read=$gApp\private",
+             "--allow-env=FORGE_PERM_TEST,FORGE_PERM_OTHER", "--audit-log=$gAudit");
+     Args = @($gApp);
+     Has = @("app reads secret: ok secret-content",
+             "reader globals: object object object undefined undefined",
+             "reader data: ok note-content", "reader secret: PermissionDenied reader not-declared",
+             "reader write: PermissionDenied reader not-declared", "reader env: ok perm-value",
+             "reader other env: PermissionDenied reader not-declared",
+             "reader env all: PermissionDenied reader all-variables",
+             "reader async data: ok note-content", "reader async secret: PermissionDenied reader not-declared",
+             "reader leaks fs: PermissionDenied - -",
+             "reader wasm data: ok note-content", "reader wasm secret: PermissionDenied reader not-declared",
+             "greedy data: ok note-content", "greedy secret: PermissionDenied greedy not-granted",
+             "greedy steals from reader: PermissionDenied",
+             "capped other: PermissionDenied capped command-line",
+             "wanting globals: undefined undefined",
+             "the package ""wanting"" runs without the permissions it declares",
+             "permissions done");
+     Not = @("SHOULD NOT", "written");
+     Check = {
+       $p = @()
+       if (Test-Path (Join-Path $gApp "data\out.txt")) { $p += "reader wrote a file" }
+       $log = if (Test-Path $gAudit) { Get-Content -Raw $gAudit } else { "" }
+       foreach ($t in @('"event":"package","package":"reader"', '"package":"reader","permission":"read","target"',
+                        '"reason":"not-declared"', '"reason":"not-granted-by-program"',
+                        '"reason":"not-allowed-by-command-line"', '"package":"reader","permission":"env"')) {
+         if (-not $log.Contains($t)) { $p += "audit log has no $t" }
+       }
+       $p
+     } },
+  @{ Name = "ambiguous grant (9.4)"; File = (Join-Path $gDup "main.js"); Exit = 1;
+     Has = @("two folders hold a package of that name"); Not = @("SHOULD NOT RUN") },
   @{ File = "frozen-intrinsics.js"; Exit = 0; Pre = @("--frozen-intrinsics");
      Has = @("frozen: true true", "extend: TypeError", "override: Fancy ok", "app globals: object object",
              "eval in the program: 2", "frozen done");
@@ -353,9 +411,9 @@ foreach ($j in @($kLink, $rOutLink, $rGitLink, $mOutLink)) {
 # A cleanup problem is reported but never fails the run, so from here on
 # errors do not stop the script (rd writes to stderr for files in use).
 $ErrorActionPreference = "Continue"
-$roots = @($kRoot, $rRoot, $fRoot, $mRoot, $pRoot, $iRoot)
+$roots = @($kRoot, $rRoot, $fRoot, $mRoot, $pRoot, $iRoot, $gRoot)
 $roots += @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module|package|isolation)-test-[0-9a-f]{8}$' } |
+            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module|package|isolation|permission)-test-[0-9a-f]{8}$' } |
             ForEach-Object { $_.FullName })
 foreach ($root in ($roots | Select-Object -Unique)) {
   try {
@@ -367,7 +425,7 @@ foreach ($root in ($roots | Select-Object -Unique)) {
     Write-Host "[runtime-test] note: could not remove $root ($($_.Exception.Message))"
   }
 }
-Remove-Item Env:\FORGE_KAVACH_TEST, Env:\FORGE_REPLAY_GRANTED -ErrorAction SilentlyContinue
+Remove-Item Env:\FORGE_KAVACH_TEST, Env:\FORGE_REPLAY_GRANTED, Env:\FORGE_PERM_TEST, Env:\FORGE_PERM_OTHER -ErrorAction SilentlyContinue
 
 if ($failures -eq 0) {
   Write-Host "[runtime-test] ALL PASSED"
