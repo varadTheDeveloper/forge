@@ -63,6 +63,11 @@ declare global {
     permission?: "read" | "write" | "env" | "env (every variable)";
     /** The environment variable involved, for Forge.env refusals. */
     variable?: string;
+    /**
+     * The package whose permissions refused, when a package's own code was
+     * refused (Phase 9.4). Absent when the program itself was refused.
+     */
+    package?: string;
   }
 
   /** Signals a script can listen for (Ctrl+C and Ctrl+Break on Windows). */
