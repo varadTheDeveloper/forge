@@ -78,7 +78,7 @@ jobs:
       - name: Check test scripts for syntax errors (as ES modules, Phase 9.1)
         run: |
           for f in tests/*.js tests/manual/*.js tests/modules/app/src/main.js tests/modules/app/shared/*.js \
-                   $(find tests/packages tests/isolation -name '*.js'); do
+                   $(find tests/packages tests/isolation tests/permissions -name '*.js'); do
             cp "$f" "$RUNNER_TEMP/check.mjs"
             node --check "$RUNNER_TEMP/check.mjs" || { echo "syntax error in $f"; exit 1; }
           done
