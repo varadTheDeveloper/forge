@@ -1,0 +1,6 @@
+{
+  "name": "cycle-b",
+  "version": "1.0.0",
+  "exports": "./b.js",
+  "dependencies": { "cycle-a": "file:../cycle-a" }
+}
