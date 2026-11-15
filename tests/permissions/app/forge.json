@@ -1,0 +1,15 @@
+{
+  "name": "perm-test-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "reader": "file:./vendor/reader",
+    "greedy": "file:./vendor/greedy",
+    "capped": "file:./vendor/capped",
+    "wanting": "file:./vendor/wanting"
+  },
+  "grants": {
+    "reader": { "read": ["./data"], "env": ["FORGE_PERM_TEST"] },
+    "greedy": { "read": ["./data"] },
+    "capped": { "read": ["./other"] }
+  }
+}
