@@ -12,7 +12,10 @@ so each one needs an answer to two questions:
    one policy for the whole program, so the answer is always "the
    program's". From Phase 9, when packages get their own permissions, a
    callback must run with the authority of the package that **registered**
-   it, never that of the code that happens to fire it.
+   it, never that of the code that happens to fire it. Phase 9.4 does this
+   by realm (D24): a Forge native takes its authority from the realm it
+   was created in, which is always the realm it runs in, and every
+   callback below runs in the realm that registered it.
 
 `tests/fuzz-natives.js` checks this list on every build: it passes values
 whose getters, conversions and Proxy traps count their own calls, and fails

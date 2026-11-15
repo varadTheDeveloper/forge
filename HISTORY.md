@@ -3940,3 +3940,52 @@ covers the option. The 9.2 package test now runs through facades.
 **Verified** on Varad's machine: the build had no warnings, and all 64
 self-tests and all 33 runtime tests (including "isolation (9.3)" and
 "frozen-intrinsics.js") passed on the first run.
+
+## Phase 9.4: per-package permissions (2026-11-15)
+
+A package can now hold permissions of its own: what its forge.json
+declares, intersected with what the program's forge.json grants it, capped
+by the command line (D26). PHASE9_DESIGN.md section 6 has the rules; this
+entry records what was built.
+
+**forge.json (`runtime/Manifest.cpp`):** `permissions` (`read`, `write`,
+`env`: arrays of at most 64 strings; paths relative to the program's
+folder) and `grants` (package name -> the same, where paths may also be
+absolute) are now parsed and validated, wherever they appear; unknown
+permission kinds, absolute paths in `permissions`, invalid names and
+control characters are refused. 21 new unit checks (100 in all).
+
+**Kavach:** package policies (`AddPackagePolicy`), made when a package is
+first loaded, with the same refusals for their paths as `--allow-read`.
+Every path and variable check of a package's code goes through three
+layers (declared, granted, command line) on the path as written, after
+links are resolved, and on the opened handle; the policy travels with the
+checked path to worker threads. A package can never read every variable.
+Refusals name the package and the layer and say what would allow it (the
+exact `grants` entry or command-line option); errors carry `package`. The
+audit log records each policy (`"event":"package"`) and adds `"package"`
+to every decision for a package, with the reasons `not-declared`,
+`not-granted-by-program` and `not-allowed-by-command-line`.
+
+**Compartments (D24, D25):** a package that holds a permission gets a
+compartment of its own (frozen like the pure one) with `fs` and a `Forge`
+namespace of only `env`, `version` and `platform`. Each realm records its
+policy, and the natives take their authority from the current realm, which
+is always their own: no stack walking. The pure compartment's policy
+refuses everything (defense in depth: it has no such natives). A package
+that declares what the program does not grant runs in the pure compartment,
+and Forge warns once. A grant naming a package that two folders hold is
+refused until `forge.lock` binds grants to identities (Phase 14).
+
+**Tests.** `tests/permissions/` (copied to Temp by the runner with its data
+files, two environment variables and an audit log): reads, a write and
+variables allowed and refused at each layer, `Forge.env.toObject()` refused
+in a package, attribution by realm (the program may read a file its package
+may not, also through `fs.readFile` and a WebAssembly import), a package's
+`fs` function refused when handed to the program or to another package, the
+declared-but-not-granted warning, the audit records, and an ambiguous
+grant. `types/forge.d.ts` gains `ForgeError.package`.
+
+**Verified** on Varad's machine: the build had no warnings, and all 64
+self-tests and all 35 runtime tests (including "permissions (9.4)" and
+"ambiguous grant (9.4)") passed on the first run.

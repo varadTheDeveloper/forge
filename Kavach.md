@@ -1,12 +1,12 @@
 # Kavach: permissions in Forge
 
 Kavach™ is the permission system of Forge™. This file describes what exists today
-(Phase 9.3), how to use it, and the user-experience rules every later
+(Phase 9.4), how to use it, and the user-experience rules every later
 permission feature must follow (gap G38 in the master plan).
 
-Status: **preview**. Since Phase 9.3 every package runs isolated from the
-program, with no access at all; per-package permissions arrive in 9.4.
-Until Forge runs inside an operating-system sandbox (Phase 13), Kavach
+Status: **preview**. Since Phase 9.4 every package runs isolated from the
+program and holds only the permissions it declares and the program grants,
+within what the command line allows. Until Forge runs inside an operating-system sandbox (Phase 13), Kavach
 cannot stop an exploit of the JavaScript engine itself. See "Known limits"
 below.
 
@@ -100,6 +100,41 @@ package never sees the program's built-in objects (it gets its own
 instead), so it cannot pollute the program's prototypes. Details:
 `PHASE9_DESIGN.md` section 5. `--frozen-intrinsics` freezes the program's
 own built-in objects too.
+
+### Permissions for packages (Phase 9.4)
+
+A package declares what it needs in its forge.json, and the program grants
+it in its own forge.json. Paths are relative to the program's folder:
+
+```json
+{ "name": "reader", "exports": "./index.js",
+  "permissions": { "read": ["./data"], "env": ["HOME"] } }
+```
+
+```json
+{ "dependencies": { "reader": "file:./vendor/reader" },
+  "grants": { "reader": { "read": ["./data"], "env": ["HOME"] } } }
+```
+
+The package may then read under `./data` and the variable `HOME`, **if the
+command line allows it too** (`--allow-read=...\data`, `--allow-env=HOME`):
+the person running Forge always has the last word. A package that holds a
+permission runs in a compartment of its own with `fs` and `Forge.env`
+(no `Forge.exit`, `Forge.args` or signal listeners), and every call is
+checked against that package's policy, whoever calls the package. A
+package never reads every variable at once. A refusal names the package
+and the layer that refused, and says what would allow it:
+
+```
+Permission denied: the package "reader" (fs.readFileSync) declares read access to
+C:\app\private\x.txt, but the program's forge.json does not grant it.
+To allow it, add to "grants" in the program's forge.json: "reader": { "read": ["C:\\app\\private\\x.txt"] }
+```
+
+The audit log records each package's declared and granted permissions
+(`"event":"package"`) and adds `"package"` to every decision made for a
+package's code; refusals give the reason `not-declared`,
+`not-granted-by-program` or `not-allowed-by-command-line`.
 
 Every module path goes through the same checks as `fs`: the path rules
 above, the as-written check, link resolution and the protected paths, then
@@ -214,10 +249,12 @@ one hard link ..."`) and are audited with the reasons `changed-after-check`,
 
 ## Known limits
 
-- **One policy for the whole program.** Packages are isolated (9.3) but
-  hold no permission at all; per-package permissions come in 9.4. A
-  closure the program passes to a package can still use the program's
-  access: that is the program's decision.
+- **Grants are by name.** Until `forge.lock` binds a grant to a package's
+  identity (Phase 14), a grant naming a package that two folders hold is
+  refused.
+- **Delegation by code.** A closure the program (or a package) passes to
+  another package can still use the giver's access: that is the giver's
+  decision. Forge's own functions themselves never cross.
 - **Pure packages share one compartment.** They cannot change anything
   they share (it is frozen), but one can read the last RegExp match
   (`RegExp.lastMatch`) of another (`PHASE9_DESIGN.md`, R19).

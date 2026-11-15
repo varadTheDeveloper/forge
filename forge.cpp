@@ -2050,7 +2050,9 @@ static bool RequireEnvName(JSContext* cx, const JS::CallArgs& args, const char* 
 static bool CheckEnvAccess(JSContext* cx, forge::kavach::Op op, const forge::core::String& name) {
   forge::kavach::Denial denial;
 
-  if (forge::kavach::CheckEnv(op, name.View(), denial).HasError()) {
+  // Phase 9.4 (D24): with the policy of the realm this native belongs to.
+  if (forge::kavach::CheckEnv(forge::runtime::CurrentPolicy(cx), op, name.View(), denial)
+          .HasError()) {
     return ThrowKavachDenial(cx, op, denial);
   }
 
@@ -2116,7 +2118,9 @@ static bool ForgeEnvToObject(JSContext* cx, unsigned argc, JS::Value* vp) {
   // Phase 8.2: needs --allow-env with no list.
   forge::kavach::Denial denial;
 
-  if (forge::kavach::CheckEnvAll(forge::kavach::Op::EnvToObject, denial).HasError()) {
+  if (forge::kavach::CheckEnvAll(forge::runtime::CurrentPolicy(cx),
+                                 forge::kavach::Op::EnvToObject, denial)
+          .HasError()) {
     return ThrowKavachDenial(cx, forge::kavach::Op::EnvToObject, denial);
   }
 
@@ -3917,6 +3921,27 @@ static bool DefineDependencyGlobals(JSContext* cx, JS::HandleObject global) {
          forge::runtime::DefineConsole(cx, global);
 }
 
+// Phase 9.4: what a permission-holding package gets on top of the above:
+// fs and a Forge namespace with only env, version and platform (no exit,
+// exitCode, args, signal listeners or stdout/stderr). Every native acts
+// with the policy of this realm (forge::runtime::CurrentPolicy).
+static bool DefinePackageGlobals(JSContext* cx, JS::HandleObject global) {
+  if (!DefineDependencyGlobals(cx, global) || !forge::runtime::DefineFs(cx, global)) {
+    return false;
+  }
+
+  JS::RootedObject forge(cx, JS_NewPlainObject(cx));
+  JS::RootedString version(cx, JS_NewStringCopyZ(cx, kForgeVersion));
+  JS::RootedString platform(cx, JS_NewStringCopyZ(cx, "windows"));
+  const unsigned constant = JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT;
+
+  return forge && version && platform &&
+         DefineFrozenSubObject(cx, forge, "env", kForgeEnvMethods) &&
+         JS_DefineProperty(cx, forge, "version", version, constant) &&
+         JS_DefineProperty(cx, forge, "platform", platform, constant) &&
+         JS_DefineProperty(cx, global, "Forge", forge, 0);
+}
+
 static void PrintUsage() {
   printf("Forge JavaScript Runtime\n\n");
   printf("Usage:\n");
@@ -4160,6 +4185,7 @@ static int ForgeMain(int argc, char* argv[]) {
   forge::runtime::CompartmentHooks compartmentHooks;
   compartmentHooks.newGlobal = NewDependencyGlobal;
   compartmentHooks.defineDependencyGlobals = DefineDependencyGlobals;
+  compartmentHooks.definePackageGlobals = DefinePackageGlobals;
 
   if (!forge::runtime::InitCompartments(cx, compartmentHooks)) {
     return 1;

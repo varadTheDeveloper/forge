@@ -1,8 +1,7 @@
 # Phase 9 design: modules, packages and per-package permissions
 
-Status: 2026-11-15. Steps 9.1 and 9.2 are done; 9.3 is being built; 9.4
-follows this document and may refine it, with every change recorded here
-and in `HISTORY.md`.
+Status: 2026-11-15. Steps 9.1, 9.2 and 9.3 are done; 9.4 is being built.
+Every refinement of this document is recorded here and in `HISTORY.md`.
 
 Phase 9 turns Forge from "one script with one policy" into "an app made of
 packages, each holding only the permissions it was given". It is the step
@@ -357,19 +356,73 @@ WebAssembly compilation follows `--disallow-wasm` as in the program.
 
 ## 6. Per-package permissions (step 9.4)
 
-- A dependency declares `"permissions": { "read": ["./data"], "env":
-  ["HOME"] }` in its `forge.json`; paths are relative to the **app**, the
-  only place a person decides what a program may touch.
-- The app grants them in its own `forge.json`:
-  `"grants": { "b": { "read": ["./data"] } }`. Phase 14 moves approvals
-  into `forge.lock` with version binding (R16).
-- The effective policy is declared ∩ granted ∩ command line (D26). A
-  dependency with no effective permission goes into the pure compartment.
-- Each compartment's realm private points at its immutable policy; every
-  native reads the policy from its own realm (D24); async jobs store it.
-- Audit records gain a `package` field.
-- Refusal messages name the package and say which of the three layers
-  refused: not declared, not granted, or not allowed on the command line.
+Built in `runtime/Manifest.cpp` (the fields), `kavach/Kavach.cpp` (the
+policies and checks), `runtime/Compartments.cpp` (one compartment per
+permission holder) and `runtime/Modules.cpp` (registration).
+
+**Declaring and granting.** A dependency declares what it needs in its
+forge.json; the program grants it in its own:
+
+```json
+{ "name": "reader", "permissions": { "read": ["./data"], "write": [], "env": ["HOME"] } }
+{ "dependencies": { "reader": "file:./vendor/reader" },
+  "grants": { "reader": { "read": ["./data"], "env": ["HOME"] } } }
+```
+
+- Paths are relative to the **program's** folder, the only place a person
+  decides what a program may touch. Only a grant may be absolute. Each
+  list holds at most 64 entries; unknown permission kinds are refused.
+- Paths go through the same refusals as `--allow-read` (no drive or share
+  root, not the home folder, nothing protected); variable names must be
+  valid. An invalid entry stops the import with the reason.
+- `permissions` and `grants` are validated wherever they appear, so one
+  forge.json works both as a program and as a package; only a dependency's
+  `permissions` and only the program's `grants` take effect.
+- Phase 14 moves approvals into `forge.lock` with version binding (R16).
+
+**The effective policy (D26).** A package may use a path or a variable
+only if **its forge.json declares it, the program's forge.json grants it,
+and the command line allows it**. The three layers are checked at every
+call, in that order, on the path as written and again after links are
+resolved (and on the opened handle). A package never reads every variable
+(`Forge.env.toObject()` is refused): it reads only the variables it names.
+
+**Compartments (D25).** A package that holds a permission (something it
+declared is also granted) gets a compartment of its own, set up like the
+pure one (frozen intrinsics, frozen global, the wrapper policy), plus
+`fs` and a `Forge` namespace with only `env`, `version` and `platform`: no
+`exit`, `exitCode`, `args`, signal listeners or `stdout`/`stderr`. A
+package that holds none runs in the pure compartment; if it declared
+something the program did not grant, Forge says so once on standard error.
+
+**Attribution by realm (D24).** Each compartment's realm records its
+policy (the program's realm: none, meaning the command line alone; the
+pure compartment: a policy that refuses everything). A Forge native always
+runs in its own realm (it can never be passed to another compartment), so
+it takes its authority from the current realm, never from its caller or
+from a stack walk. So the program calling a package's function that reads
+a file is still the package's read, refused unless the package may do it.
+Async work keeps that authority: the checked path carries its policy to
+the worker thread and to the re-check on the opened handle; timers and
+promise jobs run in the realm that created them.
+
+**Identity.** Grants name packages. Until `forge.lock` binds a grant to a
+package's identity (Phase 14), a program whose grant names a package that
+two different folders hold is refused when the second one loads, rather
+than giving both the same permissions.
+
+**Audit and messages.** Every decision for a package's code carries
+`"package"` in the audit log, and every package policy is recorded when it
+is registered (`"event":"package"`, with what was declared and granted).
+A refusal names the package and the layer: `"reason"` is `not-declared`,
+`not-granted-by-program` or `not-allowed-by-command-line`, and the message
+says what would allow it (the exact `grants` entry, or the exact
+command-line option). Errors carry a `package` property.
+
+**What a package can still do with its authority.** A package can call its
+own functions on behalf of others (it is the package's decision, as in any
+capability system); it can never hand out the Forge function itself, a
+bound copy of it, or the object holding it.
 
 ## 7. Proof (with each step)
 
@@ -389,8 +442,14 @@ WebAssembly compilation follows `--disallow-wasm` as in the program.
   package; a cross-package cycle; replays of the LavaMoat/SES escapes
   above (a spread `import()`, the app's top-level lexical bindings, a new
   realm).
-- 9.4: confused deputy (a package passing its `fs` function to another);
-  Wasm imports across compartments; per-package policies.
+- 9.4 (`tests/permissions`): each layer refusing (not declared, not
+  granted, not allowed on the command line) for reads, writes and
+  variables; `Forge.env.toObject()` refused in a package; attribution by
+  realm (the program may read a file that the package it calls may not),
+  also through `fs.readFile` (async) and a WebAssembly import; confused
+  deputy (a package handing out its `fs` function, to the program and to
+  another package); a declared-but-not-granted package in the pure
+  compartment with a warning; the audit records; an ambiguous grant.
 
 ## 8. Steps
 
