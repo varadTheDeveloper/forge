@@ -1,0 +1,7 @@
+{
+  "name": "greedy",
+  "version": "1.0.0",
+  "exports": "./index.js",
+  "dependencies": { "reader": "file:../reader" },
+  "permissions": { "read": ["./data", "./private"] }
+}
