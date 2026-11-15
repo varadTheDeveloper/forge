@@ -982,6 +982,76 @@ public:
         checked.access_ = access;
         return Result<CheckedPath>(std::move(checked));
     }
+
+    /// Phase 9.2: see CheckManifest in Kavach.h.
+    static Result<CheckedPath> Manifest(StringView packageRoot, Denial& denial) noexcept
+    {
+        const Op op = Op::ModuleImport;
+        denial = Denial();
+        denial.access = Access::Read;
+
+        bool isRoot = false;
+
+        for (Size i = 0; i < g_state.moduleRoots.Size() && !isRoot; ++i)
+        {
+            isRoot = PathEquals(g_state.moduleRoots[i].resolved.View(), packageRoot);
+        }
+
+        String text;
+
+        if (!Append(text, packageRoot) || !Append(text, "\\") || !Append(text, "forge.json"))
+        {
+            return Refuse<CheckedPath>(op, denial, Denial::Kind::Internal, packageRoot);
+        }
+
+        if (!g_state.initialized || !isRoot)
+        {
+            return Refuse<CheckedPath>(op, denial, Denial::Kind::NotGranted, text.View());
+        }
+
+        CanonicalPath lexical;
+        const PathError lexicalError = LexicalCanonicalize(text.View(), g_state.cwd.View(), lexical);
+
+        if (lexicalError != PathError::None)
+        {
+            return Refuse<CheckedPath>(op, denial, Denial::Kind::InvalidPath, text.View(), lexicalError);
+        }
+
+        String resolved;
+
+        if (Resolve(lexical, resolved) != PathError::None)
+        {
+            return Refuse<CheckedPath>(op, denial, Denial::Kind::Internal, lexical.text.View());
+        }
+
+        // forge.json itself must not be a link to somewhere else.
+        if (!PathEquals(resolved.View(), lexical.text.View()))
+        {
+            return Refuse<CheckedPath>(op, denial, Denial::Kind::Link, lexical.text.View());
+        }
+
+        if (!Audit(op, AuditPermissionName(op, Access::Read), resolved.View(), Denial::Kind::None))
+        {
+            denial.kind = Denial::Kind::AuditFailed;
+            denial.target.Append(resolved.View()).Ignore();
+            return Result<CheckedPath>(Failure{ Error(ErrorCode::PermissionDenied) });
+        }
+
+        Result<forge::core::Path> path = forge::core::Path::Create(resolved.View());
+
+        if (path.HasError())
+        {
+            return Refuse<CheckedPath>(op, denial, Denial::Kind::Internal, resolved.View());
+        }
+
+        CheckedPath checked;
+        checked.path_ = std::move(path.Value());
+        checked.text_.Swap(resolved);
+        checked.op_ = op;
+        checked.access_ = Access::Read;
+        checked.manifest_ = true;
+        return Result<CheckedPath>(std::move(checked));
+    }
 };
 
 bool Initialize(
@@ -1249,6 +1319,110 @@ bool SetUpProgramModules(
     return true;
 }
 
+Result<CheckedPath> CheckManifest(
+    StringView packageRoot,
+    Denial& denial) noexcept
+{
+    return Checker::Manifest(packageRoot, denial);
+}
+
+bool ResolvePackageFolder(
+    StringView path,
+    StringView baseFolder,
+    String& resolved,
+    String& message) noexcept
+{
+    resolved.Clear();
+    CanonicalPath lexical;
+    PathError error = LexicalCanonicalize(path, baseFolder, lexical);
+
+    if (error == PathError::None)
+    {
+        error = Resolve(lexical, resolved);
+    }
+
+    if (error != PathError::None)
+    {
+        Append(message, "\"file:");
+        Append(message, path);
+        Append(message, "\" is not a valid path: ");
+        Append(message, DescribePathError(error));
+        return false;
+    }
+
+    const DWORD attributes = AttributesOf(resolved.View());
+
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        Append(message, "there is no folder ");
+        Append(message, resolved.View());
+        return false;
+    }
+
+    String manifest;
+
+    if (!Append(manifest, resolved.View()) || !Append(manifest, "\\") ||
+        !Append(manifest, "forge.json"))
+    {
+        Append(message, "out of memory");
+        return false;
+    }
+
+    const DWORD manifestAttributes = AttributesOf(manifest.View());
+
+    if (manifestAttributes == INVALID_FILE_ATTRIBUTES ||
+        (manifestAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        Append(message, "the folder ");
+        Append(message, resolved.View());
+        Append(message, " has no forge.json, so it is not a package");
+        return false;
+    }
+
+    return true;
+}
+
+void FindInnerPackageRoot(
+    StringView outerRoot,
+    StringView path,
+    String& inner) noexcept
+{
+    inner.Clear();
+
+    if (!PathCovers(outerRoot, path) || PathEquals(outerRoot, path))
+    {
+        return;
+    }
+
+    for (StringView f = ParentPath(path); PathCovers(outerRoot, f) && !PathEquals(outerRoot, f);)
+    {
+        String manifest;
+
+        if (!Append(manifest, f) || !Append(manifest, "\\") || !Append(manifest, "forge.json"))
+        {
+            Append(inner, f);  // out of memory: answer "another package", the safe side
+            return;
+        }
+
+        const DWORD attributes = AttributesOf(manifest.View());
+
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            Append(inner, f);
+            return;
+        }
+
+        const StringView parent = ParentPath(f);
+
+        if (parent.Size() == f.Size())
+        {
+            return;
+        }
+
+        f = parent;
+    }
+}
+
 StringView FirstModuleRoot() noexcept
 {
     return g_state.moduleRoots.Empty() ? StringView() : g_state.moduleRoots[0].resolved.View();
@@ -1299,6 +1473,18 @@ bool VerifyOpenedPath(
 {
     denial = Denial();
     denial.access = checked.GetAccess();
+
+    // Phase 9.2: a manifest must be exactly the file that was checked.
+    if (checked.IsManifest())
+    {
+        if (!PathEquals(finalPath, checked.Text()))
+        {
+            RecordLateDenial(checked, denial, Denial::Kind::Changed, finalPath);
+            return false;
+        }
+
+        return true;
+    }
 
     if (IsProtected(finalPath))
     {
@@ -1427,7 +1613,8 @@ void FormatDenial(
             Append(message, target);
             Append(message, ": a program loads modules only from its own folder (");
             Append(message, FirstModuleRoot());
-            Append(message, "). No option allows other modules; packages arrive in Phase 9.2.");
+            Append(message, ") and from the folders of its declared packages. Import a package by "
+                            "the name listed in forge.json \"dependencies\".");
         }
         else if (info.permission == Permission::Read || info.permission == Permission::Write ||
             info.permission == Permission::ReadWrite)

@@ -96,6 +96,27 @@ bool SetUpProgramModules(
     forge::core::String& entryResolved,
     forge::core::String& message) noexcept;
 
+/// Phase 9.2: resolves the folder of a "file:" dependency. `path` is as
+/// written in forge.json, relative to `baseFolder` (the declaring package's
+/// root) unless absolute. The folder must exist and hold forge.json. On
+/// success `resolved` is canonical with links followed; on failure
+/// `message` says why.
+[[nodiscard]]
+bool ResolvePackageFolder(
+    forge::core::StringView path,
+    forge::core::StringView baseFolder,
+    forge::core::String& resolved,
+    forge::core::String& message) noexcept;
+
+/// Phase 9.2: the root of the innermost package strictly inside `outerRoot`
+/// that contains `path` (the nearest folder above `path`, below
+/// `outerRoot`, that holds forge.json), or an empty string if `path`
+/// belongs to `outerRoot` itself. Both are canonical, resolved paths.
+void FindInnerPackageRoot(
+    forge::core::StringView outerRoot,
+    forge::core::StringView path,
+    forge::core::String& inner) noexcept;
+
 /// The first module root, canonical and resolved, for messages; empty when
 /// there is none.
 forge::core::StringView FirstModuleRoot() noexcept;
@@ -126,6 +147,10 @@ public:
     /// after the check (the async fs functions). Leaves this proof empty.
     forge::core::Path ReleasePath() noexcept { return std::move(path_); }
 
+    /// Phase 9.2: true for a package manifest read by the module loader
+    /// (CheckManifest), the one case where a protected file is opened.
+    bool IsManifest() const noexcept { return manifest_; }
+
 private:
     friend class Checker;
 
@@ -133,6 +158,7 @@ private:
     forge::core::String text_;
     Op op_ = Op::Count;
     Access access_ = Access::Read;
+    bool manifest_ = false;
 };
 
 /// Why an operation was refused; turned into a message by FormatDenial.
@@ -187,6 +213,16 @@ forge::core::Result<CheckedPath> CheckPath(
 bool VerifyOpenedPath(
     const CheckedPath& checked,
     forge::core::StringView finalPath,
+    Denial& denial) noexcept;
+
+/// Phase 9.2: proof for reading `packageRoot`\forge.json, the package
+/// manifest. forge.json is a protected path (R13) that no grant covers;
+/// only the module loader reads it, through this check. `packageRoot` must
+/// already be a module root, and forge.json must be a plain file in it (not
+/// a link). The read is audited as op `import`.
+[[nodiscard]]
+forge::core::Result<CheckedPath> CheckManifest(
+    forge::core::StringView packageRoot,
     Denial& denial) noexcept;
 
 /// Records a refusal decided after the check (Link, HardLink, Changed).
