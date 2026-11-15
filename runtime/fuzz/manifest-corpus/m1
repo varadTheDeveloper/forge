@@ -1,0 +1,2 @@
+./features/a
+{"name":"p","exports":{".":"./main.js","./features/*":"./src/*.js","./x":{"forge":"./f.js","default":null}}}

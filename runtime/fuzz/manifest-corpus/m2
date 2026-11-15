@@ -1,0 +1,2 @@
+greet/extra
+{"name":"g","exports":"./index.js","dependencies":{"@a/b":"file:../b"}}
