@@ -29,6 +29,7 @@
 #include "kavach/SecureFs.h"
 #include "runtime/Inspect.h"
 #include "runtime/JsUtil.h"
+#include "runtime/Manifest.h"
 #include "runtime/ModuleSpecifier.h"
 
 namespace forge::runtime
@@ -55,7 +56,21 @@ struct ModuleRecord
     String path;  // canonical, resolved Windows path (the module's identity)
     JS::ModuleType type = JS::ModuleType::JavaScript;
     bool isEntry = false;
+    Size package = 0;  // index into Registry::packages (Phase 9.2)
     JS::Heap<JSObject*> module;
+};
+
+/// Phase 9.2: a package, the app's own (index 0) or a dependency. Every
+/// module belongs to exactly one package: the one whose folder holds it,
+/// with no other package folder in between.
+struct Package
+{
+    String root;         // canonical, resolved folder (or the entry file, see rootIsFile)
+    String rootUrl;      // file URL of `root`
+    bool isApp = false;
+    bool rootIsFile = false;  // an app run from the home folder or a drive root
+    bool hasManifest = false;
+    Manifest manifest;
 };
 
 struct Registry
@@ -63,12 +78,12 @@ struct Registry
     Vector<UniquePtr<ModuleRecord>> records;
     /// "<type>|<resolved path>" and "<type>|<url as first written>" -> index.
     HashMap<String, Size> byKey;
+    Vector<UniquePtr<Package>> packages;
+    HashMap<String, Size> packageByRoot;
 };
 
 Registry* g_registry = nullptr;
 bool g_tracing = false;
-
-constexpr const char* kResolveName = "import.meta.resolve";
 
 void TraceRegistry(JSTracer* trc, void* data)
 {
@@ -188,13 +203,74 @@ bool EndsWithIgnoreCase(StringView text, const char* suffix)
     return true;
 }
 
+/// Phase 9.2: true if `resolved` belongs to package `index`.
+bool InsidePackage(Size index, StringView resolved)
+{
+    const Package& package = *g_registry->packages[index];
+
+    if (package.rootIsFile)
+    {
+        return forge::kavach::PathEquals(package.root.View(), resolved);
+    }
+
+    if (!forge::kavach::PathCovers(package.root.View(), resolved))
+    {
+        return false;
+    }
+
+    String inner;
+    forge::kavach::FindInnerPackageRoot(package.root.View(), resolved, inner);
+    return inner.Empty();
+}
+
+/// "the package \"greet\" (C:\app\vendor\greet)" or "the program (C:\app)".
+void AppendPackageLabel(String& text, Size index)
+{
+    const Package& package = *g_registry->packages[index];
+
+    if (package.isApp)
+    {
+        text.Append(StringView("the program (")).Ignore();
+    }
+    else
+    {
+        text.Append(StringView("the package \"")).Ignore();
+        text.Append(package.manifest.name.View()).Ignore();
+        text.Append(StringView("\" (")).Ignore();
+    }
+
+    text.Append(package.root.View()).Ignore();
+    text.Append(')').Ignore();
+}
+
+bool ThrowBoundaryError(JSContext* cx, Size package, StringView resolved, StringView specifier,
+                        StringView referrerUrl)
+{
+    String text;
+    text.Append(StringView("Cannot import \"")).Ignore();
+    text.Append(specifier).Ignore();
+    text.Append(StringView("\": ")).Ignore();
+    text.Append(resolved).Ignore();
+    text.Append(StringView(" is not part of ")).Ignore();
+    AppendPackageLabel(text, package);
+    text.Append(StringView(". A package's files can be imported from another package only by "
+                           "its name, through its \"exports\".")).Ignore();
+    return ThrowModuleError(cx, "PermissionDenied", text.View(), specifier, referrerUrl);
+}
+
 /// Reads, compiles and registers the module at `url`, or returns the one
 /// already loaded. Throws (returns null) on failure.
 JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringView specifier,
-                     StringView referrerUrl, bool isEntry)
+                     StringView referrerUrl, bool isEntry, Size package)
 {
     if (ModuleRecord* known = Lookup(type, url))
     {
+        if (known->package != package)
+        {
+            ThrowBoundaryError(cx, package, known->path.View(), specifier, referrerUrl);
+            return nullptr;
+        }
+
         return known->module;
     }
 
@@ -232,6 +308,14 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
     }
 
     const StringView resolved = checked.Value().Text();
+
+    // Phase 9.2: the file must belong to `package`: inside its folder, with
+    // no other package's folder in between.
+    if (!InsidePackage(package, resolved))
+    {
+        ThrowBoundaryError(cx, package, resolved, specifier, referrerUrl);
+        return nullptr;
+    }
 
     if (ModuleRecord* known = Lookup(type, resolved))
     {
@@ -339,6 +423,7 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
     ModuleRecord* record = made.Value().Get();
     record->type = type;
     record->isEntry = isEntry;
+    record->package = package;
     record->module = module;
 
     const Size index = g_registry->records.Size();
@@ -363,9 +448,336 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
     return module;
 }
 
-/// Resolves `moduleRequest` against `referrer` and loads it.
-JSObject* ResolveAndLoad(JSContext* cx, StringView referrerUrl, JS::HandleObject moduleRequest)
+StringView UrlOf(ModuleRecord* record)
 {
+    return record != nullptr ? record->url.View() : StringView();
+}
+
+/// Phase 9.2: reads and validates the forge.json of the package at `root`.
+bool ReadManifest(JSContext* cx, StringView root, bool isApp, Manifest& manifest,
+                  StringView specifier, StringView referrerUrl)
+{
+    forge::kavach::Denial denial;
+    Result<forge::kavach::CheckedPath> checked = forge::kavach::CheckManifest(root, denial);
+
+    if (checked.HasError())
+    {
+        ThrowKavachDenial(cx, Op::ModuleImport, denial);
+        DefineStringOnPendingError(cx, "specifier", specifier);
+        return false;
+    }
+
+    Result<Vector<u8>> bytes = forge::kavach::fs::ReadFile(checked.Value(), denial);
+
+    if (bytes.HasError())
+    {
+        if (denial.kind != forge::kavach::Denial::Kind::None)
+        {
+            ThrowKavachDenial(cx, Op::ModuleImport, denial);
+            DefineStringOnPendingError(cx, "specifier", specifier);
+            return false;
+        }
+
+        String text;
+        text.Append(StringView("Cannot read ")).Ignore();
+        text.Append(checked.Value().Text()).Ignore();
+        return ThrowModuleError(cx, ErrorCodeToString(bytes.Error().Code()), text.View(), specifier,
+                                referrerUrl);
+    }
+
+    String message;
+    const StringView data(reinterpret_cast<const char*>(bytes.Value().Data()), bytes.Value().Size());
+
+    if (!ParseManifest(data, isApp, manifest, message))
+    {
+        String text;
+        text.Append(checked.Value().Text()).Ignore();
+        text.Append(StringView(" is not valid: ")).Ignore();
+        text.Append(message.View()).Ignore();
+        return ThrowModuleError(cx, "InvalidData", text.View(), specifier, referrerUrl);
+    }
+
+    return true;
+}
+
+/// Phase 9.2: registers a package. `root` must be canonical and resolved.
+bool AddPackage(JSContext* cx, StringView root, bool isApp, bool rootIsFile, bool hasManifest,
+                Manifest&& manifest, Size& index)
+{
+    Result<UniquePtr<Package>> made = forge::core::memory::MakeUnique<Package>();
+
+    if (made.HasError() || made.Value()->root.Append(root).HasError() ||
+        !PathToFileUrl(root, made.Value()->rootUrl))
+    {
+        JS_ReportOutOfMemory(cx);
+        return false;
+    }
+
+    Package& package = *made.Value();
+    package.isApp = isApp;
+    package.rootIsFile = rootIsFile;
+    package.hasManifest = hasManifest;
+    package.manifest = std::move(manifest);
+
+    index = g_registry->packages.Size();
+    String key;
+
+    if (key.Append(root).HasError() || g_registry->packages.PushBack(std::move(made.Value())).HasError() ||
+        g_registry->packageByRoot.Insert(key, index).HasError())
+    {
+        JS_ReportOutOfMemory(cx);
+        return false;
+    }
+
+    return true;
+}
+
+/// Phase 9.2: loads the package that `dependency` of package `from` names,
+/// or finds the one already loaded.
+bool LoadDependency(JSContext* cx, Size from, const Dependency& dependency, StringView specifier,
+                    StringView referrerUrl, Size& out)
+{
+    const Package& owner = *g_registry->packages[from];
+    String resolved;
+    String message;
+
+    if (!forge::kavach::ResolvePackageFolder(dependency.path.View(), owner.root.View(), resolved,
+                                              message))
+    {
+        String text;
+        text.Append(StringView("Cannot load the package \"")).Ignore();
+        text.Append(dependency.name.View()).Ignore();
+        text.Append(StringView("\" listed in the dependencies of ")).Ignore();
+        AppendPackageLabel(text, from);
+        text.Append(StringView(": ")).Ignore();
+        text.Append(message.View()).Ignore();
+        return ThrowModuleError(cx, "NotFound", text.View(), specifier, referrerUrl);
+    }
+
+    // A dependency may only point inside the program's folder; only the
+    // program's own forge.json may point elsewhere (PHASE9_DESIGN.md, 4).
+    // Checked before the cache, so a folder the program itself named does
+    // not become reachable from a dependency that names it too.
+    const Package& app = *g_registry->packages[0];
+
+    if (!owner.isApp &&
+        (app.rootIsFile || !forge::kavach::PathCovers(app.root.View(), resolved.View())))
+    {
+        String text;
+        text.Append(StringView("The package \"")).Ignore();
+        text.Append(owner.manifest.name.View()).Ignore();
+        text.Append(StringView("\" lists \"")).Ignore();
+        text.Append(dependency.name.View()).Ignore();
+        text.Append(StringView("\" at ")).Ignore();
+        text.Append(resolved.View()).Ignore();
+        text.Append(StringView(", outside the program's folder (")).Ignore();
+        text.Append(app.root.View()).Ignore();
+        text.Append(StringView("). Only the program's own forge.json may name a folder "
+                               "outside it.")).Ignore();
+        return ThrowModuleError(cx, "PermissionDenied", text.View(), specifier, referrerUrl);
+    }
+
+    if (const Size* known = g_registry->packageByRoot.Find(resolved))
+    {
+        const Package& package = *g_registry->packages[*known];
+
+        if (package.isApp || !(package.manifest.name.View() == dependency.name.View()))
+        {
+            String text;
+            text.Append(StringView("The dependency \"")).Ignore();
+            text.Append(dependency.name.View()).Ignore();
+            text.Append(StringView("\" points at ")).Ignore();
+            AppendPackageLabel(text, *known);
+            text.Append(StringView(", which is not a package of that name")).Ignore();
+            return ThrowModuleError(cx, "InvalidData", text.View(), specifier, referrerUrl);
+        }
+
+        out = *known;
+        return true;
+    }
+
+    if (!forge::kavach::AddModuleRoot(resolved.View(), message))
+    {
+        return ThrowModuleError(cx, "PermissionDenied", message.View(), specifier, referrerUrl);
+    }
+
+    Manifest manifest;
+
+    if (!ReadManifest(cx, resolved.View(), false, manifest, specifier, referrerUrl))
+    {
+        return false;
+    }
+
+    if (!(manifest.name.View() == dependency.name.View()))
+    {
+        String text;
+        text.Append(StringView("The folder ")).Ignore();
+        text.Append(resolved.View()).Ignore();
+        text.Append(StringView(" holds the package \"")).Ignore();
+        text.Append(manifest.name.View()).Ignore();
+        text.Append(StringView("\", not \"")).Ignore();
+        text.Append(dependency.name.View()).Ignore();
+        text.Append(StringView("\"")).Ignore();
+        return ThrowModuleError(cx, "InvalidData", text.View(), specifier, referrerUrl);
+    }
+
+    return AddPackage(cx, resolved.View(), false, false, true, std::move(manifest), out);
+}
+
+/// Resolves `specifier`, imported by a module of package `from` whose URL is
+/// `referrerUrl`, to a module URL and the package that module must belong
+/// to. Relative and file: specifiers stay in `from`; a bare specifier names
+/// a declared dependency (or the package itself) and goes through its
+/// "exports" (Phase 9.2).
+bool ResolveToUrl(JSContext* cx, Size from, StringView referrerUrl, StringView specifier,
+                  String& url, Size& package)
+{
+    const SpecifierError error = ResolveSpecifier(specifier, referrerUrl, url);
+
+    if (error == SpecifierError::None)
+    {
+        package = from;
+        return true;
+    }
+
+    if (error != SpecifierError::Bare)
+    {
+        String text;
+        text.Append(StringView("Cannot import \"")).Ignore();
+        text.Append(specifier).Ignore();
+        text.Append(StringView("\" from ")).Ignore();
+        AppendImporter(text, referrerUrl);
+        text.Append(StringView(": ")).Ignore();
+        text.Append(StringView(DescribeSpecifierError(error))).Ignore();
+        return ThrowModuleError(cx, SpecifierErrorCode(error), text.View(), specifier, referrerUrl);
+    }
+
+    String name;
+    String subpath;
+
+    if (!SplitBareSpecifier(specifier, name, subpath))
+    {
+        String text;
+        text.Append(StringView("Cannot import \"")).Ignore();
+        text.Append(specifier).Ignore();
+        text.Append(StringView("\": it is not a valid package name (lower-case letters, digits, "
+                               "- . _ ~, optionally @scope/) followed by a subpath")).Ignore();
+        return ThrowModuleError(cx, "InvalidArgument", text.View(), specifier, referrerUrl);
+    }
+
+    const Package& owner = *g_registry->packages[from];
+    Size target = 0;
+
+    if (owner.hasManifest && !owner.manifest.name.Empty() &&
+        owner.manifest.name.View() == name.View())
+    {
+        target = from;  // a package importing itself by name, through its own exports
+    }
+    else
+    {
+        const Dependency* dependency = nullptr;
+
+        for (Size i = 0; owner.hasManifest && i < owner.manifest.dependencies.Size(); ++i)
+        {
+            if (owner.manifest.dependencies[i].name.View() == name.View())
+            {
+                dependency = &owner.manifest.dependencies[i];
+            }
+        }
+
+        if (dependency == nullptr)
+        {
+            String text;
+            text.Append(StringView("Cannot import the package \"")).Ignore();
+            text.Append(name.View()).Ignore();
+            text.Append(StringView("\": ")).Ignore();
+
+            if (owner.hasManifest)
+            {
+                text.Append(StringView("it is not listed in \"dependencies\" in ")).Ignore();
+                text.Append(owner.root.View()).Ignore();
+                text.Append(StringView("\\forge.json")).Ignore();
+            }
+            else
+            {
+                text.Append(StringView("the program has no forge.json; add one next to it with "
+                                       "\"dependencies\"")).Ignore();
+            }
+
+            return ThrowModuleError(cx, "NotFound", text.View(), specifier, referrerUrl);
+        }
+
+        if (!LoadDependency(cx, from, *dependency, specifier, referrerUrl, target))
+        {
+            return false;
+        }
+    }
+
+    const Package& pkg = *g_registry->packages[target];
+    String exportTarget;
+    const ExportResult result = ResolveExport(pkg.manifest, subpath.View(), exportTarget);
+
+    if (result == ExportResult::Found)
+    {
+        String base;
+
+        if (base.Append(pkg.rootUrl.View()).HasError() || base.Append('/').HasError() ||
+            base.Append(StringView(kManifestName)).HasError())
+        {
+            JS_ReportOutOfMemory(cx);
+            return false;
+        }
+
+        const SpecifierError targetError = ResolveSpecifier(exportTarget.View(), base.View(), url);
+
+        if (targetError != SpecifierError::None)
+        {
+            return ThrowModuleError(cx, SpecifierErrorCode(targetError),
+                                    StringView(DescribeSpecifierError(targetError)), specifier,
+                                    referrerUrl);
+        }
+
+        package = target;
+        return true;
+    }
+
+    String text;
+    text.Append(StringView("Cannot import \"")).Ignore();
+    text.Append(specifier).Ignore();
+    text.Append(StringView("\": the package \"")).Ignore();
+    text.Append(name.View()).Ignore();
+
+    switch (result)
+    {
+    case ExportResult::NoExports:
+        text.Append(StringView("\" has no \"exports\" in its forge.json, so nothing in it can be "
+                               "imported")).Ignore();
+        break;
+    case ExportResult::Blocked:
+        text.Append(StringView("\" marks \"")).Ignore();
+        text.Append(subpath.View()).Ignore();
+        text.Append(StringView("\" as private (null in \"exports\")")).Ignore();
+        break;
+    case ExportResult::Invalid:
+        text.Append(StringView("\" maps \"")).Ignore();
+        text.Append(subpath.View()).Ignore();
+        text.Append(StringView("\" to a path that would leave the package")).Ignore();
+        return ThrowModuleError(cx, "InvalidArgument", text.View(), specifier, referrerUrl);
+    default:
+        text.Append(StringView("\" does not export \"")).Ignore();
+        text.Append(subpath.View()).Ignore();
+        text.Append('"').Ignore();
+        break;
+    }
+
+    return ThrowModuleError(cx, "PermissionDenied", text.View(), specifier, referrerUrl);
+}
+
+/// Resolves `moduleRequest` for `referrer` (null for a classic script) and
+/// loads it.
+JSObject* ResolveAndLoad(JSContext* cx, ModuleRecord* referrer, JS::HandleObject moduleRequest)
+{
+    const StringView referrerUrl = UrlOf(referrer);
     JS::RootedString specifierString(cx, JS::GetModuleRequestSpecifier(cx, moduleRequest));
     String specifier;
 
@@ -374,11 +786,19 @@ JSObject* ResolveAndLoad(JSContext* cx, StringView referrerUrl, JS::HandleObject
         return nullptr;
     }
 
-    if (JS::ModuleRequestIsSourcePhase(cx, moduleRequest))
+    if (g_registry->packages.Empty())
     {
         ThrowModuleError(cx, "NotSupported",
-                                StringView("Source-phase imports are not supported"),
-                                specifier.View(), referrerUrl);
+                         StringView("Modules can be imported only by a program started as "
+                                    "`forge file.js`"),
+                         specifier.View(), referrerUrl);
+        return nullptr;
+    }
+
+    if (JS::ModuleRequestIsSourcePhase(cx, moduleRequest))
+    {
+        ThrowModuleError(cx, "NotSupported", StringView("Source-phase imports are not supported"),
+                         specifier.View(), referrerUrl);
         return nullptr;
     }
 
@@ -395,29 +815,48 @@ JSObject* ResolveAndLoad(JSContext* cx, StringView referrerUrl, JS::HandleObject
         return nullptr;
     }
 
+    const Size from = referrer != nullptr ? referrer->package : 0;
     String url;
-    const SpecifierError error = ResolveSpecifier(specifier.View(), referrerUrl, url);
+    Size package = 0;
 
-    if (error != SpecifierError::None)
+    if (!ResolveToUrl(cx, from, referrerUrl, specifier.View(), url, package))
     {
-        String text;
-        text.Append(StringView("Cannot import \"")).Ignore();
-        text.Append(specifier.View()).Ignore();
-        text.Append(StringView("\" from ")).Ignore();
-        AppendImporter(text, referrerUrl);
-        text.Append(StringView(": ")).Ignore();
-        text.Append(StringView(DescribeSpecifierError(error))).Ignore();
-        ThrowModuleError(cx, SpecifierErrorCode(error), text.View(), specifier.View(),
-                                referrerUrl);
         return nullptr;
     }
 
-    return LoadModule(cx, url.View(), type, specifier.View(), referrerUrl, false);
+    return LoadModule(cx, url.View(), type, specifier.View(), referrerUrl, false, package);
 }
 
-StringView UrlOf(ModuleRecord* record)
+/// The index + 1 of `record` (0 for none), as stored where script cannot
+/// reach it (the dynamic-import holder, import.meta.resolve's slot).
+double RecordNumber(ModuleRecord* record)
 {
-    return record != nullptr ? record->url.View() : StringView();
+    for (Size i = 0; record != nullptr && i < g_registry->records.Size(); ++i)
+    {
+        if (g_registry->records[i].Get() == record)
+        {
+            return static_cast<double>(i + 1);
+        }
+    }
+
+    return 0;
+}
+
+ModuleRecord* RecordFromNumber(const JS::Value& value)
+{
+    if (!value.isNumber())
+    {
+        return nullptr;
+    }
+
+    const double n = value.toNumber();
+
+    if (!(n >= 1) || n > static_cast<double>(g_registry->records.Size()))
+    {
+        return nullptr;
+    }
+
+    return g_registry->records[static_cast<Size>(n) - 1].Get();
 }
 
 bool OnLoadResolved(JSContext* cx, JS::HandleValue hostDefined)
@@ -434,7 +873,7 @@ bool OnLoadRejected(JSContext* cx, JS::HandleValue hostDefined, JS::HandleValue 
 }
 
 /// The deferred half of a dynamic import(): args[0] is the holder array
-/// [moduleRequest, payload, referrer URL or undefined], made by
+/// [moduleRequest, payload, referrer record number (RecordNumber)], made by
 /// LoadImportedModule. The array never reaches script, so reading its
 /// elements runs no script.
 bool ContinueDynamicImport(JSContext* cx, unsigned argc, JS::Value* vp)
@@ -459,15 +898,7 @@ bool ContinueDynamicImport(JSContext* cx, unsigned argc, JS::Value* vp)
     }
 
     JS::RootedObject moduleRequest(cx, &requestValue.toObject());
-    String referrerUrl;
-
-    if (referrerValue.isString() &&
-        !AppendStringUtf8(cx, referrerValue.toString(), referrerUrl))
-    {
-        return JS::FinishLoadingImportedModuleFailedWithPendingException(cx, payload);
-    }
-
-    JS::RootedObject module(cx, ResolveAndLoad(cx, referrerUrl.View(), moduleRequest));
+    JS::RootedObject module(cx, ResolveAndLoad(cx, RecordFromNumber(referrerValue), moduleRequest));
 
     if (!module)
     {
@@ -495,7 +926,7 @@ bool LoadImportedModule(JSContext* cx, JS::Handle<JSScript*> referrer,
     (void)lineNumber;
     (void)columnNumber;
 
-    const StringView referrerUrl = UrlOf(RecordOf(referrer));
+    ModuleRecord* referrerRecord = RecordOf(referrer);
 
     JS::RootedObject payloadObject(cx, payload.isObject() ? &payload.toObject() : nullptr);
 
@@ -506,18 +937,7 @@ bool LoadImportedModule(JSContext* cx, JS::Handle<JSScript*> referrer,
         JS::RootedValueArray<3> items(cx);
         items[0].setObject(*moduleRequest);
         items[1].set(payload);
-
-        if (!referrerUrl.Empty())
-        {
-            JSString* url = FromForgeString(cx, referrerUrl);
-
-            if (!url)
-            {
-                return false;
-            }
-
-            items[2].setString(url);
-        }
+        items[2].setNumber(RecordNumber(referrerRecord));
 
         JS::RootedObject holder(cx, JS::NewArrayObject(cx, items));
         JS::RootedValue holderValue(cx, holder ? JS::ObjectValue(*holder) : JS::UndefinedValue());
@@ -532,7 +952,7 @@ bool LoadImportedModule(JSContext* cx, JS::Handle<JSScript*> referrer,
                JS::AddPromiseReactions(cx, delay, continuationObject, continuationObject);
     }
 
-    JS::RootedObject module(cx, ResolveAndLoad(cx, referrerUrl, moduleRequest));
+    JS::RootedObject module(cx, ResolveAndLoad(cx, referrerRecord, moduleRequest));
 
     if (!module)
     {
@@ -553,29 +973,28 @@ bool ImportMetaResolve(JSContext* cx, unsigned argc, JS::Value* vp)
         return ThrowArgumentTypeError(cx, Op::ImportMetaResolve, "the specifier must be a string");
     }
 
-    String base;
+    // Slot 0 holds the module's record number (script cannot read it).
+    ModuleRecord* record = RecordFromNumber(js::GetFunctionNativeReserved(&args.callee(), 0));
     String specifier;
-    const JS::Value& baseValue = js::GetFunctionNativeReserved(&args.callee(), 0);
 
-    if ((baseValue.isString() && !AppendStringUtf8(cx, baseValue.toString(), base)) ||
-        !AppendStringUtf8(cx, args[0].toString(), specifier))
+    if (record == nullptr || !AppendStringUtf8(cx, args[0].toString(), specifier))
     {
+        if (!JS_IsExceptionPending(cx))
+        {
+            JS_ReportErrorASCII(cx, "import.meta.resolve: the module is not known");
+        }
+
         return false;
     }
 
+    // Packages are resolved too (their manifests may be read); nothing is
+    // loaded or evaluated.
     String url;
-    const SpecifierError error = ResolveSpecifier(specifier.View(), base.View(), url);
+    Size package = 0;
 
-    if (error != SpecifierError::None)
+    if (!ResolveToUrl(cx, record->package, record->url.View(), specifier.View(), url, package))
     {
-        String text;
-        text.Append(StringView(kResolveName)).Ignore();
-        text.Append(StringView(": cannot resolve \"")).Ignore();
-        text.Append(specifier.View()).Ignore();
-        text.Append(StringView("\": ")).Ignore();
-        text.Append(StringView(DescribeSpecifierError(error))).Ignore();
-        return ThrowModuleError(cx, SpecifierErrorCode(error), text.View(), specifier.View(),
-                                base.View());
+        return false;
     }
 
     JSString* result = FromForgeString(cx, url.View());
@@ -626,7 +1045,8 @@ bool PopulateImportMeta(JSContext* cx, JS::Handle<JSObject*> moduleRecord,
         return false;
     }
 
-    js::SetFunctionNativeReserved(JS_GetFunctionObject(resolve), 0, urlValue);
+    js::SetFunctionNativeReserved(JS_GetFunctionObject(resolve), 0,
+                                  JS::NumberValue(RecordNumber(record)));
     return true;
 }
 
@@ -709,8 +1129,35 @@ EntryResult RunEntryModule(JSContext* cx, StringView entryPath)
         return EntryResult::Threw;
     }
 
+    // Phase 9.2: the program's own package. Its root is the module root
+    // Kavach chose (the folder with forge.json, the entry's folder, or the
+    // entry file alone).
+    const StringView root = forge::kavach::FirstModuleRoot();
+    const bool rootIsFile = forge::kavach::PathEquals(root, entryPath);
+    bool hasManifest = false;
+    Manifest manifest;
+
+    if (!rootIsFile)
+    {
+        String resolved;
+        String unused;
+        hasManifest = forge::kavach::ResolvePackageFolder(root, root, resolved, unused);
+
+        if (hasManifest && !ReadManifest(cx, root, true, manifest, url.View(), StringView()))
+        {
+            return EntryResult::Threw;
+        }
+    }
+
+    Size appPackage = 0;
+
+    if (!AddPackage(cx, root, true, rootIsFile, hasManifest, std::move(manifest), appPackage))
+    {
+        return EntryResult::Threw;
+    }
+
     JS::RootedObject module(cx, LoadModule(cx, url.View(), JS::ModuleType::JavaScript,
-                                           url.View(), StringView(), true));
+                                           url.View(), StringView(), true, appPackage));
 
     if (!module)
     {

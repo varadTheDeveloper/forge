@@ -23,7 +23,7 @@ enum class SpecifierError
 {
     None,
     Empty,
-    Bare,               // "lib", "@scope/lib": packages arrive in Phase 9.2
+    Bare,               // "lib", "@scope/lib": a package (resolved by runtime/Modules)
     NodeBuiltin,        // "node:fs": Forge has no Node built-ins
     UnsupportedScheme,  // https:, data:, npm:, jsr:, blob:, ...
     WindowsPath,        // "C:/x.js" or "C:\x.js" written as a specifier

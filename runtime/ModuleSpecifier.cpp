@@ -358,8 +358,7 @@ const char* DescribeSpecifierError(SpecifierError error) noexcept
     case SpecifierError::None: return "no error";
     case SpecifierError::Empty: return "the specifier is empty";
     case SpecifierError::Bare:
-        return "importing a package by name needs packages, which arrive in Phase 9.2; "
-               "use a relative path such as ./lib.js";
+        return "a package name is resolved through the \"dependencies\" in forge.json";
     case SpecifierError::NodeBuiltin: return "Forge has no Node built-in modules";
     case SpecifierError::UnsupportedScheme:
         return "Forge loads modules only from files (never from the network, data: or "
