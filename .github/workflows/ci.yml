@@ -3,8 +3,9 @@
 # Jobs:
 #   * forge-core unit tests on Linux under ASan + UBSan (g++), built as both
 #     C++17 and C++20, plus Kavach's portable path-rule tests (Phase 8.2);
-#   * one-minute libFuzzer runs of the Kavach path rules (Phase 8.2) and the
-#     module specifier resolver (Phase 9.1), rule R24;
+#   * one-minute libFuzzer runs of the Kavach path rules (Phase 8.2), the
+#     module specifier resolver (Phase 9.1), the JSON parser and the
+#     forge.json validator (Phase 9.2), rule R24;
 #   * types/forge.d.ts checked with the TypeScript compiler, and every test
 #     script checked for syntax errors with Node (Phase 8.4);
 #   * forge-core unit and smoke tests on Windows with MSVC, including the
@@ -53,14 +54,14 @@ jobs:
   # Phase 8.2 (R24): fuzz the Kavach path rules for a minute on every push.
   fuzz-kavach:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Install clang's fuzzer and sanitizer runtimes
         run: sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev
-      - name: Fuzz kavach/PathRules and runtime/ModuleSpecifier (60 s each)
+      - name: Fuzz the path rules, module specifiers, JSON parser and forge.json (60 s each)
         run: CXX=clang++-18 bash tools/ci/fuzz.sh 60
 
   # Phase 8.4: the type declarations compile, and the JavaScript tests
@@ -76,7 +77,8 @@ jobs:
         run: npx --yes --package=typescript@5.9.3 -- tsc -p types/test
       - name: Check test scripts for syntax errors (as ES modules, Phase 9.1)
         run: |
-          for f in tests/*.js tests/manual/*.js tests/modules/app/src/main.js tests/modules/app/shared/*.js; do
+          for f in tests/*.js tests/manual/*.js tests/modules/app/src/main.js tests/modules/app/shared/*.js \
+                   $(find tests/packages -name '*.js'); do
             cp "$f" "$RUNNER_TEMP/check.mjs"
             node --check "$RUNNER_TEMP/check.mjs" || { echo "syntax error in $f"; exit 1; }
           done
