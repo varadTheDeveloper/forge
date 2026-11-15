@@ -1,0 +1,14 @@
+{
+  "name": "pkg-test-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "greet": "file:./vendor/greet",
+    "@forge-test/util": "file:./vendor/util",
+    "outside": "file:../outside-pkg",
+    "escaper": "file:./vendor/escaper",
+    "broken": "file:./vendor/broken",
+    "misnamed": "file:./vendor/greet",
+    "phantom-user": "file:./vendor/phantom-user",
+    "no-exports": "file:./vendor/no-exports"
+  }
+}
