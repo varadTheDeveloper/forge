@@ -101,6 +101,13 @@ Set-Content -NoNewline -Path (Join-Path $pOutside "index.js") -Value 'export def
 Set-Content -NoNewline -Path (Join-Path $pBad "forge.json") -Value '{ "dependancies": {} }'
 Set-Content -NoNewline -Path (Join-Path $pBad "main.js") -Value 'console.log("SHOULD NOT RUN");'
 
+# Phase 9.3: a copy of tests\isolation\app in Temp (a program with packages
+# that run in the shared, frozen "pure" compartment).
+$iRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("forge-isolation-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+$iApp = Join-Path $iRoot "app"
+New-Item -ItemType Directory -Force -Path $iRoot | Out-Null
+Copy-Item -Recurse -Path (Join-Path $here "isolation\app") -Destination $iApp
+
 # What a folder holds, for "nothing changed" checks.
 function Get-TreeListing([string]$Path) {
   (Get-ChildItem -LiteralPath $Path -Recurse -Force -Attributes !ReparsePoint |
@@ -235,6 +242,37 @@ $cases = @(
      Not = @("SHOULD NOT") },
   @{ Name = "bad forge.json (9.2)"; File = (Join-Path $pBad "main.js"); Exit = 1;
      Has = @("forge.json is not valid", "unknown field ""dependancies"""); Not = @("SHOULD NOT RUN") },
+  @{ Name = "isolation (9.3)"; File = (Join-Path $iApp "src\main.js"); Exit = 0;
+     Has = @("probe globals: undefined undefined undefined", "probe safe globals: function function function",
+             "probe eval: PermissionDenied", "probe indirect eval: PermissionDenied",
+             "probe new Function: PermissionDenied", "probe frozen: true true true true true true",
+             "probe hidden frozen: true true true true true true true true true",
+             "probe pollute Object.prototype: TypeError", "probe then on Promise.prototype: TypeError",
+             "probe global variable: TypeError", "probe replace console.log: TypeError",
+             "probe override: MyError mine custom-text true", "probe app lexical: undefined",
+             "probe new realms: undefined undefined",
+             "meta in a package: true", "json across packages: probe-data 3",
+             "app not polluted: true true", "closure crosses: app-closure", "data crosses: 3 string",
+             "pollute through a wrapper: TypeError", "app not polluted after: true",
+             "prototypes map: true", "intrinsics map back: true true",
+             "Function through constructor: PermissionDenied",
+             "refused fs: PermissionDenied", "refused fs function: PermissionDenied",
+             "refused bound fs function: PermissionDenied", "refused console: PermissionDenied",
+             "refused console.log: PermissionDenied", "refused Forge: PermissionDenied",
+             "refused Forge.env.get: PermissionDenied", "refused global object: PermissionDenied",
+             "refused import.meta.resolve: PermissionDenied", "fs inside an object: PermissionDenied",
+             "Forge.args crosses: true", "error crosses: true probe failed",
+             "regexp statics separate: true true", "live binding: bump=1 seen=0",
+             "{ id: 7, list: [ 1, 2 ] }", "clear from a package: cleared",
+             "package timer: later-ok", "package microtask: micro-ok", "wrapped microtask ran",
+             "app timer survived: true", "package dynamic import: helper-ok", "spread import: NotFound",
+             "thrower: true thrower failed at its top level", "cycle: InvalidArgument true",
+             "isolation done");
+     Not = @("SHOULD NOT", "[Proxy]") },
+  @{ File = "frozen-intrinsics.js"; Exit = 0; Pre = @("--frozen-intrinsics");
+     Has = @("frozen: true true", "extend: TypeError", "override: Fancy ok", "app globals: object object",
+             "eval in the program: 2", "frozen done");
+     Not = @("SHOULD NOT") },
   # Last: it removes the junction the earlier cases use.
   @{ File = "kavach-links.js";           Exit = 0; Has = @("hardlink: PermissionDenied explained", "junction removed: true", "plain: plain-ok");
      Not = @("SHOULD NOT WRITE");
@@ -315,9 +353,9 @@ foreach ($j in @($kLink, $rOutLink, $rGitLink, $mOutLink)) {
 # A cleanup problem is reported but never fails the run, so from here on
 # errors do not stop the script (rd writes to stderr for files in use).
 $ErrorActionPreference = "Continue"
-$roots = @($kRoot, $rRoot, $fRoot, $mRoot, $pRoot)
+$roots = @($kRoot, $rRoot, $fRoot, $mRoot, $pRoot, $iRoot)
 $roots += @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module|package)-test-[0-9a-f]{8}$' } |
+            Where-Object { $_.Name -match '^forge-(kavach|replay|fuzz|module|package|isolation)-test-[0-9a-f]{8}$' } |
             ForEach-Object { $_.FullName })
 foreach ($root in ($roots | Select-Object -Unique)) {
   try {
