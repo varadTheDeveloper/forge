@@ -1,4 +1,5 @@
 // ES modules (Phase 9.1). See Modules.h and PHASE9_DESIGN.md section 3.
+// Packages (Phase 9.2, section 4) and compartments (Phase 9.3, section 5).
 //
 // The engine's own shell loader (js/src/shell/ModuleLoader.cpp at the
 // pinned commit) is the reference for how the load hook, LoadRequestedModules
@@ -27,6 +28,7 @@
 #include "forge-core/memory/Vector.h"
 #include "kavach/Kavach.h"
 #include "kavach/SecureFs.h"
+#include "runtime/Compartments.h"
 #include "runtime/Inspect.h"
 #include "runtime/JsUtil.h"
 #include "runtime/Manifest.h"
@@ -57,6 +59,11 @@ struct ModuleRecord
     JS::ModuleType type = JS::ModuleType::JavaScript;
     bool isEntry = false;
     Size package = 0;  // index into Registry::packages (Phase 9.2)
+    Size compartment = kAppCompartment;  // where the module was compiled (Phase 9.3)
+    /// Phase 9.3: a facade module, made for an importer in `compartment`,
+    /// whose exports are those of records[facadeTarget] (another package).
+    bool isFacade = false;
+    Size facadeTarget = 0;
     JS::Heap<JSObject*> module;
 };
 
@@ -70,6 +77,7 @@ struct Package
     bool isApp = false;
     bool rootIsFile = false;  // an app run from the home folder or a drive root
     bool hasManifest = false;
+    Size compartment = kAppCompartment;  // Phase 9.3 (D25)
     Manifest manifest;
 };
 
@@ -80,6 +88,10 @@ struct Registry
     HashMap<String, Size> byKey;
     Vector<UniquePtr<Package>> packages;
     HashMap<String, Size> packageByRoot;
+    /// Phase 9.3: the packages whose module graphs are being loaded for a
+    /// facade, innermost last. A package already on it is an import cycle
+    /// between packages.
+    Vector<Size> loadingPackages;
 };
 
 Registry* g_registry = nullptr;
@@ -258,10 +270,35 @@ bool ThrowBoundaryError(JSContext* cx, Size package, StringView resolved, String
     return ThrowModuleError(cx, "PermissionDenied", text.View(), specifier, referrerUrl);
 }
 
-/// Reads, compiles and registers the module at `url`, or returns the one
-/// already loaded. Throws (returns null) on failure.
-JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringView specifier,
-                     StringView referrerUrl, bool isEntry, Size package)
+/// Phase 9.3: leaves `exception` (taken in another realm) pending in the
+/// current one.
+void RethrowHere(JSContext* cx, bool thrown, JS::HandleValue exception)
+{
+    if (!thrown)
+    {
+        return;  // an uncatchable error: nothing to rethrow
+    }
+
+    JS::RootedValue value(cx, exception);
+
+    if (JS_WrapValue(cx, &value))
+    {
+        JS_SetPendingException(cx, value);
+    }
+}
+
+/// Phase 9.3: the global object of the compartment that package `index`
+/// runs in.
+JSObject* PackageGlobal(JSContext* cx, Size index)
+{
+    return CompartmentGlobal(cx, g_registry->packages[index]->compartment);
+}
+
+/// Reads, compiles (in the package's compartment) and registers the module
+/// at `url`, or returns the one already loaded. Throws (returns null) in
+/// the current realm on failure.
+ModuleRecord* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringView specifier,
+                         StringView referrerUrl, bool isEntry, Size package)
 {
     if (ModuleRecord* known = Lookup(type, url))
     {
@@ -271,7 +308,7 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
             return nullptr;
         }
 
-        return known->module;
+        return known;
     }
 
     String path;
@@ -334,7 +371,7 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
             return nullptr;
         }
 
-        return known->module;
+        return known;
     }
 
     if (type == JS::ModuleType::JavaScript && EndsWithIgnoreCase(resolved, ".json"))
@@ -392,22 +429,41 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
         return nullptr;
     }
 
-    JS::CompileOptions options(cx);
-    options.setFileAndLine(filename.CStr(), 1);
+    // Phase 9.3: compiled in the realm of the package's compartment, so
+    // its code runs with that compartment's (frozen) intrinsics.
+    JS::RootedObject global(cx, PackageGlobal(cx, package));
 
-    JS::SourceText<mozilla::Utf8Unit> text;
-
-    if (!text.init(cx, length == 0 ? "" : source, length, JS::SourceOwnership::Borrowed))
+    if (!global)
     {
         return nullptr;
     }
 
-    JS::RootedObject module(cx, type == JS::ModuleType::JSON
-                                    ? JS::CompileJsonModule(cx, options, text)
-                                    : JS::CompileModule(cx, options, text));
+    JS::RootedObject module(cx);
+    JS::RootedValue exception(cx);
+    bool thrown = false;
+
+    {
+        JSAutoRealm ar(cx, global);
+        JS::CompileOptions options(cx);
+        options.setFileAndLine(filename.CStr(), 1);
+
+        JS::SourceText<mozilla::Utf8Unit> text;
+
+        if (text.init(cx, length == 0 ? "" : source, length, JS::SourceOwnership::Borrowed))
+        {
+            module = type == JS::ModuleType::JSON ? JS::CompileJsonModule(cx, options, text)
+                                                  : JS::CompileModule(cx, options, text);
+        }
+
+        if (!module)
+        {
+            thrown = TakePendingException(cx, &exception);
+        }
+    }
 
     if (!module)
     {
+        RethrowHere(cx, thrown, exception);
         return nullptr;
     }
 
@@ -424,6 +480,7 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
     record->type = type;
     record->isEntry = isEntry;
     record->package = package;
+    record->compartment = g_registry->packages[package]->compartment;
     record->module = module;
 
     const Size index = g_registry->records.Size();
@@ -445,7 +502,7 @@ JSObject* LoadModule(JSContext* cx, StringView url, JS::ModuleType type, StringV
         JS::SetModulePrivate(module, JS::PrivateValue(record));
     }
 
-    return module;
+    return record;
 }
 
 StringView UrlOf(ModuleRecord* record)
@@ -515,6 +572,9 @@ bool AddPackage(JSContext* cx, StringView root, bool isApp, bool rootIsFile, boo
 
     Package& package = *made.Value();
     package.isApp = isApp;
+    // Phase 9.3 (D25): no dependency can hold a permission before 9.4, so
+    // every dependency runs in the shared, frozen "pure" compartment.
+    package.compartment = isApp ? kAppCompartment : kPureCompartment;
     package.rootIsFile = rootIsFile;
     package.hasManifest = hasManifest;
     package.manifest = std::move(manifest);
@@ -773,6 +833,401 @@ bool ResolveToUrl(JSContext* cx, Size from, StringView referrerUrl, StringView s
     return ThrowModuleError(cx, "PermissionDenied", text.View(), specifier, referrerUrl);
 }
 
+bool OnLoadResolved(JSContext* cx, JS::HandleValue hostDefined);
+bool OnLoadRejected(JSContext* cx, JS::HandleValue hostDefined, JS::HandleValue error);
+double RecordNumber(ModuleRecord* record);
+ModuleRecord* RecordFromNumber(const JS::Value& value);
+
+Size IndexOfRecord(const ModuleRecord* record)
+{
+    Size index = 0;
+
+    while (g_registry->records[index].Get() != record)
+    {
+        ++index;
+    }
+
+    return index;
+}
+
+/// Phase 9.3: appends `name` as the inside of a JavaScript string literal:
+/// letters, digits, `_` and `$` as they are, everything else as \uXXXX.
+/// Export names are well-formed Unicode (the language requires it), so
+/// the result is always valid source.
+bool AppendEscapedName(String& out, StringView name)
+{
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(name.Data());
+    const unsigned char* end = p + name.Size();
+
+    auto unit = [&out](unsigned value) -> bool
+    {
+        char escape[8];
+        snprintf(escape, sizeof(escape), "\\u%04X", value & 0xFFFFu);
+        return out.Append(StringView(escape)).HasValue();
+    };
+
+    while (p < end)
+    {
+        const unsigned char c = *p;
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '$')
+        {
+            if (out.Append(static_cast<char>(c)).HasError())
+            {
+                return false;
+            }
+
+            ++p;
+            continue;
+        }
+
+        unsigned codePoint = 0xFFFD;
+        Size length = 1;
+
+        if (c < 0x80)
+        {
+            codePoint = c;
+        }
+        else if ((c & 0xE0) == 0xC0 && end - p >= 2)
+        {
+            codePoint = ((c & 0x1Fu) << 6) | (p[1] & 0x3Fu);
+            length = 2;
+        }
+        else if ((c & 0xF0) == 0xE0 && end - p >= 3)
+        {
+            codePoint = ((c & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu);
+            length = 3;
+        }
+        else if ((c & 0xF8) == 0xF0 && end - p >= 4)
+        {
+            codePoint = ((c & 0x07u) << 18) | ((p[1] & 0x3Fu) << 12) | ((p[2] & 0x3Fu) << 6) |
+                        (p[3] & 0x3Fu);
+            length = 4;
+        }
+
+        p += length;
+
+        if (codePoint >= 0x10000)
+        {
+            codePoint -= 0x10000;
+
+            if (!unit(0xD800 + (codePoint >> 10)) || !unit(0xDC00 + (codePoint & 0x3FF)))
+            {
+                return false;
+            }
+        }
+        else if (!unit(codePoint))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// Phase 9.3: the source of a facade module. It awaits the target package's
+/// evaluation through import.meta.load() (a Forge function only this module
+/// can reach), then re-exports a snapshot of every export, read from
+/// import.meta.namespace. It is generated from the export names alone,
+/// never from the package's source text. (The namespace is not the
+/// promise's value: a package exporting `then` would make it a thenable.)
+bool BuildFacadeSource(const Vector<String>& names, String& source)
+{
+    bool ok = source.Append(StringView("await import.meta.load();\n"
+                                       "const n = import.meta.namespace;\n")).HasValue();
+
+    for (Size i = 0; ok && i < names.Size(); ++i)
+    {
+        char binding[48];
+        snprintf(binding, sizeof(binding), "const e%zu = n[\"", static_cast<size_t>(i));
+        ok = source.Append(StringView(binding)).HasValue() &&
+             AppendEscapedName(source, names[i].View()) &&
+             source.Append(StringView("\"];\n")).HasValue();
+    }
+
+    ok = ok && source.Append(StringView("export {")).HasValue();
+
+    for (Size i = 0; ok && i < names.Size(); ++i)
+    {
+        char binding[48];
+        snprintf(binding, sizeof(binding), "%s e%zu as \"", i == 0 ? "" : ",",
+                 static_cast<size_t>(i));
+        ok = source.Append(StringView(binding)).HasValue() &&
+             AppendEscapedName(source, names[i].View()) && source.Append('"').HasValue();
+    }
+
+    return ok && source.Append(StringView(" };\n")).HasValue();
+}
+
+/// Phase 9.3: "greet -> util -> greet", the packages of an import cycle.
+void AppendCycle(String& text, Size repeated)
+{
+    bool started = false;
+
+    for (Size i = 0; i < g_registry->loadingPackages.Size(); ++i)
+    {
+        const Size index = g_registry->loadingPackages[i];
+
+        if (!started && index != repeated)
+        {
+            continue;
+        }
+
+        started = true;
+        const Package& package = *g_registry->packages[index];
+        text.Append(package.isApp ? StringView("the program") : package.manifest.name.View()).Ignore();
+        text.Append(StringView(" -> ")).Ignore();
+    }
+
+    text.Append(g_registry->packages[repeated]->manifest.name.View()).Ignore();
+}
+
+/// Phase 9.3: the facade through which modules of `compartment` import
+/// `target`, a module of another package. The target's module graph is
+/// loaded and linked in its own compartment first (an import cycle between
+/// packages is refused here); the facade is compiled in `compartment`.
+ModuleRecord* GetFacade(JSContext* cx, ModuleRecord* target, Size compartment,
+                        StringView specifier, StringView referrerUrl)
+{
+    const Size targetIndex = IndexOfRecord(target);
+    char keyText[64];
+    snprintf(keyText, sizeof(keyText), "F|%zu|%zu", static_cast<size_t>(targetIndex),
+             static_cast<size_t>(compartment));
+    String key;
+
+    if (key.Append(StringView(keyText)).HasError())
+    {
+        JS_ReportOutOfMemory(cx);
+        return nullptr;
+    }
+
+    if (const Size* known = g_registry->byKey.Find(key))
+    {
+        return g_registry->records[*known].Get();
+    }
+
+    for (Size i = 0; i < g_registry->loadingPackages.Size(); ++i)
+    {
+        if (g_registry->loadingPackages[i] == target->package)
+        {
+            String text;
+            text.Append(StringView("Cannot import \"")).Ignore();
+            text.Append(specifier).Ignore();
+            text.Append(StringView("\": it closes an import cycle between packages (")).Ignore();
+            AppendCycle(text, target->package);
+            text.Append(StringView("). Import cycles are allowed only inside one package.")).Ignore();
+            ThrowModuleError(cx, "InvalidArgument", text.View(), specifier, referrerUrl);
+            return nullptr;
+        }
+    }
+
+    JS::RootedObject targetGlobal(cx, CompartmentGlobal(cx, target->compartment));
+    JS::RootedObject facadeGlobal(cx, targetGlobal ? CompartmentGlobal(cx, compartment) : nullptr);
+
+    if (!facadeGlobal || g_registry->loadingPackages.PushBack(target->package).HasError())
+    {
+        if (!JS_IsExceptionPending(cx))
+        {
+            JS_ReportOutOfMemory(cx);
+        }
+
+        return nullptr;
+    }
+
+    // Load and link the target's graph, then read its export names. The
+    // namespace's keys are its exports; reading them runs no code and does
+    // not touch the (not yet initialized) bindings.
+    Vector<String> names;
+    JS::RootedValue exception(cx);
+    bool thrown = false;
+    bool ok = false;
+
+    {
+        JSAutoRealm ar(cx, targetGlobal);
+        JS::RootedObject module(cx, target->module);
+        JS::RootedValue hostDefined(cx, JS::ObjectValue(*module));
+        ok = JS::LoadRequestedModules(cx, module, hostDefined, OnLoadResolved, OnLoadRejected) &&
+             !JS_IsExceptionPending(cx);
+
+        JS::RootedObject ns(cx, ok ? JS::GetModuleNamespace(cx, module) : nullptr);
+        JS::RootedIdVector ids(cx);
+        ok = ns && js::GetPropertyKeys(cx, ns, JSITER_OWNONLY | JSITER_HIDDEN, &ids);
+
+        for (size_t i = 0; ok && i < ids.length(); ++i)
+        {
+            if (!ids[i].isString())
+            {
+                continue;
+            }
+
+            String name;
+            ok = AppendStringUtf8(cx, ids[i].toString(), name) &&
+                 names.PushBack(std::move(name)).HasValue();
+        }
+
+        if (!ok)
+        {
+            if (!JS_IsExceptionPending(cx))
+            {
+                JS_ReportOutOfMemory(cx);
+            }
+
+            thrown = TakePendingException(cx, &exception);
+        }
+    }
+
+    g_registry->loadingPackages.PopBack();
+
+    if (!ok)
+    {
+        RethrowHere(cx, thrown, exception);
+        return nullptr;
+    }
+
+    String source;
+    String filename;
+
+    if (!BuildFacadeSource(names, source) || filename.Append(target->path.View()).HasError() ||
+        filename.Append(StringView(" (package facade)")).HasError())
+    {
+        JS_ReportOutOfMemory(cx);
+        return nullptr;
+    }
+
+    JS::RootedObject facade(cx);
+
+    {
+        JSAutoRealm ar(cx, facadeGlobal);
+        JS::CompileOptions options(cx);
+        options.setFileAndLine(filename.CStr(), 1);
+        JS::SourceText<mozilla::Utf8Unit> text;
+
+        if (text.init(cx, source.Data(), source.Size(), JS::SourceOwnership::Borrowed))
+        {
+            facade = JS::CompileModule(cx, options, text);
+        }
+
+        if (!facade)
+        {
+            thrown = TakePendingException(cx, &exception);
+        }
+    }
+
+    if (!facade)
+    {
+        RethrowHere(cx, thrown, exception);
+        return nullptr;
+    }
+
+    Result<UniquePtr<ModuleRecord>> made = forge::core::memory::MakeUnique<ModuleRecord>();
+
+    if (made.HasError() || made.Value()->url.Append(target->url.View()).HasError() ||
+        made.Value()->path.Append(target->path.View()).HasError())
+    {
+        JS_ReportOutOfMemory(cx);
+        return nullptr;
+    }
+
+    ModuleRecord* record = made.Value().Get();
+    record->type = JS::ModuleType::JavaScript;
+    record->package = target->package;
+    record->compartment = compartment;
+    record->isFacade = true;
+    record->facadeTarget = targetIndex;
+    record->module = facade;
+
+    const Size index = g_registry->records.Size();
+
+    if (g_registry->records.PushBack(std::move(made.Value())).HasError() ||
+        g_registry->byKey.Insert(key, index).HasError())
+    {
+        JS_ReportOutOfMemory(cx);
+        return nullptr;
+    }
+
+    JS::SetModulePrivate(facade, JS::PrivateValue(record));
+    return record;
+}
+
+/// Phase 9.3: import.meta.load() of a facade (`this` is the facade's
+/// import.meta). Evaluates the target module in its own compartment (once;
+/// later calls share that evaluation), defines import.meta.namespace (the
+/// target's namespace, wrapped for the facade's compartment) and returns a
+/// promise that settles when the evaluation does. Reserved slot 0 holds the
+/// facade's record number.
+bool FacadeLoad(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    ModuleRecord* facade = RecordFromNumber(js::GetFunctionNativeReserved(&args.callee(), 0));
+
+    if (facade == nullptr || !facade->isFacade || !args.thisv().isObject())
+    {
+        JS_ReportErrorASCII(cx, "import.meta.load: not a package facade");
+        return false;
+    }
+
+    JS::RootedObject meta(cx, &args.thisv().toObject());
+
+    ModuleRecord* target = g_registry->records[facade->facadeTarget].Get();
+    JS::RootedObject targetGlobal(cx, CompartmentGlobal(cx, target->compartment));
+
+    if (!targetGlobal)
+    {
+        return false;
+    }
+
+    JS::RootedValue evaluation(cx);
+    JS::RootedValue ns(cx);
+    JS::RootedValue exception(cx);
+    bool thrown = false;
+    bool ok = false;
+
+    {
+        JSAutoRealm ar(cx, targetGlobal);
+        JS::RootedObject module(cx, target->module);
+        ok = JS::ModuleEvaluate(cx, module, &evaluation);
+
+        JSObject* nsObject = ok ? JS::GetModuleNamespace(cx, module) : nullptr;
+        ok = nsObject != nullptr;
+
+        if (ok)
+        {
+            ns.setObject(*nsObject);
+        }
+        else
+        {
+            thrown = TakePendingException(cx, &exception);
+        }
+    }
+
+    if (!ok)
+    {
+        RethrowHere(cx, thrown, exception);
+        return false;
+    }
+
+    if (!JS_WrapValue(cx, &evaluation) || !JS_WrapValue(cx, &ns) ||
+        !JS_DefineProperty(cx, meta, "namespace", ns, JSPROP_READONLY | JSPROP_PERMANENT))
+    {
+        return false;
+    }
+
+    // A promise of this realm that settles like the evaluation (fulfilled
+    // with undefined, or rejected with the package's error).
+    JS::RootedObject promise(cx, evaluation.isObject() ? &evaluation.toObject() : nullptr);
+    JS::RootedObject result(cx, promise ? JS::CallOriginalPromiseThen(cx, promise, nullptr, nullptr)
+                                        : JS::CallOriginalPromiseResolve(cx, JS::UndefinedHandleValue));
+
+    if (!result)
+    {
+        return false;
+    }
+
+    args.rval().setObject(*result);
+    return true;
+}
+
 /// Resolves `moduleRequest` for `referrer` (null for a classic script) and
 /// loads it.
 JSObject* ResolveAndLoad(JSContext* cx, ModuleRecord* referrer, JS::HandleObject moduleRequest)
@@ -824,7 +1279,24 @@ JSObject* ResolveAndLoad(JSContext* cx, ModuleRecord* referrer, JS::HandleObject
         return nullptr;
     }
 
-    return LoadModule(cx, url.View(), type, specifier.View(), referrerUrl, false, package);
+    ModuleRecord* record =
+        LoadModule(cx, url.View(), type, specifier.View(), referrerUrl, false, package);
+
+    if (record == nullptr)
+    {
+        return nullptr;
+    }
+
+    if (package == from)
+    {
+        return record->module;
+    }
+
+    // Phase 9.3: another package runs in another compartment (or is its
+    // own module graph in the shared one); it is reached through a facade.
+    ModuleRecord* facade = GetFacade(cx, record, g_registry->packages[from]->compartment,
+                                     specifier.View(), referrerUrl);
+    return facade != nullptr ? facade->module : nullptr;
 }
 
 /// The index + 1 of `record` (0 for none), as stored where script cannot
@@ -1020,6 +1492,21 @@ bool PopulateImportMeta(JSContext* cx, JS::Handle<JSObject*> moduleRecord,
         return true;
     }
 
+    if (record->isFacade)
+    {
+        // Phase 9.3: only the facade's own (generated) code sees this.
+        JSFunction* load = js::DefineFunctionWithReserved(cx, metaObject, "load", FacadeLoad, 0, 0);
+
+        if (!load)
+        {
+            return false;
+        }
+
+        JS::RootedObject loadObject(cx, JS_GetFunctionObject(load));
+        js::SetFunctionNativeReserved(loadObject, 0, JS::NumberValue(RecordNumber(record)));
+        return MarkHostObject(cx, loadObject);
+    }
+
     JS::RootedString url(cx, FromForgeString(cx, record->url.View()));
 
     if (!url)
@@ -1045,9 +1532,11 @@ bool PopulateImportMeta(JSContext* cx, JS::Handle<JSObject*> moduleRecord,
         return false;
     }
 
-    js::SetFunctionNativeReserved(JS_GetFunctionObject(resolve), 0,
-                                  JS::NumberValue(RecordNumber(record)));
-    return true;
+    JS::RootedObject resolveObject(cx, JS_GetFunctionObject(resolve));
+    js::SetFunctionNativeReserved(resolveObject, 0, JS::NumberValue(RecordNumber(record)));
+    // Phase 9.3: it resolves with this module's package; it must not
+    // reach another package.
+    return MarkHostObject(cx, resolveObject);
 }
 
 /// The rejection handler for an entry module whose top-level await fails.
@@ -1109,7 +1598,7 @@ void ShutdownModules(JSContext* cx)
     g_registry = nullptr;
 }
 
-EntryResult RunEntryModule(JSContext* cx, StringView entryPath)
+EntryResult RunEntryModule(JSContext* cx, StringView entryPath, bool frozenIntrinsics)
 {
     String url;
 
@@ -1149,6 +1638,17 @@ EntryResult RunEntryModule(JSContext* cx, StringView entryPath)
         }
     }
 
+    // Phase 9.3: a program with dependencies has its intrinsics recorded
+    // now, before any code runs, so none of them can ever reach a package
+    // as an ordinary wrapper.
+    JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
+    const bool hasDependencies = hasManifest && !manifest.dependencies.Empty();
+
+    if (!global || !PrepareAppRealm(cx, global, hasDependencies, frozenIntrinsics))
+    {
+        return EntryResult::Threw;
+    }
+
     Size appPackage = 0;
 
     if (!AddPackage(cx, root, true, rootIsFile, hasManifest, std::move(manifest), appPackage))
@@ -1156,13 +1656,15 @@ EntryResult RunEntryModule(JSContext* cx, StringView entryPath)
         return EntryResult::Threw;
     }
 
-    JS::RootedObject module(cx, LoadModule(cx, url.View(), JS::ModuleType::JavaScript,
-                                           url.View(), StringView(), true, appPackage));
+    ModuleRecord* entry = LoadModule(cx, url.View(), JS::ModuleType::JavaScript, url.View(),
+                                     StringView(), true, appPackage);
 
-    if (!module)
+    if (entry == nullptr)
     {
         return EntryResult::Threw;
     }
+
+    JS::RootedObject module(cx, entry->module);
 
     JS::RootedValue hostDefined(cx, JS::ObjectValue(*module));
 

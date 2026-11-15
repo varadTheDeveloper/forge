@@ -1,6 +1,10 @@
 #pragma once
 
 // ES modules (Phase 9.1, PHASE9_DESIGN.md section 3, decisions D22 and D23).
+// Packages (9.2, section 4). Compartments (9.3, section 5): a module is
+// compiled in its package's compartment, and a module of another package
+// is reached through a generated facade module in the importer's
+// compartment.
 //
 // Every program file is a module. The engine's module load hook is the only
 // way code is loaded: static imports load synchronously while the graph is
@@ -37,9 +41,14 @@ enum class EntryResult
 /// Loads, links and evaluates the entry module at `entryPath` (canonical,
 /// resolved; from kavach::SetUpProgramModules). If the module's top-level
 /// await later rejects, the rejection is reported through HostReportFatal.
+/// Phase 9.3: call inside the program's realm; a program whose forge.json
+/// lists dependencies gets its intrinsics recorded first (runtime/
+/// Compartments.h), and `frozenIntrinsics` (--frozen-intrinsics) freezes
+/// them as well.
 EntryResult RunEntryModule(
     JSContext* cx,
-    forge::core::StringView entryPath);
+    forge::core::StringView entryPath,
+    bool frozenIntrinsics);
 
 // Implemented by forge.cpp, which owns exit and error reporting.
 /// True once Forge.exit() or a signal asked the program to stop.

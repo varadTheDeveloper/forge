@@ -9,6 +9,7 @@
 #include "js/Conversions.h"
 #include "js/PropertyAndElement.h"
 #include "js/PropertySpec.h"
+#include "js/Realm.h"
 #include "js/Stack.h"
 #include "js/String.h"
 #include "jsapi.h"
@@ -33,6 +34,9 @@ struct LabelEntry
 {
     String label;
     double value = 0;  // a count, or a start time in milliseconds
+    // Phase 9.3: the realm that made it. A package and the program each
+    // have their own counters and timers, so neither can reset the other's.
+    const JS::Realm* realm = nullptr;
 };
 
 /// Process-wide console state. Forge has one JS thread, and console calls
@@ -168,12 +172,15 @@ bool GetLabel(
 }
 
 Size FindLabel(
+    JSContext* cx,
     forge::core::Vector<LabelEntry>& entries,
     StringView label)
 {
+    const JS::Realm* realm = JS::GetCurrentRealmOrNull(cx);
+
     for (Size i = 0; i < entries.Size(); ++i)
     {
-        if (entries[i].label.View() == label)
+        if (entries[i].realm == realm && entries[i].label.View() == label)
         {
             return i;
         }
@@ -336,12 +343,13 @@ bool ConsoleCount(JSContext* cx, unsigned argc, JS::Value* vp)
         return false;
     }
 
-    Size index = FindLabel(g_console.counts, label.View());
+    Size index = FindLabel(cx, g_console.counts, label.View());
 
     if (index == static_cast<Size>(-1))
     {
         LabelEntry entry;
         entry.label.Swap(label);
+        entry.realm = JS::GetCurrentRealmOrNull(cx);
 
         if (g_console.counts.PushBack(std::move(entry)).HasError())
         {
@@ -381,7 +389,7 @@ bool ConsoleCountReset(JSContext* cx, unsigned argc, JS::Value* vp)
         return false;
     }
 
-    const Size index = FindLabel(g_console.counts, label.View());
+    const Size index = FindLabel(cx, g_console.counts, label.View());
 
     if (index == static_cast<Size>(-1))
     {
@@ -405,7 +413,7 @@ bool ConsoleTime(JSContext* cx, unsigned argc, JS::Value* vp)
         return false;
     }
 
-    if (FindLabel(g_console.timers, label.View()) != static_cast<Size>(-1))
+    if (FindLabel(cx, g_console.timers, label.View()) != static_cast<Size>(-1))
     {
         WarnAboutLabel("Timer '", label.View(), "' already exists");
         return true;
@@ -414,6 +422,7 @@ bool ConsoleTime(JSContext* cx, unsigned argc, JS::Value* vp)
     LabelEntry entry;
     entry.label.Swap(label);
     entry.value = NowMs();
+    entry.realm = JS::GetCurrentRealmOrNull(cx);
 
     if (g_console.timers.PushBack(std::move(entry)).HasError())
     {
@@ -434,7 +443,7 @@ bool ReportTimer(JSContext* cx, const JS::CallArgs& args, bool end)
         return false;
     }
 
-    const Size index = FindLabel(g_console.timers, label.View());
+    const Size index = FindLabel(cx, g_console.timers, label.View());
 
     if (index == static_cast<Size>(-1))
     {

@@ -24,6 +24,7 @@
 #include "js/Stack.h"
 #include "js/String.h"
 #include "js/Symbol.h"
+#include "js/Wrapper.h"
 #include "js/experimental/TypedData.h"
 #include "jsapi.h"
 #include "jsfriendapi.h"
@@ -1313,6 +1314,21 @@ private:
 
     bool RenderObject(JS::HandleObject obj, unsigned depth, unsigned indent, Text& out)
     {
+        // Phase 9.3: an object of another compartment (a package's object
+        // seen by the program, or the other way round) arrives as a
+        // cross-compartment wrapper. It runs no script, so look through it
+        // and print the object itself, inside its own realm.
+        if (js::IsCrossCompartmentWrapper(obj))
+        {
+            JS::RootedObject target(cx_, js::UncheckedUnwrap(obj));
+
+            if (target && !JS_IsDeadWrapper(target) && !js::IsCrossCompartmentWrapper(target))
+            {
+                JSAutoRealm ar(cx_, target);
+                return RenderObject(target, depth, indent, out);
+            }
+        }
+
         // A Proxy's handler is script: asking it anything would run code.
         if (js::IsProxy(obj))
         {
