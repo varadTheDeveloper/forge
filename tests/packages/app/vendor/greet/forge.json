@@ -1,0 +1,12 @@
+{
+  "name": "greet",
+  "version": "1.0.0",
+  "exports": {
+    ".": "./index.js",
+    "./extra": { "node": "./extra-node.js", "forge": "./extra-forge.js", "default": "./extra-default.js" },
+    "./features/*": "./features/*.js",
+    "./private": null,
+    "./escape": "./escape.js"
+  },
+  "dependencies": { "@forge-test/util": "file:../util" }
+}
