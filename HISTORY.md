@@ -4047,3 +4047,67 @@ console output across compartments, both ways), and the web APIs added to
 self-tests and all 37 runtime tests (including "web APIs (10.1)", "web
 uncaught (10.1)" and the extended "isolation (9.3)") passed on the first
 run.
+
+## Phase 10.2: events, and uncaught errors as events (2026-11-17)
+
+`Event`, `CustomEvent`, `ErrorEvent`, `PromiseRejectionEvent` and
+`EventTarget`, built as D27 describes (`runtime/WebApis.js`), plus
+`reportError`, `self`, `navigator` (`userAgent` is `"Forge"`) and the
+`onerror`, `onunhandledrejection` and `onrejectionhandled` handlers.
+PHASE10_DESIGN.md section 5 has the details.
+
+**The global object is an EventTarget**, as a worker's is: its prototype is
+`EventTarget.prototype`, and an operation called with no `this` acts on it,
+so `addEventListener(...)` works bare. Dispatch follows the DOM Standard
+for a target that is not a node (capturing listeners first, all at
+`AT_TARGET`; `once`, `passive`, `handleEvent`, unforgeable `isTrusted`).
+Listener lists are null-prototype array-likes, so a setter added to
+`Array.prototype` or `Object.prototype` is never reached.
+
+**Uncaught errors are events (D28).** The main module, timers,
+microtasks, signal listeners, top-level `await`, event listeners and
+`reportError()` now report an exception with an `ErrorEvent` at the
+program's global object (fields from the error report, no script run);
+unhandled rejections fire `unhandledrejection`, and a cancelled one fires
+`rejectionhandled` when it is handled later (`JS::GetPromiseIsHandled`
+decides, as in HTML). Only an event no listener cancels is printed and
+makes the exit code 1; the output is the same as before. These events go
+only to the program's global, never a package's: packages share the pure
+compartment's global, and none may hide another's errors. An exception in
+an error listener is uncaught at once. In forge.cpp, `ReportFatalException`
+now hands the exception to `forge::runtime::ReportException`, which calls
+back `HostReportUncaught` for the old output; the event loop drains the
+microtasks rejection listeners queue; a cancelled error in the main
+module's top-level code no longer ends the program.
+
+**Compartments.** `Navigator.prototype` is a hidden intrinsic (frozen in
+packages); the `navigator` object itself is frozen in every realm. A
+program listener on a package's EventTarget works through forwarding; an
+`Event` can be dispatched only at a target of its own compartment (a
+documented deviation). `Event.timeStamp` comes from a 0.1 ms clock (a new
+native, ready for `performance` in 10.6). Eleven new `kavach/Ops.h` rows,
+all `Permission::None`.
+
+**Tests.** `tests/web-events.js` (36 groups: the WPT cases, transcribed,
+for the event classes, EventTarget, the global object, handlers and
+`reportError`, plus patched built-ins), `tests/web-error-handled.js`
+(cancelled errors from a listener, `reportError`, top-level code, a
+microtask and a timer; a cancelled rejection handled later),
+`tests/web-error-unhandled.js` (a listener that does not cancel; an
+exception inside an error listener), new `webby` checks in the isolation
+test, and the event APIs in `tests/fuzz-natives.js` (which cancels the
+TypeErrors its own object listeners cause). `types/forge.d.ts` declares
+everything, with `types/test/usage.ts` checks.
+
+The WPT runner moves to 10.3, with `AbortController`.
+
+**Found by the first build:** the op-table self-test (R2) copied each
+global Forge adds onto a probe object as a data property, so an accessor
+(`self`, `navigator`, the three `on…` handlers, the first accessors on the
+global) became `undefined` and its row looked unreachable. It now copies
+the whole property descriptor.
+
+**Verified** on Varad's machine: the build had no warnings; after the
+self-test fix above, all 64 self-tests and all 40 runtime tests (including
+"web events (10.2)", "error events (10.2)", "error events, not cancelled
+(10.2)" and the extended "isolation (9.3)") passed.

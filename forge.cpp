@@ -352,16 +352,48 @@ static void ReportPendingException(JSContext* cx, const char* context) {
 }
 
 // Reports the pending exception as uncaught and makes the process exit
-// with code 1 once the event loop unwinds.
+// with code 1 once the event loop unwinds. Phase 10.2: first the HTML
+// "report an exception" steps (runtime/WebApis.h): an "error" event at the
+// program's global object, which a listener may cancel; then, if none
+// did, HostReportUncaught below.
 static void ReportFatalException(JSContext* cx, const char* context) {
-  if (g_exitRequested && !JS_IsExceptionPending(cx)) {
-    // Forge.exit() or a signal unwound the script; the exit code is set.
+  if (!JS_IsExceptionPending(cx)) {
+    if (g_exitRequested) {
+      // Forge.exit() or a signal unwound the script; the exit code is set.
+      g_stopRequested = true;
+      return;
+    }
+
+    fprintf(stderr, "Uncaught exception in %s:\n", context);
+    ReportPendingException(cx, context);  // the "uncatchable error" line
+    g_exitCode = 1;
     g_stopRequested = true;
     return;
   }
 
+  JS::ExceptionStack exn(cx);
+
+  if (!JS::StealPendingExceptionStack(cx, &exn)) {
+    JS_ClearPendingException(cx);
+    fprintf(stderr, "Uncaught exception in %s (it could not be retrieved)\n", context);
+    g_exitCode = 1;
+    g_stopRequested = true;
+    return;
+  }
+
+  forge::runtime::ReportException(cx, exn, context);
+}
+
+// Phase 10.2 (runtime/WebApis.h): an exception nobody cancelled.
+void forge::runtime::HostReportUncaught(JSContext* cx, const JS::ExceptionStack& exception,
+                                        const char* context) {
+  if (g_exitRequested) {
+    g_stopRequested = true;  // Forge.exit() inside an error listener
+    return;
+  }
+
   fprintf(stderr, "Uncaught exception in %s:\n", context);
-  ReportPendingException(cx, context);
+  PrintExceptionReport(cx, exception, context);
   g_exitCode = 1;
   g_stopRequested = true;
 }
@@ -789,6 +821,11 @@ class Runtime {
 
       if (!g_stopRequested) {
         ReportUnhandledRejections();
+
+        // Phase 10.2: rejection listeners may have queued microtasks.
+        if (!g_stopRequested && JS::HasAnyMicroTasks(cx_)) {
+          continue;
+        }
       }
 
       // Phase 8: Ctrl+C / Ctrl+Break recorded since the last pass.
@@ -906,6 +943,14 @@ class Runtime {
       JS::TraceEdge(trc, &unhandledRejections_[i]->promise, "forge-unhandled-rejection");
     }
 
+    for (forge::core::Size i = 0; i < reportingRejections_.Size(); ++i) {
+      JS::TraceEdge(trc, &reportingRejections_[i]->promise, "forge-reporting-rejection");
+    }
+
+    for (forge::core::Size i = 0; i < handledLater_.Size(); ++i) {
+      JS::TraceEdge(trc, &handledLater_[i]->promise, "forge-rejection-handled-later");
+    }
+
     for (forge::core::Size i = 0; i < signalListeners_.Size(); ++i) {
       JS::TraceEdge(trc, &signalListeners_[i]->callback, "forge-signal-listener");
     }
@@ -943,6 +988,8 @@ class Runtime {
     forge::runtime::ShutdownFs(cx_);  // Phase 8.3: pending fs jobs, while cx is alive
     timers_.Clear();
     unhandledRejections_.Clear();
+    reportingRejections_.Clear();
+    handledLater_.Clear();
     signalListeners_.Clear();
 
     for (int i = 0; i < kSignalCount; ++i) {
@@ -972,6 +1019,12 @@ class Runtime {
   };
 
   forge::core::Vector<forge::core::memory::UniquePtr<TrackedRejection>> unhandledRejections_;
+
+  // Phase 10.2: the rejections whose "unhandledrejection" events are being
+  // dispatched right now, and rejections that got a handler after being
+  // reported (each may fire "rejectionhandled"). Both are traced.
+  forge::core::Vector<forge::core::memory::UniquePtr<TrackedRejection>> reportingRejections_;
+  forge::core::Vector<forge::core::memory::UniquePtr<TrackedRejection>> handledLater_;
 
   // Phase 8: Forge.addSignalListener callbacks, in registration order.
   struct SignalListener {
@@ -1061,16 +1114,18 @@ class Runtime {
         }
       }
 
-      return;
+      // Phase 10.2: already reported. If its event was cancelled, the next
+      // pass fires "rejectionhandled" (runtime/WebApis.h).
     }
 
+    auto& target = state == JS::PromiseRejectionHandlingState::Handled ? self->handledLater_ : list;
     forge::core::Result<forge::core::memory::UniquePtr<TrackedRejection>> made =
         forge::core::memory::MakeUnique<TrackedRejection>();
 
     if (made.HasValue()) {
       made.Value()->promise = promise;
 
-      if (list.PushBack(std::move(made.Value())).HasValue()) {
+      if (target.PushBack(std::move(made.Value())).HasValue()) {
         return;
       }
     }
@@ -1083,16 +1138,46 @@ class Runtime {
     g_stopRequested = true;
   }
 
-  // Reports every still-unhandled rejection (with the reason's own stack
-  // when it is an Error) and makes the process exit with code 1.
+  // The HTML "notify about rejected promises" steps, after a microtask
+  // drain. Phase 10.2: first "rejectionhandled" for reported rejections
+  // that got a handler since; then, for each rejection still without a
+  // handler, an "unhandledrejection" event at the program's global object.
+  // A rejection whose event no listener cancelled is printed (with the
+  // reason's own stack when it is an Error) and makes the process exit
+  // with code 1.
   void ReportUnhandledRejections() {
+    for (forge::core::Size i = 0; i < handledLater_.Size(); ++i) {
+      JS::RootedObject promise(cx_, handledLater_[i]->promise);
+      JSAutoRealm ar(cx_, promise);
+      forge::runtime::FireRejectionHandled(cx_, promise);
+    }
+
+    handledLater_.Clear();
+
     if (unhandledRejections_.Empty()) {
       return;
     }
 
-    for (forge::core::Size i = 0; i < unhandledRejections_.Size(); ++i) {
-      JS::RootedObject promise(cx_, unhandledRejections_[i]->promise);
+    // Listeners may reject or handle promises meanwhile: new rejections go
+    // to the (now empty) unhandledRejections_ for the next pass.
+    reportingRejections_ = std::move(unhandledRejections_);
+    unhandledRejections_.Clear();
+    bool fatal = false;
+
+    for (forge::core::Size i = 0; i < reportingRejections_.Size() && !g_exitRequested; ++i) {
+      JS::RootedObject promise(cx_, reportingRejections_[i]->promise);
       JSAutoRealm ar(cx_, promise);
+
+      if (JS::GetPromiseIsHandled(promise)) {
+        continue;  // an earlier listener attached a handler
+      }
+
+      bool handled = false;
+      forge::runtime::FireUnhandledRejection(cx_, promise, &handled);
+
+      if (handled) {
+        continue;
+      }
 
       JS::RootedValue reason(cx_, JS::GetPromiseResult(promise));
       JS::RootedObject stack(cx_);
@@ -1105,11 +1190,15 @@ class Runtime {
       fprintf(stderr, "Uncaught (in promise):\n");
       JS::ExceptionStack exn(cx_, reason, stack);
       PrintExceptionReport(cx_, exn, "unhandled promise rejection");
+      fatal = true;
     }
 
-    unhandledRejections_.Clear();
-    g_exitCode = 1;
-    g_stopRequested = true;
+    reportingRejections_.Clear();
+
+    if (fatal && !g_exitRequested) {
+      g_exitCode = 1;
+      g_stopRequested = true;
+    }
   }
 };
 
@@ -3751,19 +3840,21 @@ static bool SelfTest_OpTableCoversNatives(JSContext* cx) {
       continue;
     }
 
-    // Something Forge added: walk it as a root.
+    // Something Forge added: walk it as a root. Phase 10.2: the whole
+    // descriptor is copied, so an accessor on the global (self, navigator,
+    // onerror, ...) is checked as one (a data-only copy turned it into
+    // undefined, and its row looked unreachable).
     JS::RootedObject holder(cx, JS_NewPlainObject(cx));
     JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(cx);
+    bool found = holder && JS_GetOwnPropertyDescriptorById(cx, global, id, &desc) && desc.isSome();
 
-    JS::RootedValue rootValue(cx);
-
-    if (holder && JS_GetOwnPropertyDescriptorById(cx, global, id, &desc) && desc.isSome() &&
-        desc->isDataDescriptor()) {
-      rootValue = desc->value();
+    if (found) {
+      JS::Rooted<JS::PropertyDescriptor> copy(cx, *desc);
+      copy.setConfigurable(true);
+      found = JS_DefinePropertyById(cx, holder, id, copy);
     }
 
-    if (!holder || desc.isNothing() ||
-        !JS_DefinePropertyById(cx, holder, id, rootValue, JSPROP_ENUMERATE)) {
+    if (!found) {
       JS_ClearPendingException(cx);
       fprintf(stderr, "  FAIL op table: could not inspect global %s\n", name.CStr());
       ok = false;
@@ -4292,7 +4383,7 @@ static int ForgeMain(int argc, char* argv[]) {
         // walk roots for the lockdown like the engine's globals, but the
         // op-table self-test (R2) still sees them as Forge's (they have
         // rows in kavach/Ops.h), so it keeps the engine-only list.
-        if (!forge::runtime::DefineWebApis(cx, global)) {
+        if (!forge::runtime::DefineWebApis(cx, global, forge::runtime::WebRealm::Program)) {
           ReportFatalException(cx, "startup");
           runtime.Shutdown();
           return 1;
@@ -4418,13 +4509,19 @@ static int ForgeMain(int argc, char* argv[]) {
       if (forge::runtime::RunEntryModule(cx, entryPath.View(), frozenIntrinsics) ==
           forge::runtime::EntryResult::Threw) {
         ReportFatalException(cx, scriptArg);
-        // The module may have already called setTimeout/setInterval before
-        // failing; release those before cx goes away, same reasoning as the
-        // runtime.Shutdown() call after the event loop below.
-        StopSignalHandling();
-        runtime.Shutdown();
-        // Phase 8: Forge.exit(n) in the main module is not a failure.
-        return g_exitRequested ? g_exitCode : 1;
+
+        // Phase 10.2: an "error" listener cancelled it; the program goes on
+        // (its timers and promises still run), as in a browser or Deno.
+        if (g_stopRequested) {
+          // The module may have already called setTimeout/setInterval
+          // before failing; release those before cx goes away, same
+          // reasoning as the runtime.Shutdown() call after the event loop
+          // below.
+          StopSignalHandling();
+          runtime.Shutdown();
+          // Phase 8: Forge.exit(n) in the main module is not a failure.
+          return g_exitRequested ? g_exitCode : 1;
+        }
       }
 
       // Phase 8: the old "Result = <number>" line printed after a script
@@ -4437,6 +4534,7 @@ static int ForgeMain(int argc, char* argv[]) {
   StopSignalHandling();
   forge::runtime::ShutdownModules(cx);
   forge::runtime::ShutdownCompartments(cx);
+  forge::runtime::ShutdownWebApis();  // Phase 10.2: the program global's root
   runtime.Shutdown();
   JS_DestroyContext(cx);
   JS_ShutDown();

@@ -17,9 +17,10 @@ order of the rest of Phase 10: [PHASE10_DESIGN.md](PHASE10_DESIGN.md).
 | ⚙️ Engine | Provided by SpiderMonkey; not yet covered by Forge's tests |
 | ❌ No | Not implemented yet; the phase that adds it is given |
 
-**Summary (2026-11-15):** of the 25 global functions and properties, 7 are
-✅, 1 is 🟡, 4 are ⚙️ and 13 are ❌. Of the 53 interfaces, 2 are ✅, 1 is
-🟡, 10 are ⚙️ (all WebAssembly) and 40 are ❌.
+**Summary (2026-11-17):** of the 25 global functions and properties, 14
+are ✅, 1 is 🟡, 4 are ⚙️ and 6 are ❌. Of the 53 interfaces, 7 are ✅, 1
+is 🟡, 10 are ⚙️ (all WebAssembly) and 35 are ❌. (The Phase 10.1 summary
+counted `atob()` and `btoa()` as one entry; they are two.)
 
 ## Global functions and properties (§5.2)
 
@@ -40,24 +41,27 @@ order of the rest of Phase 10: [PHASE10_DESIGN.md](PHASE10_DESIGN.md).
 | `WebAssembly.instantiateStreaming()` | ❌ No | Needs `Response`; Phase 11 |
 | `atob()`, `btoa()` | ✅ Yes | Phase 10.1 (forgiving-base64, WebIDL conversions, `InvalidCharacterError`) |
 | `structuredClone()` | ❌ No | Phase 10 |
-| `reportError()` | ❌ No | Phase 10 |
-| `self` | ❌ No | Phase 10 |
-| `navigator.userAgent` | ❌ No | Phase 10; will be `"Forge"` |
-| `onerror`, `onunhandledrejection`, `onrejectionhandled` | ❌ No | Phase 10, with `error` / `unhandledrejection` events on the global object. Today an uncaught error or unhandled rejection ends the program with exit code 1. |
+| `reportError()` | ✅ Yes | Phase 10.2 |
+| `self` | ✅ Yes | Phase 10.2 |
+| `navigator.userAgent` | ✅ Yes | Phase 10.2: `"Forge"` |
+| `onerror`, `onunhandledrejection`, `onrejectionhandled` | ✅ Yes | Phase 10.2, with the `error`, `unhandledrejection` and `rejectionhandled` events on the global object (an `EventTarget`). An uncaught error or unhandled rejection ends the program with exit code 1 only if no listener cancels its event. |
 | `performance` | ❌ No | Phase 10; the timer will be coarsened (Spectre) |
 | `crypto` | ❌ No | Phase 10, on Windows CNG |
 | `fetch()` | ❌ No | Phase 11 |
 
-The three `on…` properties are listed separately in the specification; the
-table groups them, so it counts 25 entries.
+The three `on…` properties, and `atob()` and `btoa()`, are listed
+separately in the specification; the table groups them, so its 22 rows
+count 25 entries.
 
 ## Interfaces (§5.1)
 
 | Group | Interfaces | Status |
 |---|---|---|
 | WebAssembly | `Global`, `Instance`, `Memory`, `Module`, `Table`, `Tag`, `Exception`, `CompileError`, `LinkError`, `RuntimeError` | ⚙️ Engine |
-| DOM | `AbortController`, `AbortSignal`, `Event`, `EventTarget` | ❌ No (Phase 10) |
-| HTML | `CustomEvent`, `ErrorEvent`, `MessageChannel`, `MessageEvent`, `MessagePort`, `PromiseRejectionEvent` | ❌ No (Phase 10) |
+| DOM | `Event`, `EventTarget` | ✅ Yes (Phase 10.2) |
+| DOM | `AbortController`, `AbortSignal` | ❌ No (Phase 10.3) |
+| HTML | `CustomEvent`, `ErrorEvent`, `PromiseRejectionEvent` | ✅ Yes (Phase 10.2) |
+| HTML | `MessageChannel`, `MessageEvent`, `MessagePort` | ❌ No (Phase 10.4) |
 | WebIDL | `DOMException` | ✅ Yes (Phase 10.1) |
 | Encoding | `TextEncoder` | ✅ Yes (Phase 10.1) |
 | Encoding | `TextDecoder` | 🟡 Partial (Phase 10.1): UTF-8, UTF-16LE/BE, all 28 single-byte encodings and x-user-defined; the CJK multi-byte encodings throw a `RangeError` for now |
@@ -97,6 +101,15 @@ technical or structural reasons, if the deviation is documented. Forge's:
   Node and Deno.
 - **Packages (Phase 10.1).** Inside a package the web API classes are
   frozen, like every other built-in there (PHASE9_DESIGN.md section 5).
+- **Uncaught errors in packages (Phase 10.2).** The `error`,
+  `unhandledrejection` and `rejectionhandled` events are dispatched only at
+  the program's global object, also for a package's own errors; a
+  package's global never receives them (PHASE10_DESIGN.md, D28).
+- **Events across compartments (Phase 10.2).** An `Event` can be
+  dispatched only at an `EventTarget` of its own compartment.
+- **`addEventListener` `signal` (Phase 10.2)** arrives with `AbortSignal`
+  in Phase 10.3.
+- **`Event.timeStamp` (Phase 10.2)** has a resolution of 0.1 ms.
 
 ## Forge's own APIs
 
