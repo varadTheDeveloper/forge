@@ -21,6 +21,7 @@ SOURCES += [
     "kavach/SecureFs.cpp",
     "runtime/Compartments.cpp",
     "runtime/Console.cpp",
+    "runtime/Encoding.cpp",
     "runtime/Fs.cpp",
     "runtime/Inspect.cpp",
     "runtime/Json.cpp",
@@ -28,6 +29,7 @@ SOURCES += [
     "runtime/Manifest.cpp",
     "runtime/Modules.cpp",
     "runtime/ModuleSpecifier.cpp",
+    "runtime/WebApis.cpp",
 ]
 
 # Socket.cpp (Phase 5) links against Winsock's WSAStartup/socket/connect/

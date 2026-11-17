@@ -3989,3 +3989,61 @@ grant. `types/forge.d.ts` gains `ForgeError.package`.
 **Verified** on Varad's machine: the build had no warnings, and all 64
 self-tests and all 35 runtime tests (including "permissions (9.4)" and
 "ambiguous grant (9.4)") passed on the first run.
+
+## Phase 10.1: DOMException, TextEncoder, TextDecoder, atob, btoa (2026-11-15)
+
+The first web-standard APIs, and the way every Phase 10 API is built
+(PHASE10_DESIGN.md, decision D27): the WebIDL surface is a built-in
+JavaScript file (`runtime/WebApis.js`, embedded by `tools/gen-webapis.py`;
+CI checks the two match) that runs in each realm before any other script
+and captures the built-ins it needs; the byte work is portable C++ reached
+through a natives object only that script holds.
+
+**Encodings (`runtime/Encoding.cpp`).** UTF-8 encode and `encodeInto`;
+the WHATWG UTF-8 and UTF-16 decoders, with stateless streaming (a decoder
+reports what it consumed); the 28 single-byte encodings and
+x-user-defined, from tables that `tools/gen-encoding-tables.py` generates
+from the standard's index files; all 228 labels; forgiving-base64. 89 unit
+checks (`runtime/EncodingTest.cpp`, both CI test jobs) and a fuzzer
+(`runtime/fuzz/EncodingFuzz.cpp`: whole and split decoding agree, fatal
+decoding succeeds exactly on valid input, encode/decode and btoa/atob round
+trips). During development the results were compared with Node's
+TextDecoder and atob on random inputs: identical for UTF-8, UTF-16 and
+base64; every single-byte difference was ICU departing from the WHATWG
+index.
+
+**The APIs.** `DOMException` (a real Error object with the WebIDL shape:
+inherited getters, the 25 legacy constants, codes by name),
+`TextEncoder`, `TextDecoder` (labels, `fatal`, `ignoreBOM`, streaming, BOM
+removal), `atob`, `btoa`, with WebIDL argument conversion, brand checks
+and property attributes. Errors they throw have stacks that start in the
+caller's code, not in Forge's script, and console output shows a
+`DOMException` as `Name: message` without calling its getters. The CJK
+multi-byte encodings are a documented deviation (WinterTC.md).
+
+**Compartments.** The new globals are walk roots for the lockdown, so in a
+package they are frozen and a class that crosses becomes the other side's
+own (`instanceof DOMException` works both ways). A method called on
+another compartment's instance is forwarded to that compartment, as the
+engine does for its own built-ins. Each global has a `kavach/Ops.h` row
+(`Permission::None`); none makes a Kavach decision.
+
+**A latent bug fixed.** The global class was declared with
+`JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_RESERVED_SLOTS(1)`, which ORs two slot
+counts: 6 | 1 gave the 7 slots Forge needed by luck, but adding a second
+slot the same way (6 | 2 = 6) would have left neither slot in range. It is
+now `JSCLASS_GLOBAL_FLAGS_WITH_SLOTS(2)`, and the web API slot is checked
+with a static_assert.
+
+**Tests.** `tests/web-apis.js` (40 groups: the WPT cases for these APIs,
+transcribed, plus primordial checks: replacing `WeakMap.prototype.get`,
+`Function.prototype.call`, the array iterator or the global `TypeError`
+changes nothing), `tests/web-uncaught.js`, the `webby` package in
+`tests/isolation/` (classes, instances, getters, forwarded methods and
+console output across compartments, both ways), and the web APIs added to
+`tests/fuzz-natives.js`. `types/forge.d.ts` declares the new globals.
+
+**Verified** on Varad's machine: the build had no warnings, and all 64
+self-tests and all 37 runtime tests (including "web APIs (10.1)", "web
+uncaught (10.1)" and the extended "isolation (9.3)") passed on the first
+run.

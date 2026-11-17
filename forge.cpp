@@ -102,6 +102,7 @@
 #include "runtime/Fs.h"
 #include "runtime/Modules.h"
 #include "runtime/JsUtil.h"
+#include "runtime/WebApis.h"  // Phase 10: DOMException, TextEncoder, ...
 
 using forge::runtime::AsByteSpan;
 using forge::runtime::CheckPathArg;
@@ -117,13 +118,19 @@ using forge::runtime::ToForgeString;
 using forge::runtime::Uint8ArrayFromBytes;
 
 // cx points to SpiderMonkey's context object.
+// Phase 10.1: two slots of Forge's own after the engine's. (This used to be
+// JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_RESERVED_SLOTS(1), which ORs two slot
+// counts: 6 | 1 happened to give the 7 slots needed, but 6 | 2 would give 6,
+// leaving no room for either slot. See HISTORY.md, Phase 10.1.)
 static const JSClass globalClass = {
     "global",
-    JSCLASS_GLOBAL_FLAGS | JSCLASS_HAS_RESERVED_SLOTS(1),
+    JSCLASS_GLOBAL_FLAGS_WITH_SLOTS(2),
     &JS::DefaultGlobalClassOps,
 };
 
-enum GlobalSlots { RuntimeSlot = JSCLASS_GLOBAL_SLOT_COUNT };
+enum GlobalSlots { RuntimeSlot = JSCLASS_GLOBAL_SLOT_COUNT, WebInternalsSlot };
+static_assert(WebInternalsSlot == forge::runtime::kWebInternalsSlot,
+              "runtime/WebApis.h and the global class agree on the slot");
 static bool EnqueueMicrotask(JSContext* cx, JS::HandleObject callback);
 
 // Forward declarations: ForgeTimerFired (defined further down, right after
@@ -4281,7 +4288,37 @@ static int ForgeMain(int argc, char* argv[]) {
           }
         }
 
-        if (!forge::runtime::SetStandardGlobalNames(standardGlobalNames)) {
+        // Phase 10.1: the web APIs, before anything else can run. They are
+        // walk roots for the lockdown like the engine's globals, but the
+        // op-table self-test (R2) still sees them as Forge's (they have
+        // rows in kavach/Ops.h), so it keeps the engine-only list.
+        if (!forge::runtime::DefineWebApis(cx, global)) {
+          ReportFatalException(cx, "startup");
+          runtime.Shutdown();
+          return 1;
+        }
+
+        static forge::core::Vector<forge::core::String> walkRoots;
+
+        for (forge::core::Size i = 0; i < standardGlobalNames.Size(); ++i) {
+          forge::core::String copy;
+
+          if (copy.Append(standardGlobalNames[i].View()).HasError() ||
+              walkRoots.PushBack(std::move(copy)).HasError()) {
+            return 1;
+          }
+        }
+
+        for (forge::core::Size i = 0; i < forge::runtime::kWebApiGlobalCount; ++i) {
+          forge::core::String name;
+
+          if (name.Append(forge::runtime::kWebApiGlobalNames[i]).HasError() ||
+              walkRoots.PushBack(std::move(name)).HasError()) {
+            return 1;
+          }
+        }
+
+        if (!forge::runtime::SetStandardGlobalNames(walkRoots)) {
           return 1;
         }
 

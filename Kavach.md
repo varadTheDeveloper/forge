@@ -73,7 +73,10 @@ instead of guessing (the error has `code: "InvalidArgument"`):
 
 Every native function Forge exposes to JavaScript is listed, with the
 permission it needs, in `kavach/Ops.h` (rule R2). `forge --self-test` fails
-if a function exists without a row, or a row without a function.
+if a function exists without a row, or a row without a function. The web
+APIs of Phase 10 (`DOMException`, `TextEncoder`, `TextDecoder`, `atob`,
+`btoa`, ...) have one row each with no permission: none of them reaches
+outside the process (PHASE10_DESIGN.md).
 
 ### Loading modules (Phase 9.1)
 

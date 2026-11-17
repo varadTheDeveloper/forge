@@ -35,10 +35,12 @@ if a native outside the "may run script code" rows below ran any of them.
 | Package evaluation (`runtime/Modules.cpp`, `import.meta.load` of a facade, Phase 9.3) | Another package's modules, in that package's compartment | When the facade module evaluates, before the importer; only the facade's generated code can call it | Nothing depends on state after the call: it defines `import.meta.namespace` and returns a promise | The package that owns the modules (its own compartment) |
 | Assignment to an inherited built-in property in a frozen realm (`runtime/Compartments.cpp`, the "override mistake" setters, Phase 9.3) | If the object already has the property as its own accessor, that accessor's setter | Inside the assignment the script itself wrote (`obj.toString = f`) | No other native is running | The caller |
 | `print` (`JS::ToString`) | `toString` / `Symbol.toPrimitive` of each value | Inside the native, while the line is built, before anything is written | A throw leaves nothing written | The caller |
+| Web API conversions (`runtime/WebApis.js`, Phase 10.1) | WebIDL conversions: `ToString` of a string argument (`toString`, `Symbol.toPrimitive`), and the getters of an options object (`fatal`, `ignoreBOM`, `stream`) | In Forge's built-in script, in the order WebIDL gives, **before** any native is called and before any state changes (`TextDecoder.decode` reads `stream` before it touches the stream) | Nothing changed yet; a throw leaves the object as it was | The caller. No web API makes a Kavach decision. |
+| Forwarded web API calls (`runtime/WebApis.cpp`, `NativeForward`, Phase 10.1) | Forge's own built-in method (never user code) of another compartment, on that compartment's object | When a method is called on a web API object of another compartment | Arguments and result cross through the wrapper policy, as in any call through a wrapper | The compartment that owns the object (it runs that compartment's method); no Kavach decision is involved (PHASE10_DESIGN.md, D27) |
 
-`print` and the timer functions are the only natives that run script code
-while they are running. They are kept compatible with the engine shell and
-with the web; none of them makes a Kavach decision.
+`print`, the timer functions and the web APIs are the only natives that run
+script code while they are running. They are kept compatible with the
+engine shell and with the web; none of them makes a Kavach decision.
 
 ## Places that deliberately do not call into script code
 
@@ -62,6 +64,9 @@ with the web; none of them makes a Kavach decision.
 | Facade generation (`runtime/Modules.cpp`, Phase 9.3) | Reads the keys of the package's module namespace, which touches no binding and runs no code; each name is written as an escaped string literal. |
 | Formatting another compartment's object (`runtime/Inspect.cpp`, Phase 9.3) | Looks through the cross-compartment wrapper with `js::UncheckedUnwrap` and formats the object inside its own realm, with the same no-script rules as above. |
 | Self-test natives (`__asyncSelfTestRecord`) | Exist only while `forge --self-test` runs, which runs no user script. |
+| Web API natives (`runtime/WebApis.cpp`, Phase 10.1) | Reachable only from Forge's built-in script, which converts every argument first. They accept only primitives and buffers, read through the engine's internal slots (`JS_GetObjectAsArrayBufferView`, never `length` or `buffer`); the result of `encodeInto` is made with `JS_DefineProperty`. |
+| The web API script's own state (`runtime/WebApis.js`, Phase 10.1) | Built-ins are captured before user code runs (`Function.prototype.call.bind`), state lives in private fields and WeakMaps, and the array iterator is never used, so replacing `WeakMap.prototype.get`, `Function.prototype.call` or `Array.prototype[Symbol.iterator]` changes nothing (`tests/web-apis.js` checks this). |
+| Formatting a `DOMException` (`runtime/Inspect.cpp`, Phase 10.1) | Its name and message are read from Forge's WeakMap with `JS::GetWeakMapEntry`; the prototype getters are never called. |
 
 ## Rules for new code
 

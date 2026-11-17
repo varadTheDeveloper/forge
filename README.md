@@ -56,7 +56,7 @@ Status: **preview.** Per-package permissions come with modules (Phase 9) and an 
 
 ## Standards
 
-Forge targets the [WinterTC Minimum Common Web API](https://min-common-api.proposal.wintertc.org/), the standard for server-side JavaScript interoperability developed by Ecma TC55. **Forge does not conform yet.** Most of the required APIs arrive in Phases 10 and 11. The entry-by-entry status is in [WinterTC.md](WinterTC.md).
+Forge targets the [WinterTC Minimum Common Web API](https://min-common-api.proposal.wintertc.org/), the standard for server-side JavaScript interoperability developed by Ecma TC55. **Forge does not conform yet.** Phase 10 has begun: `DOMException`, `TextEncoder`, `TextDecoder` (UTF-8, UTF-16 and every single-byte encoding) and `atob`/`btoa` work, in packages too; the rest of the required APIs arrive in Phases 10 and 11 ([PHASE10_DESIGN.md](PHASE10_DESIGN.md)). The entry-by-entry status is in [WinterTC.md](WinterTC.md).
 
 ---
 
