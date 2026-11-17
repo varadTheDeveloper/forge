@@ -3,6 +3,7 @@
 import * as probe from "probe";
 import data from "probe/data" with { type: "json" };
 import { count, bump } from "live";
+import * as webby from "webby";
 
 const appSecret = "app-secret";  // a package must not see this binding
 const lines = [];
@@ -69,6 +70,46 @@ log("live binding: bump=" + bump() + " seen=" + count);
 
 // Logging a package's object prints the object, not "[Proxy]".
 console.log(probe.sample);
+
+// Phase 10.1: web API objects across compartments. The classes are
+// intrinsics (one crossing becomes the other side's own); instances cross
+// as wrappers, and a method called on another compartment's instance is
+// forwarded to that compartment (runtime/WebApis.cpp, NativeForward).
+for (const line of webby.checks) {
+  log("webby " + line);
+}
+
+const packageError = webby.makeDomException();
+log("web class maps: " + (webby.PackageDOMException === DOMException));
+log("web exception from a package: " + (packageError instanceof DOMException) + " " +
+  (packageError instanceof Error) + " " + packageError.name + " " + packageError.message + " " +
+  packageError.code);
+log("web getter forwarded: " +
+  Object.getOwnPropertyDescriptor(DOMException.prototype, "code").get.call(packageError));
+log("web exception toString: " + String(packageError));
+console.log(packageError);
+
+const packageDecoder = webby.makeDecoder();
+log("web decoder from a package: " + packageDecoder.encoding + " " + packageDecoder.fatal + " " +
+  packageDecoder.decode(new Uint8Array([0x41, 0, 0x42, 0])));
+try {
+  packageDecoder.decode(new Uint8Array([0x41]));
+  log("SHOULD NOT DECODE");
+} catch (e) {
+  log("web forwarded error: " + (e instanceof TypeError));
+}
+const into = new Uint8Array(2);
+log("web encodeInto forwarded: " + JSON.stringify(webby.makeEncoder().encodeInto("abc", into)) +
+  " " + into.join(","));
+log("web app decoder in a package: " +
+  webby.decodeWith(new TextDecoder(), new Uint8Array([0x6f, 0x6b])));
+log("web app exception in a package: " +
+  webby.describeDom(new DOMException("app message", "SyntaxError")));
+try {
+  webby.throwDom();
+} catch (e) {
+  log("web thrown across: " + (e instanceof DOMException) + " " + e.name + " " + e.code);
+}
 
 // Timers and microtasks belong to the realm that made them.
 let appTimerRan = false;
