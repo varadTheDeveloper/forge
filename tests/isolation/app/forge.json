@@ -5,6 +5,7 @@
     "probe": "file:./vendor/probe",
     "live": "file:./vendor/live",
     "thrower": "file:./vendor/thrower",
-    "cycle-a": "file:./vendor/cycle-a"
+    "cycle-a": "file:./vendor/cycle-a",
+    "webby": "file:./vendor/webby"
   }
 }
