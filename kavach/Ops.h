@@ -117,7 +117,18 @@ bool OpAllows(
     X(TextEncoder, "TextEncoder", None)                          \
     X(TextDecoder, "TextDecoder", None)                          \
     X(Atob, "atob", None)                                        \
-    X(Btoa, "btoa", None)
+    X(Btoa, "btoa", None)                                        \
+    X(EventTarget, "EventTarget", None)                          \
+    X(Event, "Event", None)                                      \
+    X(CustomEvent, "CustomEvent", None)                          \
+    X(ErrorEvent, "ErrorEvent", None)                            \
+    X(PromiseRejectionEvent, "PromiseRejectionEvent", None)      \
+    X(ReportError, "reportError", None)                          \
+    X(Self, "self", None)                                        \
+    X(Navigator, "navigator", None)                              \
+    X(OnError, "onerror", None)                                  \
+    X(OnUnhandledRejection, "onunhandledrejection", None)        \
+    X(OnRejectionHandled, "onrejectionhandled", None)
 
 enum class Op : uint16_t
 {
