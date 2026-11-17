@@ -7,13 +7,16 @@
 //
 //   natives    Forge's C++ helpers for this file (byte work: UTF-8, base64,
 //              the other decoders; errors with clean stacks; calls on objects
-//              of another compartment). The object is never reachable from
-//              any other script.
+//              of another compartment; the coarse clock; reporting an
+//              exception). The object is never reachable from any other
+//              script.
 //   global     the realm's global object.
 //   internals  an object only this file and C++ hold (a reserved slot of the
 //              global): the DOMException records, which console output reads
-//              without running script, and the members table used to
-//              forward calls across compartments.
+//              without running script; the members table used to forward
+//              calls across compartments; and (Phase 10.2) the functions C++
+//              calls to dispatch uncaught errors and rejections, in the
+//              program's realm only.
 //
 // Rules for this file (it runs where user code can later change any
 // built-in object):
@@ -21,7 +24,9 @@
 //      set-up, before user code exists: no `Foo.prototype.bar(...)`, no
 //      array destructuring or spread or for-of (they use the array
 //      iterator), no method call on a value user code made.
-//   2. State lives in private fields or in WeakMaps captured here.
+//   2. State lives in private fields or in WeakMaps captured here. Lists
+//      are null-prototype array-likes, so appending never reaches a setter
+//      on Array.prototype or Object.prototype.
 //   3. WebIDL conversions (ToString, dictionary members) do run user code,
 //      exactly where the standards say they do, and nowhere else.
 //   4. Every global this file defines is listed in kWebApiGlobalNames in
@@ -49,7 +54,18 @@
   const WeakMapGet = uncurryThis(WeakMap.prototype.get);
   const WeakMapSet = uncurryThis(WeakMap.prototype.set);
   const StringPrototypeSlice = uncurryThis(String.prototype.slice);
+  const StringPrototypeToWellFormed = uncurryThis(String.prototype.toWellFormed);
   const SymbolToStringTag = Symbol.toStringTag;
+  // Phase 10.2
+  const ObjectCreate = Object.create;
+  const ReflectApply = Reflect.apply;
+  const MapCtor = Map;
+  const MapGet = uncurryThis(Map.prototype.get);
+  const MapSet = uncurryThis(Map.prototype.set);
+  const WeakSetCtor = WeakSet;
+  const WeakSetAdd = uncurryThis(WeakSet.prototype.add);
+  const WeakSetHas = uncurryThis(WeakSet.prototype.has);
+  const WeakSetDelete = uncurryThis(WeakSet.prototype.delete);
 
   const {
     makeError,
@@ -62,6 +78,8 @@
     utf8EncodeInto,
     atob: nativeAtob,
     btoa: nativeBtoa,
+    now,
+    reportException,
   } = natives;
 
   // makeError kinds. The stack of an error made by makeError starts at the
@@ -126,8 +144,8 @@
 
   // Interface objects: members enumerable (WebIDL), a @@toStringTag, the
   // constants, the global property (writable, configurable, not
-  // enumerable).
-  function defineInterface(ctor, name, constants) {
+  // enumerable). `exposed` false: no global property (Navigator).
+  function defineInterface(ctor, name, constants, exposed = true) {
     const proto = ctor.prototype;
     const keys = ObjectGetOwnPropertyNames(proto);
 
@@ -142,6 +160,10 @@
       desc.enumerable = true;
       ObjectDefineProperty(proto, key, desc);
       members[`${name}.${key}`] = desc.get !== undefined ? desc.get : desc.value;
+
+      if (desc.set !== undefined) {
+        members[`${name}.${key}=`] = desc.set;
+      }
     }
 
     ObjectDefineProperty(proto, SymbolToStringTag, {
@@ -154,9 +176,27 @@
       ObjectDefineProperty(proto, constants[i], constant);
     }
 
-    ObjectDefineProperty(global, name, {
-      value: ctor, writable: true, enumerable: false, configurable: true,
-    });
+    if (exposed) {
+      ObjectDefineProperty(global, name, {
+        value: ctor, writable: true, enumerable: false, configurable: true,
+      });
+    }
+  }
+
+  // WebIDL "unsigned long": ToNumber, then modulo 2^32 (NaN and the
+  // infinities are 0). A BigInt or Symbol throws, as ToNumber does.
+  function toUnsignedLong(value) {
+    return (+value) >>> 0;
+  }
+
+  // WebIDL USVString: ToString, then lone surrogates become U+FFFD.
+  function toUSVString(value) {
+    return StringPrototypeToWellFormed(`${value}`);
+  }
+
+  // WebIDL callback interface or callback function arguments: any object.
+  function isObject(value) {
+    return value !== null && (typeof value === 'object' || typeof value === 'function');
   }
 
   // ------------------------------------------------------------------
@@ -443,4 +483,849 @@
   ObjectDefineProperty(global, 'btoa', {
     value: operations.btoa, writable: true, enumerable: true, configurable: true,
   });
+
+  // ------------------------------------------------------------------
+  // Events (DOM Standard), Phase 10.2
+  // ------------------------------------------------------------------
+
+  const kNone = 0;
+  const kAtTarget = 2;
+  const eventPhases = ['NONE', 'CAPTURING_PHASE', 'AT_TARGET', 'BUBBLING_PHASE'];
+
+  // An event's internal record (never exposed), or undefined if `value` is
+  // not an Event. Set by Event's static block.
+  let eventStateOf;
+  // An ErrorEvent's [message, filename, lineno, colno, error], or
+  // undefined. Set by ErrorEvent's static block.
+  let errorEventFields;
+
+  function setCanceled(state) {
+    if (state.cancelable && !state.inPassiveListener) {
+      state.canceled = true;
+    }
+  }
+
+  // [LegacyUnforgeable] isTrusted: an own accessor on every event, with one
+  // getter shared by all of them.
+  const isTrustedGetter = ObjectGetOwnPropertyDescriptor({
+    get isTrusted() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.isTrusted
+                                 : notBranded('Event', 'isTrusted', this, arguments);
+    },
+  }, 'isTrusted').get;
+  members['Event.isTrusted'] = isTrustedGetter;
+
+  class Event {
+    #state;
+
+    static {
+      eventStateOf = (value) => (isObject(value) && #state in value ? value.#state : undefined);
+    }
+
+    constructor(type, eventInitDict = undefined) {
+      requireArguments(arguments.length, 1, 'Event constructor');
+      type = `${type}`;
+      const init = toDictionary(eventInitDict, 'Event constructor');
+      const bubbles = init === undefined ? false : !!init.bubbles;
+      const cancelable = init === undefined ? false : !!init.cancelable;
+      const composed = init === undefined ? false : !!init.composed;
+      this.#state = {
+        __proto__: null,
+        type,
+        bubbles,
+        cancelable,
+        composed,
+        target: null,
+        currentTarget: null,
+        eventPhase: kNone,
+        stopPropagation: false,
+        stopImmediatePropagation: false,
+        canceled: false,
+        inPassiveListener: false,
+        dispatching: false,
+        isTrusted: false,
+        timeStamp: now(),
+      };
+      ObjectDefineProperty(this, 'isTrusted', {
+        get: isTrustedGetter, set: undefined, enumerable: true, configurable: false,
+      });
+    }
+
+    get type() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.type : notBranded('Event', 'type', this, arguments);
+    }
+
+    get target() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.target : notBranded('Event', 'target', this, arguments);
+    }
+
+    get srcElement() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.target : notBranded('Event', 'srcElement', this, arguments);
+    }
+
+    get currentTarget() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.currentTarget
+                                 : notBranded('Event', 'currentTarget', this, arguments);
+    }
+
+    composedPath() {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'composedPath', this, arguments);
+      }
+
+      // An EventTarget that is not a node: the path is the target alone.
+      return state.dispatching ? [state.target] : [];
+    }
+
+    get eventPhase() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.eventPhase : notBranded('Event', 'eventPhase', this, arguments);
+    }
+
+    stopPropagation() {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'stopPropagation', this, arguments);
+      }
+
+      state.stopPropagation = true;
+    }
+
+    get cancelBubble() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.stopPropagation
+                                 : notBranded('Event', 'cancelBubble', this, arguments);
+    }
+
+    set cancelBubble(value) {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'cancelBubble=', this, arguments);
+      }
+
+      if (value) {
+        state.stopPropagation = true;
+      }
+    }
+
+    stopImmediatePropagation() {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'stopImmediatePropagation', this, arguments);
+      }
+
+      state.stopPropagation = true;
+      state.stopImmediatePropagation = true;
+    }
+
+    get bubbles() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.bubbles : notBranded('Event', 'bubbles', this, arguments);
+    }
+
+    get cancelable() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.cancelable : notBranded('Event', 'cancelable', this, arguments);
+    }
+
+    get returnValue() {
+      const state = eventStateOf(this);
+      return state !== undefined ? !state.canceled : notBranded('Event', 'returnValue', this, arguments);
+    }
+
+    set returnValue(value) {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'returnValue=', this, arguments);
+      }
+
+      if (!value) {
+        setCanceled(state);
+      }
+    }
+
+    preventDefault() {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'preventDefault', this, arguments);
+      }
+
+      setCanceled(state);
+    }
+
+    get defaultPrevented() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.canceled
+                                 : notBranded('Event', 'defaultPrevented', this, arguments);
+    }
+
+    get composed() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.composed : notBranded('Event', 'composed', this, arguments);
+    }
+
+    get timeStamp() {
+      const state = eventStateOf(this);
+      return state !== undefined ? state.timeStamp : notBranded('Event', 'timeStamp', this, arguments);
+    }
+
+    initEvent(type, bubbles = false, cancelable = false) {
+      const state = eventStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('Event', 'initEvent', this, arguments);
+      }
+
+      requireArguments(arguments.length, 1, 'Event.initEvent');
+      type = `${type}`;
+      bubbles = !!bubbles;
+      cancelable = !!cancelable;
+
+      if (!state.dispatching) {
+        initializeEvent(state, type, bubbles, cancelable);
+      }
+    }
+  }
+
+  // The DOM "initialize" steps (initEvent, initCustomEvent).
+  function initializeEvent(state, type, bubbles, cancelable) {
+    state.stopPropagation = false;
+    state.stopImmediatePropagation = false;
+    state.canceled = false;
+    state.isTrusted = false;
+    state.target = null;
+    state.type = type;
+    state.bubbles = bubbles;
+    state.cancelable = cancelable;
+  }
+
+  defineInterface(Event, 'Event', undefined);
+
+  for (let i = 0; i < eventPhases.length; i++) {
+    const constant = { value: i, writable: false, enumerable: true, configurable: false };
+    ObjectDefineProperty(Event, eventPhases[i], constant);
+    ObjectDefineProperty(Event.prototype, eventPhases[i], constant);
+  }
+
+  class CustomEvent extends Event {
+    #detail;
+
+    static #is(value) {
+      return isObject(value) && #detail in value;
+    }
+
+    constructor(type, eventInitDict = undefined) {
+      requireArguments(arguments.length, 1, 'CustomEvent constructor');
+      super(type, eventInitDict);
+      const init = toDictionary(eventInitDict, 'CustomEvent constructor');
+      const detail = init === undefined ? undefined : init.detail;
+      this.#detail = detail === undefined ? null : detail;
+    }
+
+    get detail() {
+      return CustomEvent.#is(this) ? this.#detail : notBranded('CustomEvent', 'detail', this, arguments);
+    }
+
+    initCustomEvent(type, bubbles = false, cancelable = false, detail = null) {
+      if (!CustomEvent.#is(this)) {
+        return notBranded('CustomEvent', 'initCustomEvent', this, arguments);
+      }
+
+      requireArguments(arguments.length, 1, 'CustomEvent.initCustomEvent');
+      type = `${type}`;
+      bubbles = !!bubbles;
+      cancelable = !!cancelable;
+      const state = eventStateOf(this);
+
+      if (!state.dispatching) {
+        initializeEvent(state, type, bubbles, cancelable);
+        this.#detail = detail;
+      }
+    }
+  }
+
+  defineInterface(CustomEvent, 'CustomEvent', undefined);
+
+  class ErrorEvent extends Event {
+    #message;
+    #filename;
+    #lineno;
+    #colno;
+    #error;
+
+    static #is(value) {
+      return isObject(value) && #message in value;
+    }
+
+    constructor(type, eventInitDict = undefined) {
+      requireArguments(arguments.length, 1, 'ErrorEvent constructor');
+      super(type, eventInitDict);
+      const init = toDictionary(eventInitDict, 'ErrorEvent constructor');
+      let colno = 0;
+      let error;
+      let filename = '';
+      let lineno = 0;
+      let message = '';
+
+      // ErrorEventInit's own members, in lexicographic order.
+      if (init !== undefined) {
+        const colnoValue = init.colno;
+        colno = colnoValue === undefined ? 0 : toUnsignedLong(colnoValue);
+        error = init.error;
+        const filenameValue = init.filename;
+        filename = filenameValue === undefined ? '' : toUSVString(filenameValue);
+        const linenoValue = init.lineno;
+        lineno = linenoValue === undefined ? 0 : toUnsignedLong(linenoValue);
+        const messageValue = init.message;
+        message = messageValue === undefined ? '' : `${messageValue}`;
+      }
+
+      this.#message = message;
+      this.#filename = filename;
+      this.#lineno = lineno;
+      this.#colno = colno;
+      this.#error = error;
+    }
+
+    get message() {
+      return ErrorEvent.#is(this) ? this.#message : notBranded('ErrorEvent', 'message', this, arguments);
+    }
+
+    get filename() {
+      return ErrorEvent.#is(this) ? this.#filename : notBranded('ErrorEvent', 'filename', this, arguments);
+    }
+
+    get lineno() {
+      return ErrorEvent.#is(this) ? this.#lineno : notBranded('ErrorEvent', 'lineno', this, arguments);
+    }
+
+    get colno() {
+      return ErrorEvent.#is(this) ? this.#colno : notBranded('ErrorEvent', 'colno', this, arguments);
+    }
+
+    get error() {
+      return ErrorEvent.#is(this) ? this.#error : notBranded('ErrorEvent', 'error', this, arguments);
+    }
+
+    // For the onerror handler's five arguments.
+    static {
+      errorEventFields = (event) => (ErrorEvent.#is(event)
+        ? [event.#message, event.#filename, event.#lineno, event.#colno, event.#error]
+        : undefined);
+    }
+  }
+
+  defineInterface(ErrorEvent, 'ErrorEvent', undefined);
+
+  class PromiseRejectionEvent extends Event {
+    #promise;
+    #reason;
+
+    static #is(value) {
+      return isObject(value) && #promise in value;
+    }
+
+    constructor(type, eventInitDict) {
+      requireArguments(arguments.length, 2, 'PromiseRejectionEvent constructor');
+      super(type, eventInitDict);
+      const init = toDictionary(eventInitDict, 'PromiseRejectionEvent constructor');
+      const promise = init === undefined ? undefined : init.promise;
+
+      // `required object promise` (the HTML Standard no longer converts it
+      // to a Promise).
+      if (!isObject(promise)) {
+        throw typeError(promise === undefined
+          ? "PromiseRejectionEvent constructor: the 'promise' member is required."
+          : "PromiseRejectionEvent constructor: the 'promise' member is not an object.");
+      }
+
+      this.#promise = promise;
+      this.#reason = init.reason;
+    }
+
+    get promise() {
+      return PromiseRejectionEvent.#is(this) ? this.#promise
+                                             : notBranded('PromiseRejectionEvent', 'promise', this, arguments);
+    }
+
+    get reason() {
+      return PromiseRejectionEvent.#is(this) ? this.#reason
+                                             : notBranded('PromiseRejectionEvent', 'reason', this, arguments);
+    }
+  }
+
+  defineInterface(PromiseRejectionEvent, 'PromiseRejectionEvent', undefined);
+
+  // ------------------------------------------------------------------
+  // EventTarget (DOM Standard), Phase 10.2
+  // ------------------------------------------------------------------
+
+  // EventTarget -> Map(type -> listener list). A WeakMap rather than a
+  // private field, so the global object can be an EventTarget too.
+  const eventTargets = new WeakMapCtor();
+
+  // Lists are null-prototype array-likes: appending to one can never reach
+  // a setter that user code put on Array.prototype or Object.prototype.
+  function newList() {
+    return { __proto__: null, length: 0 };
+  }
+
+  function listAppend(list, item) {
+    list[list.length] = item;
+    list.length = list.length + 1;
+  }
+
+  function listCopy(list, skip) {
+    const copy = newList();
+
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] !== skip) {
+        listAppend(copy, list[i]);
+      }
+    }
+
+    return copy;
+  }
+
+  // EventListener? callback: null, or any object (a function, or an object
+  // whose handleEvent is looked up at each dispatch).
+  function toListener(callback, where) {
+    if (callback === undefined || callback === null) {
+      return null;
+    }
+
+    if (!isObject(callback)) {
+      throw typeError(`${where}: parameter 2 is not an object.`);
+    }
+
+    return callback;
+  }
+
+  // The DOM "flatten" and "flatten more" steps. Options are a boolean
+  // (capture) or a dictionary, read in WebIDL order: capture, then once,
+  // passive and signal.
+  function flattenOptions(options, add, where) {
+    const flat = { __proto__: null, capture: false, once: false, passive: false };
+
+    if (options === undefined || options === null) {
+      return flat;
+    }
+
+    if (!isObject(options)) {
+      flat.capture = !!options;
+      return flat;
+    }
+
+    flat.capture = !!options.capture;
+
+    if (add) {
+      flat.once = !!options.once;
+      const passive = options.passive;
+      flat.passive = passive === undefined ? false : !!passive;
+
+      // AbortSignal arrives in Phase 10.3; until then no value is one.
+      if (options.signal !== undefined) {
+        throw typeError(`${where}: the 'signal' option is not an AbortSignal.`);
+      }
+    }
+
+    return flat;
+  }
+
+  // The listener list of `target`, an EventTarget (or the global object),
+  // or undefined.
+  function targetListeners(target) {
+    return WeakMapGet(eventTargets, target);
+  }
+
+  function addListener(map, type, callback, flat) {
+    let list = MapGet(map, type);
+
+    if (list === undefined) {
+      list = newList();
+      MapSet(map, type, list);
+    }
+
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].callback === callback && list[i].capture === flat.capture) {
+        return;
+      }
+    }
+
+    listAppend(list, {
+      __proto__: null,
+      type,
+      callback,
+      capture: flat.capture,
+      once: flat.once,
+      passive: flat.passive,
+      removed: false,
+    });
+  }
+
+  function removeListener(map, listener) {
+    const list = MapGet(map, listener.type);
+    listener.removed = true;
+
+    if (list !== undefined) {
+      MapSet(map, listener.type, listCopy(list, listener));
+    }
+  }
+
+  // Calls one listener. An exception it throws is reported (an "error"
+  // event on the program's global object; uncaught if not prevented) and
+  // the dispatch goes on.
+  function callListener(callback, thisValue, event) {
+    try {
+      if (typeof callback === 'function') {
+        ReflectApply(callback, thisValue, [event]);
+      } else {
+        const handleEvent = callback.handleEvent;
+
+        if (typeof handleEvent !== 'function') {
+          throw typeError("The event listener's handleEvent is not a function.");
+        }
+
+        ReflectApply(handleEvent, callback, [event]);
+      }
+    } catch (error) {
+      reportException(error, 0);
+    }
+  }
+
+  // The DOM "inner invoke" steps, on a copy of the target's list.
+  function invokeListeners(target, map, event, state, capturing) {
+    if (state.stopPropagation) {
+      return;
+    }
+
+    state.currentTarget = target;
+    const list = MapGet(map, state.type);
+
+    if (list === undefined) {
+      return;
+    }
+
+    const listeners = listCopy(list, undefined);
+
+    for (let i = 0; i < listeners.length; i++) {
+      const listener = listeners[i];
+
+      if (listener.removed || listener.capture !== capturing) {
+        continue;
+      }
+
+      if (listener.once) {
+        removeListener(map, listener);
+      }
+
+      if (listener.passive) {
+        state.inPassiveListener = true;
+      }
+
+      callListener(listener.callback, target, event);
+      state.inPassiveListener = false;
+
+      if (state.stopImmediatePropagation) {
+        break;
+      }
+    }
+  }
+
+  // The DOM "dispatch" steps for a target that is not a node: the path is
+  // the target alone, so capturing listeners run first, then the others,
+  // all at AT_TARGET.
+  function dispatch(target, map, event, state) {
+    state.dispatching = true;
+    state.target = target;
+    state.eventPhase = kAtTarget;
+    invokeListeners(target, map, event, state, true);
+    invokeListeners(target, map, event, state, false);
+    state.eventPhase = kNone;
+    state.currentTarget = null;
+    state.dispatching = false;
+    state.stopPropagation = false;
+    state.stopImmediatePropagation = false;
+    return !state.canceled;
+  }
+
+  class EventTarget {
+    constructor() {
+      WeakMapSet(eventTargets, this, new MapCtor());
+    }
+
+    // WebIDL: an operation called with an undefined or null `this` acts on
+    // the global object, which is an EventTarget (so a bare
+    // addEventListener(...) works).
+    addEventListener(type, callback, options = undefined) {
+      const self = this === undefined || this === null ? global : this;
+      const map = targetListeners(self);
+
+      if (map === undefined) {
+        return notBranded('EventTarget', 'addEventListener', this, arguments);
+      }
+
+      requireArguments(arguments.length, 2, 'EventTarget.addEventListener');
+      type = `${type}`;
+      callback = toListener(callback, 'EventTarget.addEventListener');
+      const flat = flattenOptions(options, true, 'EventTarget.addEventListener');
+
+      if (callback !== null) {
+        addListener(map, type, callback, flat);
+      }
+    }
+
+    removeEventListener(type, callback, options = undefined) {
+      const self = this === undefined || this === null ? global : this;
+      const map = targetListeners(self);
+
+      if (map === undefined) {
+        return notBranded('EventTarget', 'removeEventListener', this, arguments);
+      }
+
+      requireArguments(arguments.length, 2, 'EventTarget.removeEventListener');
+      type = `${type}`;
+      callback = toListener(callback, 'EventTarget.removeEventListener');
+      const flat = flattenOptions(options, false, 'EventTarget.removeEventListener');
+      const list = MapGet(map, type);
+
+      for (let i = 0; list !== undefined && i < list.length; i++) {
+        if (list[i].callback === callback && list[i].capture === flat.capture) {
+          removeListener(map, list[i]);
+          return;
+        }
+      }
+    }
+
+    dispatchEvent(event) {
+      const self = this === undefined || this === null ? global : this;
+      const map = targetListeners(self);
+
+      if (map === undefined) {
+        return notBranded('EventTarget', 'dispatchEvent', this, arguments);
+      }
+
+      requireArguments(arguments.length, 1, 'EventTarget.dispatchEvent');
+      const state = eventStateOf(event);
+
+      if (state === undefined) {
+        throw typeError("EventTarget.dispatchEvent: parameter 1 is not of type 'Event'.");
+      }
+
+      if (state.dispatching) {
+        throw new DOMException('EventTarget.dispatchEvent: the event is already being dispatched.',
+                               'InvalidStateError');
+      }
+
+      state.isTrusted = false;
+      return dispatch(self, map, event, state);
+    }
+  }
+
+  defineInterface(EventTarget, 'EventTarget', undefined);
+
+  // The global object is an EventTarget, as a worker's global is.
+  WeakMapSet(eventTargets, global, new MapCtor());
+  ObjectSetPrototypeOf(global, EventTarget.prototype);
+
+  // ------------------------------------------------------------------
+  // The global object's attributes (HTML Standard), Phase 10.2
+  // ------------------------------------------------------------------
+
+  // Event handlers (onerror, onunhandledrejection, onrejectionhandled).
+  // Setting one to an object adds a listener the first time; setting it to
+  // anything else removes that listener (the HTML "event handler" rules).
+  const handlerValues = { __proto__: null, error: null, unhandledrejection: null, rejectionhandled: null };
+  const handlerListeners = { __proto__: null };
+
+  function runEventHandler(name, event) {
+    const callback = handlerValues[name];
+
+    if (callback === null) {
+      return;
+    }
+
+    const state = eventStateOf(event);
+    const fields = name === 'error' ? errorEventFields(event) : undefined;
+
+    // A non-callable object makes ReflectApply throw a TypeError, which
+    // callListener reports like any listener's exception.
+    if (fields !== undefined && state.type === 'error') {
+      // OnErrorEventHandler: (message, source, lineno, colno, error); true
+      // cancels the event.
+      if (ReflectApply(callback, state.currentTarget, fields) === true) {
+        setCanceled(state);
+      }
+    } else if (ReflectApply(callback, state.currentTarget, [event]) === false) {
+      setCanceled(state);
+    }
+  }
+
+  function setEventHandler(name, value) {
+    const callback = isObject(value) ? value : null;
+    handlerValues[name] = callback;
+    const map = targetListeners(global);
+    const listener = handlerListeners[name];
+
+    if (callback === null) {
+      if (listener !== undefined) {
+        handlerListeners[name] = undefined;
+        const list = MapGet(map, name);
+
+        for (let i = 0; list !== undefined && i < list.length; i++) {
+          if (list[i].callback === listener) {
+            removeListener(map, list[i]);
+            break;
+          }
+        }
+      }
+
+      return;
+    }
+
+    if (listener === undefined) {
+      const added = (event) => runEventHandler(name, event);
+      handlerListeners[name] = added;
+      addListener(map, name, added, { __proto__: null, capture: false, once: false, passive: false });
+    }
+  }
+
+  function checkGlobal(self) {
+    if (self !== undefined && self !== null && self !== global) {
+      throw typeError('Illegal invocation: not the global object.');
+    }
+  }
+
+  class Navigator {
+    constructor() {
+      throw typeError('Illegal constructor.');
+    }
+
+    get userAgent() {
+      // D13: the name only, no version.
+      return this === navigatorObject ? 'Forge' : notBranded('Navigator', 'userAgent', this, arguments);
+    }
+  }
+
+  defineInterface(Navigator, 'Navigator', undefined, false);
+  // One per realm, frozen: in a package compartment it is shared by every
+  // package there, so no package may change it.
+  const navigatorObject = ObjectFreeze(ObjectCreate(Navigator.prototype));
+
+  const globalAttributes = {
+    get self() {
+      checkGlobal(this);
+      return global;
+    },
+    // [Replaceable]
+    set self(value) {
+      checkGlobal(this);
+      ObjectDefineProperty(global, 'self', {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    },
+    get navigator() {
+      checkGlobal(this);
+      return navigatorObject;
+    },
+    get onerror() {
+      checkGlobal(this);
+      return handlerValues.error;
+    },
+    set onerror(value) {
+      checkGlobal(this);
+      setEventHandler('error', value);
+    },
+    get onunhandledrejection() {
+      checkGlobal(this);
+      return handlerValues.unhandledrejection;
+    },
+    set onunhandledrejection(value) {
+      checkGlobal(this);
+      setEventHandler('unhandledrejection', value);
+    },
+    get onrejectionhandled() {
+      checkGlobal(this);
+      return handlerValues.rejectionhandled;
+    },
+    set onrejectionhandled(value) {
+      checkGlobal(this);
+      setEventHandler('rejectionhandled', value);
+    },
+  };
+
+  const globalAttributeNames = ['self', 'navigator', 'onerror', 'onunhandledrejection',
+                                'onrejectionhandled'];
+
+  for (let i = 0; i < globalAttributeNames.length; i++) {
+    const desc = ObjectGetOwnPropertyDescriptor(globalAttributes, globalAttributeNames[i]);
+    ObjectDefineProperty(global, globalAttributeNames[i], {
+      get: desc.get, set: desc.set, enumerable: true, configurable: true,
+    });
+  }
+
+  // reportError (HTML Standard): reports `e` as an uncaught exception would
+  // be, without throwing.
+  const globalOperations = {
+    reportError(e) {
+      requireArguments(arguments.length, 1, 'reportError');
+      reportException(e, 1);
+    },
+  };
+
+  ObjectDefineProperty(global, 'reportError', {
+    value: globalOperations.reportError, writable: true, enumerable: true, configurable: true,
+  });
+
+  // ------------------------------------------------------------------
+  // Uncaught errors and rejections, called by C++ (WebApis.cpp) in the
+  // program's realm only: packages never see or cancel these events.
+  // ------------------------------------------------------------------
+
+  function fireTrusted(event) {
+    const state = eventStateOf(event);
+    state.isTrusted = true;
+    return dispatch(global, targetListeners(global), event, state);
+  }
+
+  // Returns true if no listener cancelled it (the error is then fatal).
+  internals.dispatchError = (error, message, filename, lineno, colno) => fireTrusted(
+    new ErrorEvent('error', {
+      __proto__: null, cancelable: true, colno, error, filename, lineno, message,
+    }));
+
+  // HTML's "outstanding rejected promises": rejections whose
+  // unhandledrejection event was cancelled, so a later handler fires
+  // rejectionhandled.
+  const outstandingRejections = new WeakSetCtor();
+
+  internals.dispatchUnhandledRejection = (promise, reason) => fireTrusted(
+    new PromiseRejectionEvent('unhandledrejection', {
+      __proto__: null, cancelable: true, promise, reason,
+    }));
+
+  internals.rememberRejection = (promise) => {
+    WeakSetAdd(outstandingRejections, promise);
+  };
+
+  internals.dispatchRejectionHandled = (promise, reason) => {
+    if (WeakSetHas(outstandingRejections, promise)) {
+      WeakSetDelete(outstandingRejections, promise);
+      fireTrusted(new PromiseRejectionEvent('rejectionhandled', {
+        __proto__: null, promise, reason,
+      }));
+    }
+  };
 })

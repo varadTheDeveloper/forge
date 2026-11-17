@@ -2,6 +2,9 @@
 
 #include "runtime/WebApis.h"
 
+#include <string.h>
+
+#include <chrono>
 #include <utility>
 
 #include "js/Array.h"
@@ -16,6 +19,7 @@
 #include "js/PropertyAndElement.h"
 #include "js/PropertyDescriptor.h"
 #include "js/PropertySpec.h"
+#include "js/Promise.h"
 #include "js/SavedFrameAPI.h"
 #include "js/SourceText.h"
 #include "js/Stack.h"
@@ -28,6 +32,8 @@
 #include "mozilla/Utf8.h"
 
 #include "forge-core/String.h"
+#include "forge-core/memory/MakeUnique.h"
+#include "forge-core/memory/UniquePtr.h"
 #include "forge-core/memory/Vector.h"
 #include "runtime/Encoding.h"
 #include "runtime/JsUtil.h"
@@ -36,11 +42,24 @@ namespace forge::runtime
 {
 
 const char* const kWebApiGlobalNames[] = {
+    // Phase 10.1
     "DOMException",
     "TextDecoder",
     "TextEncoder",
     "atob",
     "btoa",
+    // Phase 10.2
+    "CustomEvent",
+    "ErrorEvent",
+    "Event",
+    "EventTarget",
+    "PromiseRejectionEvent",
+    "navigator",
+    "onerror",
+    "onrejectionhandled",
+    "onunhandledrejection",
+    "reportError",
+    "self",
 };
 
 const forge::core::Size kWebApiGlobalCount = sizeof(kWebApiGlobalNames) / sizeof(kWebApiGlobalNames[0]);
@@ -63,6 +82,19 @@ constexpr const char kWebApisSourceName[] = "forge:web";
 /// The most arguments a forwarded call passes on (no web API method takes
 /// more than a few).
 constexpr uint32_t kMaxForwardedArguments = 16;
+
+/// Phase 10.2: the program's global object (DefineWebApis with
+/// WebRealm::Program), where uncaught errors and rejections are dispatched.
+JS::PersistentRootedObject* g_programGlobal = nullptr;
+
+/// Set while an "error" event is being dispatched: an exception thrown by
+/// one of its listeners is then uncaught at once (no second event), as in
+/// the HTML Standard's "report an exception".
+bool g_reportingException = false;
+
+/// The time origin of Event.timeStamp (and, in Phase 10.6, performance).
+std::chrono::steady_clock::time_point g_timeOrigin;
+bool g_timeOriginSet = false;
 
 /// A native called with arguments WebApis.js never passes: a bug in Forge,
 /// reported as a TypeError rather than a crash.
@@ -191,22 +223,19 @@ bool IsForgeSource(JSContext* cx, JS::HandleString source, bool* result)
     return true;
 }
 
-/// A new error of `type` whose stack, file name, line and column come from
-/// the first frame outside Forge's own scripts, so an error a web API throws
-/// points at the code that called it. With a null `message` it has no own
-/// `message` property (DOMException keeps its message internally).
-bool MakeError(JSContext* cx, JSExnType type, JS::HandleString message, JS::MutableHandleValue error)
+/// The current stack from its first frame outside Forge's own scripts
+/// (source names starting with "forge:"), with that frame's file, line and
+/// column. `stack` may end up null (no such frame).
+bool CaptureUserStack(JSContext* cx, JS::MutableHandleObject stack, JS::MutableHandleString fileName,
+                      uint32_t* line, JS::TaggedColumnNumberOneOrigin* column)
 {
-    JS::RootedObject stack(cx);
-
-    if (!JS::CaptureCurrentStack(cx, &stack))
+    if (!JS::CaptureCurrentStack(cx, stack))
     {
         return false;
     }
 
-    JS::RootedString fileName(cx, JS_GetEmptyString(cx));
-    uint32_t line = 0;
-    JS::TaggedColumnNumberOneOrigin column;
+    fileName.set(JS_GetEmptyString(cx));
+    *line = 0;
     JS::RootedString source(cx);
     JS::RootedObject parent(cx);
 
@@ -227,9 +256,9 @@ bool MakeError(JSContext* cx, JSExnType type, JS::HandleString message, JS::Muta
 
         if (!internal)
         {
-            fileName = source;
-            (void)JS::GetSavedFrameLine(cx, nullptr, stack, &line);
-            (void)JS::GetSavedFrameColumn(cx, nullptr, stack, &column);
+            fileName.set(source);
+            (void)JS::GetSavedFrameLine(cx, nullptr, stack, line);
+            (void)JS::GetSavedFrameColumn(cx, nullptr, stack, column);
             break;
         }
 
@@ -244,7 +273,26 @@ bool MakeError(JSContext* cx, JSExnType type, JS::HandleString message, JS::Muta
             parent = nullptr;
         }
 
-        stack = parent;
+        stack.set(parent);
+    }
+
+    return true;
+}
+
+/// A new error of `type` whose stack, file name, line and column come from
+/// the first frame outside Forge's own scripts, so an error a web API throws
+/// points at the code that called it. With a null `message` it has no own
+/// `message` property (DOMException keeps its message internally).
+bool MakeError(JSContext* cx, JSExnType type, JS::HandleString message, JS::MutableHandleValue error)
+{
+    JS::RootedObject stack(cx);
+    JS::RootedString fileName(cx);
+    uint32_t line = 0;
+    JS::TaggedColumnNumberOneOrigin column;
+
+    if (!CaptureUserStack(cx, &stack, &fileName, &line, &column))
+    {
+        return false;
     }
 
     JS::Rooted<mozilla::Maybe<JS::Value>> cause(cx, mozilla::Nothing());
@@ -826,6 +874,51 @@ bool NativeBtoa(JSContext* cx, unsigned argc, JS::Value* vp)
     return true;
 }
 
+/// now() -> milliseconds since the time origin, in steps of 0.1 ms. A
+/// coarse clock makes timing side channels harder (Spectre); browsers
+/// that are not cross-origin isolated use the same step.
+bool NativeNow(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    const auto elapsed = std::chrono::steady_clock::now() - g_timeOrigin;
+    const long long tenthsOfMs =
+        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() / 100;
+    args.rval().setDouble(static_cast<double>(tenthsOfMs) / 10.0);
+    (void)cx;
+    return true;
+}
+
+/// reportException(value, kind): an event listener threw `value` (kind 0),
+/// or the program called reportError(value) (kind 1). Reports it (see
+/// ReportException); never throws.
+bool NativeReportException(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    if (args.length() < 2 || !args[1].isInt32())
+    {
+        return Misuse(cx, "reportException");
+    }
+
+    // The value's own stack is used when it is an Error; for any other value
+    // the stack is the caller's (reportError's caller, or the dispatch).
+    JS::RootedObject stack(cx);
+    JS::RootedString fileName(cx);
+    uint32_t line = 0;
+    JS::TaggedColumnNumberOneOrigin column;
+
+    if (!CaptureUserStack(cx, &stack, &fileName, &line, &column))
+    {
+        JS_ClearPendingException(cx);
+        stack = nullptr;
+    }
+
+    JS::ExceptionStack exception(cx, args[0], stack);
+    ReportException(cx, exception, args[1].toInt32() == 1 ? "reportError" : "an event listener");
+    args.rval().setUndefined();
+    return true;
+}
+
 const JSFunctionSpec kNatives[] = {
     JS_FN("makeError", NativeMakeError, 3, 0),
     JS_FN("forward", NativeForward, 4, 0),
@@ -837,6 +930,8 @@ const JSFunctionSpec kNatives[] = {
     JS_FN("utf8EncodeInto", NativeUtf8EncodeInto, 2, 0),
     JS_FN("atob", NativeAtob, 1, 0),
     JS_FN("btoa", NativeBtoa, 1, 0),
+    JS_FN("now", NativeNow, 0, 0),
+    JS_FN("reportException", NativeReportException, 2, 0),
     JS_FS_END,
 };
 
@@ -853,10 +948,65 @@ bool CountOwnKeys(JSContext* cx, JS::HandleObject obj, size_t* count)
     return true;
 }
 
+/// Calls internals.<name>(argv) of the program's realm, which the caller
+/// has entered. False (with an exception pending, or none after an
+/// uncatchable error) if it could not be called or threw.
+bool CallProgramInternal(JSContext* cx, const char* name, const JS::HandleValueArray& argv,
+                         JS::MutableHandleValue rval)
+{
+    JS::RootedObject internals(cx, InternalsOf(JS::CurrentGlobalOrNull(cx)));
+    JS::RootedValue function(cx);
+
+    if (!internals || !GetOwnData(cx, internals, name, &function) || !function.isObject())
+    {
+        if (!JS_IsExceptionPending(cx))
+        {
+            JS_ReportErrorASCII(cx, "Forge: the web API internal %s is missing", name);
+        }
+
+        return false;
+    }
+
+    return JS::Call(cx, JS::UndefinedHandleValue, function, argv, rval);
+}
+
+JSString* NewUtf8String(JSContext* cx, const char* text)
+{
+    return text != nullptr ? JS_NewStringCopyUTF8Z(cx, JS::ConstUTF8CharsZ(text, strlen(text)))
+                           : JS_GetEmptyString(cx);
+}
+
 } // namespace
 
-bool DefineWebApis(JSContext* cx, JS::HandleObject global)
+bool DefineWebApis(JSContext* cx, JS::HandleObject global, WebRealm kind)
 {
+    if (kind == WebRealm::Program)
+    {
+        if (g_programGlobal != nullptr)
+        {
+            JS_ReportErrorASCII(cx, "Forge: the program's web APIs were defined twice");
+            return false;
+        }
+
+        forge::core::Result<forge::core::memory::UniquePtr<JS::PersistentRootedObject>> made =
+            forge::core::memory::MakeUnique<JS::PersistentRootedObject>(cx, global);
+
+        if (made.HasError())
+        {
+            JS_ReportOutOfMemory(cx);
+            return false;
+        }
+
+        g_programGlobal = made.Value().Release();
+        g_timeOrigin = std::chrono::steady_clock::now();
+        g_timeOriginSet = true;
+    }
+    else if (g_programGlobal == nullptr || !g_timeOriginSet)
+    {
+        JS_ReportErrorASCII(cx, "Forge: a package's web APIs were defined before the program's");
+        return false;
+    }
+
     if (JSCLASS_RESERVED_SLOTS(JS::GetClass(global)) <= kWebInternalsSlot)
     {
         JS_ReportErrorASCII(cx, "Forge: the global object has no slot for the web APIs");
@@ -981,6 +1131,155 @@ bool GetDomExceptionFields(JSContext* cx, JS::HandleObject obj, JS::MutableHandl
 
     *found = true;
     return true;
+}
+
+void ShutdownWebApis()
+{
+    delete g_programGlobal;
+    g_programGlobal = nullptr;
+}
+
+void ReportException(JSContext* cx, const JS::ExceptionStack& exception, const char* context)
+{
+    if (g_programGlobal == nullptr || g_reportingException)
+    {
+        HostReportUncaught(cx, exception, context);
+        return;
+    }
+
+    // The ErrorEvent's fields, from the error report: it runs no script (no
+    // getter, no toString), so reporting cannot be hijacked by the value.
+    String message;
+    String fileName;
+    uint32_t line = 0;
+    uint32_t column = 0;
+
+    {
+        JS::ErrorReportBuilder report(cx);
+
+        if (report.init(cx, exception, JS::ErrorReportBuilder::NoSideEffects))
+        {
+            if (report.toStringResult())
+            {
+                message.Append(report.toStringResult().c_str()).Ignore();
+            }
+
+            if (const JSErrorReport* r = report.report())
+            {
+                if (r->filename)
+                {
+                    fileName.Append(r->filename.c_str()).Ignore();
+                }
+
+                line = r->lineno;
+                column = r->column.oneOriginValue();
+            }
+        }
+
+        JS_ClearPendingException(cx);
+    }
+
+    bool notCanceled = true;
+    g_reportingException = true;
+
+    {
+        JS::RootedObject programGlobal(cx, *g_programGlobal);
+        JSAutoRealm ar(cx, programGlobal);
+        JS::RootedValueArray<5> argv(cx);
+        argv[0].set(exception.exception());
+        JSString* messageString = NewUtf8String(cx, message.CStr());
+        JSString* fileString = messageString ? NewUtf8String(cx, fileName.CStr()) : nullptr;
+        bool ok = messageString && fileString;
+
+        if (ok)
+        {
+            argv[1].setString(messageString);
+            argv[2].setString(fileString);
+            argv[3].setNumber(line);
+            argv[4].setNumber(column);
+            JS::RootedValue rval(cx);
+            ok = JS_WrapValue(cx, argv[0]) && CallProgramInternal(cx, "dispatchError", argv, &rval);
+            notCanceled = !ok || rval.isTrue();
+        }
+
+        JS_ClearPendingException(cx);
+    }
+
+    g_reportingException = false;
+
+    if (notCanceled)
+    {
+        HostReportUncaught(cx, exception, context);
+    }
+}
+
+void FireUnhandledRejection(JSContext* cx, JS::HandleObject promise, bool* handled)
+{
+    *handled = false;
+
+    if (g_programGlobal == nullptr)
+    {
+        return;
+    }
+
+    bool canceled = false;
+
+    {
+        JS::RootedValueArray<2> argv(cx);
+        argv[0].setObject(*promise);
+        argv[1].set(JS::GetPromiseResult(promise));
+        JS::RootedObject programGlobal(cx, *g_programGlobal);
+        JSAutoRealm ar(cx, programGlobal);
+        JS::RootedValue rval(cx);
+        canceled = JS_WrapValue(cx, argv[0]) && JS_WrapValue(cx, argv[1]) &&
+                   CallProgramInternal(cx, "dispatchUnhandledRejection", argv, &rval) &&
+                   rval.isFalse();
+        JS_ClearPendingException(cx);
+    }
+
+    if (!canceled)
+    {
+        return;
+    }
+
+    *handled = true;
+
+    // HTML: a rejection still without a handler after its event joins the
+    // "outstanding rejected promises", which fire rejectionhandled later.
+    if (!JS::GetPromiseIsHandled(promise))
+    {
+        JS::RootedValue promiseValue(cx, JS::ObjectValue(*promise));
+        JS::RootedObject programGlobal(cx, *g_programGlobal);
+        JSAutoRealm ar(cx, programGlobal);
+        JS::RootedValue rval(cx);
+
+        if (!JS_WrapValue(cx, &promiseValue) ||
+            !CallProgramInternal(cx, "rememberRejection", JS::HandleValueArray(promiseValue), &rval))
+        {
+            JS_ClearPendingException(cx);
+        }
+    }
+}
+
+void FireRejectionHandled(JSContext* cx, JS::HandleObject promise)
+{
+    if (g_programGlobal == nullptr)
+    {
+        return;
+    }
+
+    JS::RootedValueArray<2> argv(cx);
+    argv[0].setObject(*promise);
+    argv[1].set(JS::GetPromiseResult(promise));
+    JS::RootedObject programGlobal(cx, *g_programGlobal);
+    JSAutoRealm ar(cx, programGlobal);
+    JS::RootedValue rval(cx);
+
+    if (!JS_WrapValue(cx, argv[0]) || !JS_WrapValue(cx, argv[1]) ||
+        !CallProgramInternal(cx, "dispatchRejectionHandled", argv, &rval))
+    {
+        JS_ClearPendingException(cx);
+    }
 }
 
 } // namespace forge::runtime

@@ -16,8 +16,15 @@
 // every other intrinsic, and one crossing compartments is replaced by the
 // receiving side's own (runtime/Compartments.cpp). None of them needs a
 // permission (kavach/Ops.h rows with Permission::None).
+//
+// Phase 10.2: the global object is an EventTarget, and an uncaught error
+// or an unhandled rejection is first dispatched as an "error" or
+// "unhandledrejection" event at the PROGRAM's global object (never a
+// package's: a package must not be able to hide another package's errors,
+// D28). It is fatal only if no listener cancels it.
 
 #include "js/Class.h"
+#include "js/Exception.h"
 #include "js/RootingAPI.h"
 #include "js/TypeDecls.h"
 
@@ -36,14 +43,60 @@ constexpr uint32_t kWebInternalsSlot = JSCLASS_GLOBAL_SLOT_COUNT + 1;
 extern const char* const kWebApiGlobalNames[];
 extern const forge::core::Size kWebApiGlobalCount;
 
+enum class WebRealm
+{
+    Program,  // the program's realm: receives the uncaught-error events
+    Package,  // a package compartment
+};
+
 /// Defines the web APIs on `global`, the current realm's global object.
 /// Call once per realm, after JS::InitRealmStandardClasses and before any
 /// other script runs in it. Fails (with an exception pending) if the script
-/// does not define exactly kWebApiGlobalNames.
+/// does not define exactly kWebApiGlobalNames. Exactly one realm is
+/// WebRealm::Program, and it must be defined first.
 [[nodiscard]]
 bool DefineWebApis(
     JSContext* cx,
-    JS::HandleObject global);
+    JS::HandleObject global,
+    WebRealm kind);
+
+/// Releases what DefineWebApis kept. Call before the context is destroyed.
+void ShutdownWebApis();
+
+/// The HTML "report an exception" steps: dispatches an ErrorEvent (message,
+/// filename, line and column from the error report, error = the value) at
+/// the program's global object. If no listener cancels it, the exception is
+/// uncaught: HostReportUncaught prints it and ends the program. Runs in any
+/// realm; nothing is left pending. `context` names where it happened.
+void ReportException(
+    JSContext* cx,
+    const JS::ExceptionStack& exception,
+    const char* context);
+
+/// The HTML "notify about rejected promises" steps for one rejected
+/// promise with no handler (called in the promise's realm): dispatches
+/// "unhandledrejection" at the program's global object. `*handled` is set
+/// if a listener cancelled it; the rejection is then not fatal, and a
+/// handler attached later fires "rejectionhandled" (FireRejectionHandled).
+void FireUnhandledRejection(
+    JSContext* cx,
+    JS::HandleObject promise,
+    bool* handled);
+
+/// A handler was attached to `promise` after it was reported (called in
+/// the promise's realm): dispatches "rejectionhandled" if its
+/// "unhandledrejection" event was cancelled.
+void FireRejectionHandled(
+    JSContext* cx,
+    JS::HandleObject promise);
+
+/// Implemented by forge.cpp, which owns exit and error output: prints
+/// `exception` as uncaught in `context` and ends the program with exit code
+/// 1 (or, after Forge.exit(), just stops).
+void HostReportUncaught(
+    JSContext* cx,
+    const JS::ExceptionStack& exception,
+    const char* context);
 
 /// For console output (runtime/Inspect.cpp): if `obj`, an object of the
 /// current realm, is a DOMException, sets `*found` and its name and message.
