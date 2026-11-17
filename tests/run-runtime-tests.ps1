@@ -292,6 +292,16 @@ $cases = @(
              "package timer: later-ok", "package microtask: micro-ok", "wrapped microtask ran",
              "app timer survived: true", "package dynamic import: helper-ok", "spread import: NotFound",
              "thrower: true thrower failed at its top level", "cycle: InvalidArgument true",
+             "webby globals: function function function function function",
+             "webby frozen: true true true true", "webby works: h$eAcute ok 20",
+             "webby replace decode: TypeError", "web class maps: true",
+             "web exception from a package: true true NotFoundError from package 8",
+             "web getter forwarded: 8", "web exception toString: NotFoundError: from package",
+             "makeDomException@", "web decoder from a package: utf-16le true AB",
+             "web forwarded error: true", 'web encodeInto forwarded: {"read":2,"written":2} 97,98',
+             "web app decoder in a package: ok",
+             "web app exception in a package: true SyntaxError app message 12",
+             "web thrown across: true AbortError 20",
              "isolation done");
      Not = @("SHOULD NOT", "[Proxy]") },
   @{ Name = "permissions (9.4)"; File = (Join-Path $gApp "src\main.js"); Exit = 0;
@@ -327,6 +337,12 @@ $cases = @(
      } },
   @{ Name = "ambiguous grant (9.4)"; File = (Join-Path $gDup "main.js"); Exit = 1;
      Has = @("two folders hold a package of that name"); Not = @("SHOULD NOT RUN") },
+  @{ Name = "web APIs (10.1)"; File = "web-apis.js"; Exit = 0;
+     Has = @("web done:", " 0 failed"); Not = @("WEB FAIL", "Uncaught") },
+  @{ Name = "web uncaught (10.1)"; File = "web-uncaught.js"; Exit = 1;
+     Has = @("before", "web-uncaught.js:6:", "InvalidCharacterError: atob: the string is not correctly encoded base64.",
+             "thrower@");
+     Not = @("forge:web", "SHOULD NOT RUN") },
   @{ File = "frozen-intrinsics.js"; Exit = 0; Pre = @("--frozen-intrinsics");
      Has = @("frozen: true true", "extend: TypeError", "override: Fancy ok", "app globals: object object",
              "eval in the program: 2", "frozen done");

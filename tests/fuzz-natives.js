@@ -1,6 +1,7 @@
 // Phase 8.4 (rule R24): a deterministic fuzzer for every native function
 // Forge exposes to JavaScript (Phase 9.1: it runs as an ES module, like
-// every program, and also covers import.meta.resolve).
+// every program, and also covers import.meta.resolve; Phase 10.1: and the
+// web APIs).
 //
 //   forge --allow-read=<scratch> --allow-write=<scratch> tests/fuzz-natives.js <scratch> [seed] [calls]
 //
@@ -13,9 +14,9 @@
 //   2. A Promise-returning fs function never threw synchronously.
 //   3. Any `code` on an error is one of Forge's error codes.
 //   4. Natives that promise never to run script code (everything except
-//      print and the timer functions, see CallSites.md) did not call a
-//      getter, a toString/valueOf, a Symbol.toPrimitive method or a Proxy
-//      trap of any argument.
+//      print, the timer functions and the web APIs, see CallSites.md) did
+//      not call a getter, a toString/valueOf, a Symbol.toPrimitive method
+//      or a Proxy trap of any argument.
 //
 // The same seed gives the same calls, so a failure can be replayed by
 // passing the seed it printed. Forge.exit is the one native left out
@@ -312,10 +313,31 @@ natives.push({ name: "Forge.exitCode=", fn(v) { Forge.exitCode = v; }, self: und
 // Phase 9.1: this file is a module, so import.meta.resolve is reachable.
 natives.push({ name: "import.meta.resolve", fn: import.meta.resolve, self: import.meta });
 
+// Phase 10.1: the web APIs (runtime/WebApis.js) and the natives behind
+// them. A brand check, a WebIDL conversion and the byte work all run on
+// every call; `self` is sometimes another value, which must give a
+// TypeError.
+const webEncoder = new TextEncoder();
+const webDecoders = [new TextDecoder(), new TextDecoder("utf-16le"),
+                     new TextDecoder("windows-1252", { fatal: true }),
+                     new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })];
+const WEB = ["atob", "btoa", "TextEncoder.encode", "TextEncoder.encodeInto", "TextDecoder.decode",
+             "new TextDecoder", "new DOMException"];
+natives.push({ name: "atob", fn: atob, self: globalThis });
+natives.push({ name: "btoa", fn: btoa, self: globalThis });
+natives.push({ name: "TextEncoder.encode", fn: TextEncoder.prototype.encode, self: webEncoder });
+natives.push({ name: "TextEncoder.encodeInto", fn: TextEncoder.prototype.encodeInto, self: webEncoder });
+for (const decoder of webDecoders) {
+  natives.push({ name: "TextDecoder.decode", fn: TextDecoder.prototype.decode, self: decoder });
+}
+natives.push({ name: "new TextDecoder", fn(...a) { return new TextDecoder(...a); }, self: undefined });
+natives.push({ name: "new DOMException", fn(...a) { return new DOMException(...a); }, self: undefined });
+
 // These may run script code by design (CallSites.md): print converts with
-// ToString and the timer functions convert the delay or id with ToNumber.
+// ToString and the timer functions convert the delay or id with ToNumber;
+// the web APIs run WebIDL conversions (ToString, dictionary members).
 const MAY_RUN_SCRIPT = new Set(["print", "setTimeout", "setInterval", "clearTimeout",
-                                "clearInterval"]);
+                                "clearInterval", ...WEB]);
 const OUTPUT = (name) => name.startsWith("console.") || name === "print" ||
                          name.startsWith("Forge.stdout") || name.startsWith("Forge.stderr");
 const TWO_PATHS = new Set(["renameSync", "rename", "copyFileSync", "copyFile"]);
@@ -359,6 +381,19 @@ function argumentsFor(native) {
     }
 
     return args;
+  }
+
+  if (name === "TextDecoder.decode" || name === "new TextDecoder") {
+    const first = name === "new TextDecoder"
+      ? (chance(0.6) ? pick(["utf-8", "UTF-16BE", " latin1 ", "koi8-u", "x-user-defined", "gbk",
+                             "replacement", "utf-7"]) : anyValue(true))
+      : (chance(0.6) ? pick([new Uint8Array([0xE2, 0x82]), new Uint8Array([0xAC, 0x41]),
+                             new Uint8Array([0xFF, 0xFE, 0x00, 0xD8]), new ArrayBuffer(3),
+                             new DataView(new ArrayBuffer(5))]) : anyValue(false));
+    const options = chance(0.5)
+      ? pick([{ stream: true }, { stream: false }, { fatal: true }, { ignoreBOM: true }, {}])
+      : anyValue(true);
+    return count === 0 ? [] : count === 1 ? [first] : [first, options];
   }
 
   const args = [];
