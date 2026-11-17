@@ -111,6 +111,22 @@ try {
   log("web thrown across: " + (e instanceof DOMException) + " " + e.name + " " + e.code);
 }
 
+// Phase 10.2: a listener of the program on a package's EventTarget, and a
+// package's unhandled rejection, which only the program's global sees.
+const packageTarget = webby.makeTarget();
+const pings = [];
+packageTarget.addEventListener("ping", (e) => pings.push(e.type));
+log("web listener across compartments: " + pings.concat(webby.fire(packageTarget, "ping")).join(" "));
+const seenRejections = [];
+addEventListener("unhandledrejection", (e) => {
+  seenRejections.push(e.reason.message);
+  e.preventDefault();
+});
+webby.rejectInPackage();
+await new Promise((resolve) => setTimeout(resolve, 20));
+log("web package rejection reaches the program: " + seenRejections.join());
+log("web package global saw: " + webby.packageSawRejections());
+
 // Timers and microtasks belong to the realm that made them.
 let appTimerRan = false;
 const appTimer = setTimeout(() => { appTimerRan = true; }, 20);
