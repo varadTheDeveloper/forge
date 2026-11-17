@@ -1,0 +1,1 @@
+{ "name": "webby", "version": "1.0.0", "exports": "./webby.js" }
