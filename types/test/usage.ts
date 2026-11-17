@@ -21,3 +21,24 @@ Forge.addSignalListener("SIGTERM", () => {});
 // @ts-expect-error  paths must be strings
 fs.readFileSync(new Uint8Array(1));
 function never(): number { Forge.exit(1); }
+
+// Phase 10.2: events.
+const target = new EventTarget();
+target.addEventListener("x", (ev: Event) => ev.preventDefault(), { once: true, passive: false });
+target.addEventListener("x", { handleEvent(ev: Event) { ev.stopPropagation(); } }, true);
+const delivered: boolean = target.dispatchEvent(new CustomEvent<number>("x", { detail: 1 }));
+const detail: number = new CustomEvent<number>("x", { detail: 2 }).detail;
+addEventListener("error", (ev) => { const m: string = ev.message; ev.preventDefault(); void m; });
+addEventListener("unhandledrejection", (ev) => { const r: unknown = ev.reason; void r; });
+addEventListener("custom", (ev: Event) => { void ev.timeStamp; });
+onerror = (message, source, lineno, colno, error) => true;
+onunhandledrejection = (ev) => { void ev.promise; return false; };
+reportError(new Error("x"));
+const ua: string = navigator.userAgent;
+const me: typeof globalThis = self;
+const phase: number = Event.AT_TARGET;
+void delivered; void detail; void ua; void me; void phase;
+// @ts-expect-error  dispatchEvent needs an Event
+target.dispatchEvent({ type: "x" });
+// @ts-expect-error  PromiseRejectionEvent needs its dictionary
+new PromiseRejectionEvent("x");
