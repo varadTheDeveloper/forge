@@ -12,5 +12,6 @@ permission, so all of them run in the shared, frozen "pure" compartment
 | `live` | Snapshot semantics: a later reassignment of an `export let` is not seen by another package. |
 | `thrower` | A package that throws at its top level: the importer gets the package's error, still a `TypeError`. |
 | `cycle-a`, `cycle-b` | An import cycle between packages is refused at load time, naming both. |
+| `webby` | Phase 10.1: the web APIs (`DOMException`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`) exist and are frozen inside a package. Their classes cross as intrinsics (the receiving side's own); instances cross as wrappers, with getters, `instanceof`, `toString` and console output working, and a method called on another compartment's instance (`decode`, `encodeInto`, a getter through `.call`) forwarded to that compartment, both ways. |
 
 `tests/frozen-intrinsics.js` runs a program with `--frozen-intrinsics`.
