@@ -27,6 +27,7 @@
 #include "kavach/Kavach.h"
 #include "runtime/Inspect.h"
 #include "runtime/JsUtil.h"
+#include "runtime/WebApis.h"
 
 namespace forge::runtime
 {
@@ -1059,7 +1060,10 @@ JSObject* CreateDependencyGlobal(JSContext* cx, Size index)
 
     {
         JSAutoRealm ar(cx, global);
-        ok = JS::InitRealmStandardClasses(cx) && Walk(cx, *info, global) &&
+        // Phase 10.1: the web APIs are intrinsics too, so they are defined
+        // before the walk (WebApis.h).
+        ok = JS::InitRealmStandardClasses(cx) && DefineWebApis(cx, global) &&
+             Walk(cx, *info, global) &&
              FreezeIntrinsics(cx, *info, global) && defineGlobals(cx, global) &&
              MarkForgeGlobals(cx, *info, global, true) && JS_FreezeObject(cx, global);
 

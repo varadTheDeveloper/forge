@@ -1,5 +1,7 @@
 #include "runtime/Inspect.h"
 
+#include "runtime/WebApis.h"
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1087,9 +1089,22 @@ private:
         JS::RootedValue message(cx_);
         bool hasName = false;
         bool hasMessage = false;
+        bool isDomException = false;
 
-        if (!GetDataProperty(cx_, obj, "name", &name, &hasName) ||
-            !GetDataProperty(cx_, obj, "message", &message, &hasMessage))
+        // Phase 10.1: a DOMException keeps its name and message internally
+        // (prototype getters); read them without running the getters.
+        if (!GetDomExceptionFields(cx_, obj, &name, &message, &isDomException))
+        {
+            return false;
+        }
+
+        if (isDomException)
+        {
+            hasName = true;
+            hasMessage = true;
+        }
+        else if (!GetDataProperty(cx_, obj, "name", &name, &hasName) ||
+                 !GetDataProperty(cx_, obj, "message", &message, &hasMessage))
         {
             return false;
         }
