@@ -73,6 +73,16 @@ runtime_test() {
 runtime_test ModuleSpecifierTest runtime/ModuleSpecifier.cpp
 runtime_test JsonTest runtime/Json.cpp
 runtime_test ManifestTest runtime/Manifest.cpp runtime/Json.cpp
+# Phase 10.1: UTF-8, the other TextDecoder encodings, base64.
+runtime_test EncodingTest runtime/Encoding.cpp
+
+# Phase 10.1: the web API script embedded in C++ matches its source.
+if (cd .. && python3 tools/gen-webapis.py --check); then
+  echo "[runtime] WebApis.js.inc PASS"
+else
+  echo "[runtime] WebApis.js.inc FAIL"
+  failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
   echo "[forge-core] $failures FAILED"
