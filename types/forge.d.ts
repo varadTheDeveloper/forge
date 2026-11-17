@@ -2,7 +2,10 @@
 //
 // These describe the globals Forge adds to standard JavaScript: Forge,
 // fs, console, the timers, queueMicrotask and print, and (Phase 10) the
-// web-standard APIs: DOMException, TextEncoder, TextDecoder, atob, btoa. Use them with
+// web-standard APIs: DOMException, TextEncoder, TextDecoder, atob, btoa;
+// events (Event, EventTarget, CustomEvent, ErrorEvent,
+// PromiseRejectionEvent), reportError, self, navigator and the global
+// event handlers. Use them with
 // TypeScript or a JavaScript editor:
 //
 //   /// <reference path="path/to/forge/types/forge.d.ts" />
@@ -440,4 +443,165 @@ declare global {
    * DOMException named "InvalidCharacterError" for any other character.
    */
   function btoa(data: string): string;
+  // ---------------------------------------------------------------------
+  // Phase 10.2: events (WinterTC.md). The global object is an EventTarget.
+  // ---------------------------------------------------------------------
+
+  interface EventInit {
+    bubbles?: boolean;
+    cancelable?: boolean;
+    composed?: boolean;
+  }
+
+  class Event {
+    constructor(type: string, eventInitDict?: EventInit);
+    readonly type: string;
+    readonly target: EventTarget | null;
+    /** Legacy alias of target. */
+    readonly srcElement: EventTarget | null;
+    readonly currentTarget: EventTarget | null;
+    /** [target] while the event is dispatched, [] otherwise. */
+    composedPath(): EventTarget[];
+    readonly eventPhase: number;
+    static readonly NONE: 0;
+    static readonly CAPTURING_PHASE: 1;
+    static readonly AT_TARGET: 2;
+    static readonly BUBBLING_PHASE: 3;
+    readonly NONE: 0;
+    readonly CAPTURING_PHASE: 1;
+    readonly AT_TARGET: 2;
+    readonly BUBBLING_PHASE: 3;
+    stopPropagation(): void;
+    /** Legacy: true after stopPropagation(); setting it to true stops propagation. */
+    cancelBubble: boolean;
+    stopImmediatePropagation(): void;
+    readonly bubbles: boolean;
+    readonly cancelable: boolean;
+    /** Legacy: false once the event is cancelled; setting false cancels it. */
+    returnValue: boolean;
+    preventDefault(): void;
+    readonly defaultPrevented: boolean;
+    readonly composed: boolean;
+    /** True only for events Forge itself dispatches. */
+    readonly isTrusted: boolean;
+    /** Milliseconds since Forge started, in steps of 0.1 ms. */
+    readonly timeStamp: number;
+    /** Legacy. */
+    initEvent(type: string, bubbles?: boolean, cancelable?: boolean): void;
+  }
+
+  interface CustomEventInit<T = any> extends EventInit {
+    detail?: T;
+  }
+
+  class CustomEvent<T = any> extends Event {
+    constructor(type: string, eventInitDict?: CustomEventInit<T>);
+    readonly detail: T;
+    /** Legacy. */
+    initCustomEvent(type: string, bubbles?: boolean, cancelable?: boolean, detail?: T): void;
+  }
+
+  interface ErrorEventInit extends EventInit {
+    message?: string;
+    filename?: string;
+    lineno?: number;
+    colno?: number;
+    error?: any;
+  }
+
+  class ErrorEvent extends Event {
+    constructor(type: string, eventInitDict?: ErrorEventInit);
+    readonly message: string;
+    readonly filename: string;
+    readonly lineno: number;
+    readonly colno: number;
+    readonly error: any;
+  }
+
+  interface PromiseRejectionEventInit extends EventInit {
+    promise: object;
+    reason?: any;
+  }
+
+  class PromiseRejectionEvent extends Event {
+    constructor(type: string, eventInitDict: PromiseRejectionEventInit);
+    readonly promise: object;
+    readonly reason: any;
+  }
+
+  interface EventListener {
+    (evt: Event): void;
+  }
+
+  interface EventListenerObject {
+    handleEvent(object: Event): void;
+  }
+
+  type EventListenerOrEventListenerObject = EventListener | EventListenerObject;
+
+  interface EventListenerOptions {
+    capture?: boolean;
+  }
+
+  interface AddEventListenerOptions extends EventListenerOptions {
+    once?: boolean;
+    /** A passive listener's preventDefault() does nothing. */
+    passive?: boolean;
+    // `signal` arrives with AbortSignal (Phase 10.3).
+  }
+
+  class EventTarget {
+    constructor();
+    addEventListener(type: string, callback: EventListenerOrEventListenerObject | null,
+                     options?: AddEventListenerOptions | boolean): void;
+    removeEventListener(type: string, callback: EventListenerOrEventListenerObject | null,
+                        options?: EventListenerOptions | boolean): void;
+    /** False if a listener cancelled the event. */
+    dispatchEvent(event: Event): boolean;
+  }
+
+  /**
+   * The global object's events. "error" (an uncaught exception) and
+   * "unhandledrejection" are cancellable: a listener that cancels one keeps
+   * the program running. Inside a package these never fire: only the
+   * program handles uncaught errors.
+   */
+  interface ForgeGlobalEventMap {
+    error: ErrorEvent;
+    unhandledrejection: PromiseRejectionEvent;
+    rejectionhandled: PromiseRejectionEvent;
+  }
+
+  function addEventListener<K extends keyof ForgeGlobalEventMap>(
+    type: K, listener: (event: ForgeGlobalEventMap[K]) => any,
+    options?: AddEventListenerOptions | boolean): void;
+  function addEventListener(type: string, listener: EventListenerOrEventListenerObject | null,
+                            options?: AddEventListenerOptions | boolean): void;
+  function removeEventListener<K extends keyof ForgeGlobalEventMap>(
+    type: K, listener: (event: ForgeGlobalEventMap[K]) => any,
+    options?: EventListenerOptions | boolean): void;
+  function removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null,
+                               options?: EventListenerOptions | boolean): void;
+  function dispatchEvent(event: Event): boolean;
+
+  /** Reports `e` as an uncaught exception would be (an "error" event first), without throwing. */
+  function reportError(e: any): void;
+
+  /** The global object. */
+  var self: typeof globalThis;
+
+  interface ForgeNavigator {
+    /** "Forge" (no version, decision D13). */
+    readonly userAgent: string;
+  }
+
+  /** Frozen. */
+  var navigator: ForgeNavigator;
+
+  /** Runs for every "error" event; returning true cancels it. */
+  var onerror: ((message: string | Event, source?: string, lineno?: number, colno?: number,
+                 error?: any) => any) | null;
+  /** Runs for every "unhandledrejection" event; returning false cancels it. */
+  var onunhandledrejection: ((event: PromiseRejectionEvent) => any) | null;
+  var onrejectionhandled: ((event: PromiseRejectionEvent) => any) | null;
 }
