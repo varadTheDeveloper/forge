@@ -1,7 +1,8 @@
 // Type declarations for the Forge runtime (Phase 8.4).
 //
 // These describe the globals Forge adds to standard JavaScript: Forge,
-// fs, console, the timers, queueMicrotask and print. Use them with
+// fs, console, the timers, queueMicrotask and print, and (Phase 10) the
+// web-standard APIs: DOMException, TextEncoder, TextDecoder, atob, btoa. Use them with
 // TypeScript or a JavaScript editor:
 //
 //   /// <reference path="path/to/forge/types/forge.d.ts" />
@@ -9,7 +10,8 @@
 // or list this file under "files" in tsconfig.json, with "lib": ["es2023"]
 // and no "dom" library (Forge has no DOM).
 //
-// They match the C++ in forge.cpp, runtime/Console.cpp and runtime/Fs.cpp.
+// They match the C++ in forge.cpp, runtime/Console.cpp and runtime/Fs.cpp,
+// and runtime/WebApis.js for the web APIs.
 // When a native function is added or changed, change this file in the same
 // commit (rule R2 lists every native in kavach/Ops.h).
 //
@@ -313,4 +315,129 @@ declare global {
    * New code should use console.log.
    */
   function print(...values: unknown[]): void;
+
+  // ---------------------------------------------------------------------
+  // Phase 10.1: web-standard APIs (WinterTC.md). Every one is available in
+  // packages too, needs no permission, and is frozen inside a package.
+  // ---------------------------------------------------------------------
+
+  /**
+   * WebIDL's exception type. A real Error (it has a stack, and
+   * `instanceof Error` is true); its name, message and code are read-only
+   * and inherited, never own properties.
+   */
+  class DOMException extends Error {
+    constructor(message?: string, name?: string);
+    /** "Error" when no name was given. */
+    readonly name: string;
+    readonly message: string;
+    /** The legacy code of the name (InvalidCharacterError is 5), or 0. */
+    readonly code: number;
+    static readonly INDEX_SIZE_ERR: 1;
+    static readonly DOMSTRING_SIZE_ERR: 2;
+    static readonly HIERARCHY_REQUEST_ERR: 3;
+    static readonly WRONG_DOCUMENT_ERR: 4;
+    static readonly INVALID_CHARACTER_ERR: 5;
+    static readonly NO_DATA_ALLOWED_ERR: 6;
+    static readonly NO_MODIFICATION_ALLOWED_ERR: 7;
+    static readonly NOT_FOUND_ERR: 8;
+    static readonly NOT_SUPPORTED_ERR: 9;
+    static readonly INUSE_ATTRIBUTE_ERR: 10;
+    static readonly INVALID_STATE_ERR: 11;
+    static readonly SYNTAX_ERR: 12;
+    static readonly INVALID_MODIFICATION_ERR: 13;
+    static readonly NAMESPACE_ERR: 14;
+    static readonly INVALID_ACCESS_ERR: 15;
+    static readonly VALIDATION_ERR: 16;
+    static readonly TYPE_MISMATCH_ERR: 17;
+    static readonly SECURITY_ERR: 18;
+    static readonly NETWORK_ERR: 19;
+    static readonly ABORT_ERR: 20;
+    static readonly URL_MISMATCH_ERR: 21;
+    static readonly QUOTA_EXCEEDED_ERR: 22;
+    static readonly TIMEOUT_ERR: 23;
+    static readonly INVALID_NODE_TYPE_ERR: 24;
+    static readonly DATA_CLONE_ERR: 25;
+    readonly INDEX_SIZE_ERR: 1;
+    readonly DOMSTRING_SIZE_ERR: 2;
+    readonly HIERARCHY_REQUEST_ERR: 3;
+    readonly WRONG_DOCUMENT_ERR: 4;
+    readonly INVALID_CHARACTER_ERR: 5;
+    readonly NO_DATA_ALLOWED_ERR: 6;
+    readonly NO_MODIFICATION_ALLOWED_ERR: 7;
+    readonly NOT_FOUND_ERR: 8;
+    readonly NOT_SUPPORTED_ERR: 9;
+    readonly INUSE_ATTRIBUTE_ERR: 10;
+    readonly INVALID_STATE_ERR: 11;
+    readonly SYNTAX_ERR: 12;
+    readonly INVALID_MODIFICATION_ERR: 13;
+    readonly NAMESPACE_ERR: 14;
+    readonly INVALID_ACCESS_ERR: 15;
+    readonly VALIDATION_ERR: 16;
+    readonly TYPE_MISMATCH_ERR: 17;
+    readonly SECURITY_ERR: 18;
+    readonly NETWORK_ERR: 19;
+    readonly ABORT_ERR: 20;
+    readonly URL_MISMATCH_ERR: 21;
+    readonly QUOTA_EXCEEDED_ERR: 22;
+    readonly TIMEOUT_ERR: 23;
+    readonly INVALID_NODE_TYPE_ERR: 24;
+    readonly DATA_CLONE_ERR: 25;
+  }
+
+  interface TextEncoderEncodeIntoResult {
+    /** UTF-16 code units of the source that were encoded. */
+    read: number;
+    /** Bytes written to the destination. */
+    written: number;
+  }
+
+  /** Encodes strings as UTF-8. Lone surrogates become U+FFFD. */
+  class TextEncoder {
+    constructor();
+    readonly encoding: "utf-8";
+    encode(input?: string): Uint8Array;
+    /** Encodes as many whole characters as fit in `destination`. */
+    encodeInto(source: string, destination: Uint8Array): TextEncoderEncodeIntoResult;
+  }
+
+  interface TextDecoderOptions {
+    /** Throw a TypeError on invalid input instead of inserting U+FFFD. */
+    fatal?: boolean;
+    /** Keep a leading byte-order mark instead of removing it. */
+    ignoreBOM?: boolean;
+  }
+
+  interface TextDecodeOptions {
+    /** More input follows: keep an incomplete character for the next call. */
+    stream?: boolean;
+  }
+
+  /**
+   * Decodes bytes as text. Supports UTF-8, UTF-16LE, UTF-16BE, every
+   * single-byte encoding of the Encoding Standard (windows-1252, the
+   * ISO-8859 family, KOI8, ...) and x-user-defined, under all their labels.
+   * The CJK multi-byte encodings throw a RangeError for now.
+   */
+  class TextDecoder {
+    constructor(label?: string, options?: TextDecoderOptions);
+    /** The encoding's name in lower case, for example "utf-8". */
+    readonly encoding: string;
+    readonly fatal: boolean;
+    readonly ignoreBOM: boolean;
+    decode(input?: ArrayBuffer | ArrayBufferView, options?: TextDecodeOptions): string;
+  }
+
+  /**
+   * Decodes base64 (ASCII whitespace ignored, padding optional) to a string
+   * of one character per byte. Throws a DOMException named
+   * "InvalidCharacterError" for anything else.
+   */
+  function atob(data: string): string;
+
+  /**
+   * Encodes a string of characters U+0000 to U+00FF as base64. Throws a
+   * DOMException named "InvalidCharacterError" for any other character.
+   */
+  function btoa(data: string): string;
 }
