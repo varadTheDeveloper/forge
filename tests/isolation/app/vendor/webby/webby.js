@@ -43,3 +43,29 @@ export function decodeWith(decoder, bytes) {
 export function describeDom(e) {
   return (e instanceof DOMException) + " " + e.name + " " + e.message + " " + e.code;
 }
+
+// Phase 10.2: events inside a package. The package's global is an
+// EventTarget too, but uncaught errors and rejections are dispatched only at
+// the program's global: a package never sees (or cancels) them.
+log("events: " + [globalThis instanceof EventTarget, self === globalThis, navigator.userAgent,
+                  Object.isFrozen(EventTarget.prototype),
+                  Object.isFrozen(Object.getPrototypeOf(navigator))].join(" "));
+
+let packageSawRejection = 0;
+addEventListener("unhandledrejection", () => { packageSawRejection++; });
+
+export function rejectInPackage() {
+  Promise.reject(new Error("from webby"));
+}
+
+export function packageSawRejections() {
+  return packageSawRejection;
+}
+
+export function makeTarget() {
+  return new EventTarget();
+}
+
+export function fire(target, type) {
+  return target.dispatchEvent(new Event(type));
+}
