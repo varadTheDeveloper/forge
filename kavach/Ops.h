@@ -15,6 +15,9 @@
 // "None" means the operation touches nothing outside the process (timers,
 // console output, exit). It is still listed, so adding a new native without
 // thinking about its permission is impossible.
+// Phase 10 web APIs (runtime/WebApis.js) have one row per global: a WebIDL
+// interface's methods are reached only through its row's class, and none
+// of them acts outside the process.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -109,7 +112,12 @@ bool OpAllows(
     X(ConsoleGroupCollapsed, "console.groupCollapsed", None)     \
     X(ConsoleGroupEnd, "console.groupEnd", None)                 \
     X(ModuleImport, "import", Module)                            \
-    X(ImportMetaResolve, "import.meta.resolve", None)
+    X(ImportMetaResolve, "import.meta.resolve", None)            \
+    X(DomException, "DOMException", None)                        \
+    X(TextEncoder, "TextEncoder", None)                          \
+    X(TextDecoder, "TextDecoder", None)                          \
+    X(Atob, "atob", None)                                        \
+    X(Btoa, "btoa", None)
 
 enum class Op : uint16_t
 {
