@@ -302,6 +302,8 @@ $cases = @(
              "web app decoder in a package: ok",
              "web app exception in a package: true SyntaxError app message 12",
              "web thrown across: true AbortError 20",
+             "webby events: true true Forge true true", "web listener across compartments: ping true",
+             "web package rejection reaches the program: from webby", "web package global saw: 0",
              "isolation done");
      Not = @("SHOULD NOT", "[Proxy]") },
   @{ Name = "permissions (9.4)"; File = (Join-Path $gApp "src\main.js"); Exit = 0;
@@ -339,6 +341,19 @@ $cases = @(
      Has = @("two folders hold a package of that name"); Not = @("SHOULD NOT RUN") },
   @{ Name = "web APIs (10.1)"; File = "web-apis.js"; Exit = 0;
      Has = @("web done:", " 0 failed"); Not = @("WEB FAIL", "Uncaught") },
+  @{ Name = "web events (10.2)"; File = "web-events.js"; Exit = 0;
+     Has = @("events done:", " 0 failed"); Not = @("EVENTS FAIL", "Uncaught") },
+  @{ Name = "error events (10.2)"; File = "web-error-handled.js"; Exit = 0;
+     Has = @("error event: from a listener | true true true | true true true", "after dispatchEvent",
+             "error event: reported |", "after reportError", "error event: top-level, cancelled |",
+             "error event: from a microtask |", "error event: from a timer |",
+             "unhandledrejection: rejected | true true true", "handled late",
+             "rejectionhandled: rejected false", "still running: 5 errors");
+     Not = @("Uncaught") },
+  @{ Name = "error events, not cancelled (10.2)"; File = "web-error-unhandled.js"; Exit = 1;
+     Has = @("listener saw: listener boom", "Uncaught exception in an event listener",
+             "thrown inside the error listener", "after dispatch");
+     Not = @("SHOULD NOT RUN", "listener saw: thrown inside") },
   @{ Name = "web uncaught (10.1)"; File = "web-uncaught.js"; Exit = 1;
      Has = @("before", "web-uncaught.js:6:", "InvalidCharacterError: atob: the string is not correctly encoded base64.",
              "thrower@");

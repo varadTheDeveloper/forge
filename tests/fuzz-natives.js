@@ -322,7 +322,12 @@ const webDecoders = [new TextDecoder(), new TextDecoder("utf-16le"),
                      new TextDecoder("windows-1252", { fatal: true }),
                      new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })];
 const WEB = ["atob", "btoa", "TextEncoder.encode", "TextEncoder.encodeInto", "TextDecoder.decode",
-             "new TextDecoder", "new DOMException"];
+             "new TextDecoder", "new DOMException",
+             // Phase 10.2 (reportError is left out: an uncancelled report ends
+             // the run, by design)
+             "EventTarget.addEventListener", "EventTarget.removeEventListener",
+             "EventTarget.dispatchEvent", "new Event", "new CustomEvent", "new ErrorEvent",
+             "new PromiseRejectionEvent"];
 natives.push({ name: "atob", fn: atob, self: globalThis });
 natives.push({ name: "btoa", fn: btoa, self: globalThis });
 natives.push({ name: "TextEncoder.encode", fn: TextEncoder.prototype.encode, self: webEncoder });
@@ -332,6 +337,20 @@ for (const decoder of webDecoders) {
 }
 natives.push({ name: "new TextDecoder", fn(...a) { return new TextDecoder(...a); }, self: undefined });
 natives.push({ name: "new DOMException", fn(...a) { return new DOMException(...a); }, self: undefined });
+// A listener the fuzzer adds may be an object with no callable handleEvent;
+// dispatching to it reports a TypeError, which is cancelled here (an
+// uncancelled report would end the run by design).
+let reportedErrors = 0;
+addEventListener("error", (e) => { reportedErrors++; e.preventDefault(); });
+const webTarget = new EventTarget();
+for (const method of ["addEventListener", "removeEventListener", "dispatchEvent"]) {
+  natives.push({ name: `EventTarget.${method}`, fn: EventTarget.prototype[method], self: webTarget });
+}
+natives.push({ name: "new Event", fn(...a) { return new Event(...a); }, self: undefined });
+natives.push({ name: "new CustomEvent", fn(...a) { return new CustomEvent(...a); }, self: undefined });
+natives.push({ name: "new ErrorEvent", fn(...a) { return new ErrorEvent(...a); }, self: undefined });
+natives.push({ name: "new PromiseRejectionEvent", fn(...a) { return new PromiseRejectionEvent(...a); },
+               self: undefined });
 
 // These may run script code by design (CallSites.md): print converts with
 // ToString and the timer functions convert the delay or id with ToNumber;
@@ -381,6 +400,18 @@ function argumentsFor(native) {
     }
 
     return args;
+  }
+
+  if (name === "EventTarget.dispatchEvent") {
+    // Mostly real events, so listeners added by the fuzzer really run (the
+    // callbacks it hands out never throw).
+    return [chance(0.7) ? new Event(pick(["a", "b", "x"]), { cancelable: chance(0.5) }) : anyValue(true)];
+  }
+
+  if (name === "EventTarget.addEventListener" || name === "EventTarget.removeEventListener") {
+    return [chance(0.7) ? pick(["a", "b", "x"]) : anyValue(true), callbackValue(),
+            chance(0.5) ? pick([true, false, { once: true }, { capture: true }, { passive: true }])
+                        : anyValue(true)];
   }
 
   if (name === "TextDecoder.decode" || name === "new TextDecoder") {
