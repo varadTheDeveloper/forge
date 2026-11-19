@@ -4215,3 +4215,32 @@ after the fixes above, all 64 self-tests and all 43 runtime tests
 (including "abort signals (10.3)", "timeout signal unref (10.3)",
 "timer-order.js", "fuzz-natives.js" and the extended "isolation (9.3)")
 passed.
+
+## Phase 10.3.1: a microtask checkpoint after every task (2026-11-19)
+
+Phase 10.3 noted the gap: Forge drained the microtask queue once per pass
+of its event loop, so two tasks ready in the same pass (two timers due
+together, a completed async read and a due timer, two signal listeners)
+ran back to back and shared one checkpoint. A promise reaction queued by
+the first task ran only after the second; HTML runs a microtask checkpoint
+after every task, and browsers, Node and Deno all order it that way.
+
+`Runtime::PerformMicrotaskCheckpoint()` is now the HTML "perform a
+microtask checkpoint" steps: drain the microtasks, then notify about
+rejected promises (`unhandledrejection` / `rejectionhandled`, D28), and
+drain again if listeners queued more; it is not reentrant, as in HTML. It
+runs after the main module (as before), after each timer callback
+(`ForgeTimerFired`), after each signal listener call (`DispatchSignals`)
+and after each completed async fs operation (`runtime/Fs.cpp`,
+`JobCompleted`, through the new `HostMicrotaskCheckpoint`). Unhandled
+rejections are therefore reported at the checkpoint of the task that made
+them, before the next task runs.
+
+**Test.** `tests/microtask-checkpoint.js`: two timers due together print
+`t1,m1,ur,t2,m2` (it printed `t1,t2,m1,m2,ur` before), and an async read
+completing while a timer is due runs its reaction first (`io,t3`, was
+`t3,io`).
+
+**Verified** on Varad's machine (2026-11-19), twice: no build warnings;
+all 64 self-tests and all 44 runtime tests (including
+"microtask-checkpoint.js") passed.

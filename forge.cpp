@@ -521,6 +521,7 @@ class ForgeJobQueue : public JS::JobQueue {
 //==============================================================================
 
 static void ForgeTimerFired(void* userData) noexcept;
+static void MicrotaskCheckpoint(JSContext* cx);
 
 struct JsTimer {
   JSContext* cx;
@@ -680,13 +681,17 @@ static void ForgeTimerFired(void* userData) noexcept {
     }
   }
 
-  // Must be last: on a one-shot timer this destroys *timer (via the
-  // registry's owning HashMap), so nothing above may touch `timer` again
-  // after this — hence copying jsId/repeat out at the top instead of
-  // reading timer->... below.
+  // On a one-shot timer this destroys *timer (via the registry's owning
+  // HashMap), so nothing after it may touch `timer` — hence copying
+  // jsId/repeat out at the top instead of reading timer->... below.
   if (!repeat) {
     GetRuntimeTimers(cx).RemoveFired(jsId);
   }
+
+  // Phase 10.3.1: the HTML event loop runs a microtask checkpoint after
+  // every task, so promise reactions queued by this callback run before
+  // the next timer due in the same pass of the loop.
+  MicrotaskCheckpoint(cx);
 }
 
 constexpr forge::core::Size kAsyncWorkerThreadCount = 4;
@@ -835,18 +840,40 @@ class Runtime {
   // without a handler is reported and ends the process with exit code 1
   // (Node's default since v15). The loop also stops at once after any
   // fatal error (g_stopRequested).
-  void run() {
-    for (;;) {
+  // The HTML "perform a microtask checkpoint" steps: drain the microtask
+  // queue, then notify about rejected promises (whose listeners may queue
+  // more microtasks; drain again). Runs after every task: the main module,
+  // each timer callback, each signal listener and each completed async
+  // operation (before Phase 10.3.1 it ran only once per pass of the
+  // loop, so two tasks due together shared one checkpoint). Not reentrant,
+  // as in HTML: a checkpoint requested during one does nothing.
+  void PerformMicrotaskCheckpoint() {
+    if (performingCheckpoint_) {
+      return;
+    }
+
+    performingCheckpoint_ = true;
+
+    while (!g_stopRequested) {
       jobQueue_.runJobs(cx_);
 
-      if (!g_stopRequested) {
-        ReportUnhandledRejections();
-
-        // Phase 10.2: rejection listeners may have queued microtasks.
-        if (!g_stopRequested && JS::HasAnyMicroTasks(cx_)) {
-          continue;
-        }
+      if (g_stopRequested) {
+        break;
       }
+
+      ReportUnhandledRejections();
+
+      if (!JS::HasAnyMicroTasks(cx_)) {
+        break;
+      }
+    }
+
+    performingCheckpoint_ = false;
+  }
+
+  void run() {
+    for (;;) {
+      PerformMicrotaskCheckpoint();
 
       // Phase 8: Ctrl+C / Ctrl+Break recorded since the last pass.
       if (!g_stopRequested && DispatchSignals()) {
@@ -1035,6 +1062,7 @@ class Runtime {
   // frozen per FsAsync.md's Dependencies section (nothing here touches
   // IocpLoop.h/.cpp).
   forge::core::Size pendingAsyncOps_{ 0 };
+  bool performingCheckpoint_{false};
 
   // Phase 7.9: Promises currently rejected with no handler, oldest first.
   struct TrackedRejection {
@@ -1110,6 +1138,8 @@ class Runtime {
         }
 
         ranListener = true;
+        // Each listener call is a task: a checkpoint before the next one.
+        PerformMicrotaskCheckpoint();
       }
     }
 
@@ -1255,6 +1285,14 @@ static JsTimerRegistry& GetRuntimeTimers(JSContext* cx) {
   return GetRuntime(cx)->timers();
 }
 
+static void MicrotaskCheckpoint(JSContext* cx) {
+  Runtime* runtime = GetRuntime(cx);
+
+  if (runtime != nullptr) {
+    runtime->PerformMicrotaskCheckpoint();
+  }
+}
+
 // Phase 8.3: what runtime/Fs.cpp needs from the event loop owner.
 namespace forge::runtime {
 
@@ -1265,6 +1303,8 @@ forge::core::platform::IoLoop& HostIoLoop(JSContext* cx) { return GetRuntime(cx)
 void HostAsyncStarted(JSContext* cx) { GetRuntime(cx)->OnAsyncOperationStarted(); }
 
 void HostAsyncFinished(JSContext* cx) { GetRuntime(cx)->OnAsyncOperationFinished(); }
+
+void HostMicrotaskCheckpoint(JSContext* cx) { MicrotaskCheckpoint(cx); }
 // Phase 9.1 (runtime/Modules.h).
 bool HostExitRequested(JSContext* cx) {
   (void)cx;
