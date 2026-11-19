@@ -327,7 +327,10 @@ const WEB = ["atob", "btoa", "TextEncoder.encode", "TextEncoder.encodeInto", "Te
              // the run, by design)
              "EventTarget.addEventListener", "EventTarget.removeEventListener",
              "EventTarget.dispatchEvent", "new Event", "new CustomEvent", "new ErrorEvent",
-             "new PromiseRejectionEvent"];
+             "new PromiseRejectionEvent",
+             // Phase 10.3
+             "AbortSignal.abort", "AbortSignal.timeout", "AbortSignal.any",
+             "AbortSignal.throwIfAborted", "AbortController.abort", "new AbortController"];
 natives.push({ name: "atob", fn: atob, self: globalThis });
 natives.push({ name: "btoa", fn: btoa, self: globalThis });
 natives.push({ name: "TextEncoder.encode", fn: TextEncoder.prototype.encode, self: webEncoder });
@@ -351,6 +354,23 @@ natives.push({ name: "new CustomEvent", fn(...a) { return new CustomEvent(...a);
 natives.push({ name: "new ErrorEvent", fn(...a) { return new ErrorEvent(...a); }, self: undefined });
 natives.push({ name: "new PromiseRejectionEvent", fn(...a) { return new PromiseRejectionEvent(...a); },
                self: undefined });
+// Phase 10.3: signals, some of them followed by others (AbortSignal.any)
+// and used to remove the fuzzer's listeners.
+const webControllers = [new AbortController(), new AbortController(), new AbortController()];
+const webSignals = [webControllers[0].signal, webControllers[1].signal,
+                    AbortSignal.any([webControllers[0].signal, webControllers[2].signal]),
+                    AbortSignal.abort("fuzz"), AbortSignal.timeout(5)];
+for (const method of ["abort", "timeout", "any"]) {
+  natives.push({ name: `AbortSignal.${method}`, fn: AbortSignal[method], self: AbortSignal });
+}
+for (const signal of webSignals) {
+  natives.push({ name: "AbortSignal.throwIfAborted", fn: AbortSignal.prototype.throwIfAborted,
+                 self: signal });
+}
+for (const controller of webControllers) {
+  natives.push({ name: "AbortController.abort", fn: AbortController.prototype.abort, self: controller });
+}
+natives.push({ name: "new AbortController", fn() { return new AbortController(); }, self: undefined });
 
 // These may run script code by design (CallSites.md): print converts with
 // ToString and the timer functions convert the delay or id with ToNumber;
@@ -410,8 +430,17 @@ function argumentsFor(native) {
 
   if (name === "EventTarget.addEventListener" || name === "EventTarget.removeEventListener") {
     return [chance(0.7) ? pick(["a", "b", "x"]) : anyValue(true), callbackValue(),
-            chance(0.5) ? pick([true, false, { once: true }, { capture: true }, { passive: true }])
+            chance(0.5) ? pick([true, false, { once: true }, { capture: true }, { passive: true },
+                                { signal: pick(webSignals) }, { signal: anyValue(true) }])
                         : anyValue(true)];
+  }
+
+  if (name === "AbortSignal.any") {
+    return [chance(0.7) ? webSignals.filter(() => chance(0.5)) : anyValue(true)];
+  }
+
+  if (name === "AbortSignal.timeout") {
+    return [chance(0.5) ? pick([0, 1, 5, 2 ** 53, -1, NaN]) : anyValue(true)];
   }
 
   if (name === "TextDecoder.decode" || name === "new TextDecoder") {
@@ -446,6 +475,14 @@ function checkThrown(native, value, args) {
     if (!MAY_RUN_SCRIPT.has(native.name)) {
       violation(`${native.name}: script code threw through it`);
     }
+    return;
+  }
+
+  // Phase 10.3: throwIfAborted() throws the signal's abort reason, which
+  // is whatever value abort(reason) was given (the DOM Standard), so only
+  // that exact value is allowed through.
+  if (native.name === "AbortSignal.throwIfAborted" && native.self instanceof AbortSignal &&
+      native.self.aborted && value === native.self.reason) {
     return;
   }
 

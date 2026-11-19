@@ -149,6 +149,7 @@ $cases = @(
   @{ File = "clean-exit.js";             Exit = 0; Has = @("ok");                                   Not = @() },
   @{ File = "set-timeout-no-delay.js";   Exit = 0; Has = @("fired");                                Not = @() },
   @{ File = "event-order.js";            Exit = 0; Has = @("order: sync,promise,micro1,micro2,timer"); Not = @() },
+  @{ File = "timer-order.js";            Exit = 0; Has = @("timer order: 123 abc"); Not = @() },
   @{ File = "handled-rejection.js";      Exit = 0; Has = @("caught: handled");                      Not = @("Uncaught") },
   @{ File = "uncaught-throw.js";         Exit = 1; Has = @("boom from main script", "inner");       Not = @("SHOULD NOT RUN") },
   @{ File = "uncaught-in-timer.js";      Exit = 1; Has = @("boom from timer");                      Not = @("SHOULD NOT RUN") },
@@ -304,6 +305,12 @@ $cases = @(
              "web thrown across: true AbortError 20",
              "webby events: true true Forge true true", "web listener across compartments: ping true",
              "web package rejection reaches the program: from webby", "web package global saw: 0",
+             "webby abort: function function true true p",
+             "web app signal removes a package listener: 1 1",
+             "web package follows an app signal: true app reason",
+             "web aborted app signal in a package: 0 early",
+             "web app follows a package signal: true package reason 0",
+             "web package rejects a non-signal: TypeError",
              "isolation done");
      Not = @("SHOULD NOT", "[Proxy]") },
   @{ Name = "permissions (9.4)"; File = (Join-Path $gApp "src\main.js"); Exit = 0;
@@ -354,6 +361,10 @@ $cases = @(
      Has = @("listener saw: listener boom", "Uncaught exception in an event listener",
              "thrown inside the error listener", "after dispatch");
      Not = @("SHOULD NOT RUN", "listener saw: thrown inside") },
+  @{ Name = "abort signals (10.3)"; File = "web-abort.js"; Exit = 0;
+     Has = @("abort done:", " 0 failed"); Not = @("ABORT FAIL", "Uncaught") },
+  @{ Name = "timeout signal unref (10.3)"; File = "web-abort-unref.js"; Exit = 0; MaxSeconds = 20;
+     Has = @("unref start", "ordinary timer ran"); Not = @("SHOULD NOT", "Uncaught") },
   @{ Name = "web uncaught (10.1)"; File = "web-uncaught.js"; Exit = 1;
      Has = @("before", "web-uncaught.js:6:", "InvalidCharacterError: atob: the string is not correctly encoded base64.",
              "thrower@");
@@ -396,7 +407,9 @@ foreach ($c in $cases) {
     RedirectStandardOutput = $outFile; RedirectStandardError = $errFile
   }
   if ($c.Cwd) { $startArgs.WorkingDirectory = $c.Cwd }
+  $clock = [System.Diagnostics.Stopwatch]::StartNew()
   $p = Start-Process @startArgs
+  $clock.Stop()
   # Forge writes UTF-8 to pipes and files.
   $output = (Get-Content -Raw -Encoding UTF8 $outFile) + (Get-Content -Raw -Encoding UTF8 $errFile)
   Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
@@ -408,6 +421,10 @@ foreach ($c in $cases) {
   foreach ($t in $c.Has) { if (-not $output.Contains($t)) { $problems += "missing '$t'" } }
   foreach ($t in $c.Not) { if ($output.Contains($t)) { $problems += "unexpected '$t'" } }
   if ($c.Check) { $problems += @(& $c.Check) }
+  # Phase 10.3: a program that must end without waiting for something.
+  if ($c.MaxSeconds -and $clock.Elapsed.TotalSeconds -gt $c.MaxSeconds) {
+    $problems += ("took {0:N1} s, more than {1} s" -f $clock.Elapsed.TotalSeconds, $c.MaxSeconds)
+  }
 
   if ($problems.Count -eq 0) {
     Write-Host ("[runtime-test] {0,-30} PASS" -f $label)
