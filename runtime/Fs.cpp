@@ -600,6 +600,10 @@ void JobCompleted(forge::core::platform::IoCompletion* self, DWORD, ULONG_PTR, b
     {
         g_jobs->Erase(job);  // frees the job; nothing may touch it after this
     }
+
+    // Settling the promise was a task: its reactions run now, before the
+    // timers due in the same pass of the event loop.
+    HostMicrotaskCheckpoint(cx);
 }
 
 /// Converts a failure before dispatch (bad argument, Kavach refusal) into

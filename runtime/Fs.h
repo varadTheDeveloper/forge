@@ -50,5 +50,7 @@ forge::core::ThreadPool& HostWorkerPool(JSContext* cx);
 forge::core::platform::IoLoop& HostIoLoop(JSContext* cx);
 void HostAsyncStarted(JSContext* cx);
 void HostAsyncFinished(JSContext* cx);
+// The HTML microtask checkpoint, after each completed operation (a task).
+void HostMicrotaskCheckpoint(JSContext* cx);
 
 } // namespace forge::runtime
