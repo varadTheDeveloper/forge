@@ -534,6 +534,10 @@ struct JsTimer {
   int jsId{0};
   forge::core::platform::TimerId nativeId{0};
   bool repeat{false};
+  // Phase 10.3: a timer Forge scheduled for itself (AbortSignal.timeout,
+  // HostScheduleInternalTimer). It does not keep the program running, and
+  // clearTimeout cannot cancel it.
+  bool internal{false};
 
   explicit JsTimer(JSContext* cx) : cx(cx), arguments(cx) {}
 };
@@ -577,13 +581,17 @@ class JsTimerRegistry {
       return -1;
     }
 
+    if (raw->internal) {
+      ++internalCount_;
+    }
+
     return jsId;
   }
 
   void CancelByJsId(int jsId, JS::Realm* realm) {
     forge::core::memory::UniquePtr<JsTimer>* found = timers_.Find(jsId);
 
-    if (found == nullptr || (*found)->realm != realm) {
+    if (found == nullptr || (*found)->realm != realm || (*found)->internal) {
       return;
     }
 
@@ -596,8 +604,18 @@ class JsTimerRegistry {
   // corresponding entry itself (TimerScheduler::PopDue erases one-shots on
   // firing) — this only releases the JS-side wrapper.
   void RemoveFired(int jsId) {
+    forge::core::memory::UniquePtr<JsTimer>* found = timers_.Find(jsId);
+
+    if (found != nullptr && (*found)->internal) {
+      --internalCount_;
+    }
+
     timers_.Erase(jsId);
   }
+
+  // Phase 10.3: how many of the pending timers are internal ones, which do
+  // not keep the event loop running (Runtime::run()).
+  forge::core::Size InternalCount() const { return internalCount_; }
 
   // Traces every live timer's JS callback so the GC does not collect it
   // out from under a still-pending timer. JS::Heap<T> (unlike
@@ -623,12 +641,14 @@ class JsTimerRegistry {
       loop_.CancelTimer(entry.Value()->nativeId);
     }
     timers_.Clear();
+    internalCount_ = 0;
   }
 
  private:
   forge::core::platform::IoLoop& loop_;
   forge::core::HashMap<int, forge::core::memory::UniquePtr<JsTimer>> timers_;
   int nextJsId_{1};
+  forge::core::Size internalCount_{0};
 };
 
 static void ForgeTimerFired(void* userData) noexcept {
@@ -837,7 +857,10 @@ class Runtime {
         break;
       }
 
-      if (!JS::HasAnyMicroTasks(cx_) && loop_.Empty() && pendingAsyncOps_ == 0) {
+      // Phase 10.3: internal timers (AbortSignal.timeout) do not count.
+      // Every IoLoop timer is a JsTimer, so the loop's count includes them.
+      if (!JS::HasAnyMicroTasks(cx_) && loop_.Count() <= timers_.InternalCount() &&
+          pendingAsyncOps_ == 0) {
         break;
       }
 
@@ -1350,6 +1373,45 @@ static bool ScheduleJsTimer(JSContext* cx, unsigned argc, JS::Value* vp, bool re
 
 static bool SetTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
   return ScheduleJsTimer(cx, argc, vp, /*repeat=*/false);
+}
+
+// Phase 10.3 (runtime/WebApis.h): AbortSignal.timeout's timer.
+bool forge::runtime::HostScheduleInternalTimer(JSContext* cx, JS::HandleObject callback,
+                                               double delayMs) {
+  Runtime* runtime = GetRuntime(cx);
+
+  if (runtime == nullptr) {
+    JS_ReportErrorASCII(cx, "AbortSignal.timeout: no event loop in this realm");
+    return false;
+  }
+
+  forge::core::Result<forge::core::memory::UniquePtr<JsTimer>> made =
+      forge::core::memory::MakeUnique<JsTimer>(cx);
+
+  if (made.HasError()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  forge::core::memory::UniquePtr<JsTimer> timer = std::move(made.Value());
+  timer->callback = callback;
+  timer->repeat = false;
+  timer->internal = true;
+  timer->realm = JS::GetCurrentRealmOrNull(cx);
+
+  // The script passes an integer from 0 to 2^53 - 1; anything else is
+  // clamped. IocpLoop waits in steps of at most 2^32 - 2 ms.
+  const double kMaxDelay = 9007199254740991.0;
+  const uint64_t delay = !(delayMs > 0) ? 0
+                         : delayMs >= kMaxDelay ? static_cast<uint64_t>(kMaxDelay)
+                                                : static_cast<uint64_t>(delayMs);
+
+  if (runtime->timers().Add(std::move(timer), delay) < 0) {
+    JS_ReportErrorASCII(cx, "AbortSignal.timeout: failed to schedule the timer");
+    return false;
+  }
+
+  return true;
 }
 static bool ClearTimeout(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);

@@ -56,7 +56,7 @@ Status: **preview.** Per-package permissions come with modules (Phase 9) and an 
 
 ## Standards
 
-Forge targets the [WinterTC Minimum Common Web API](https://min-common-api.proposal.wintertc.org/), the standard for server-side JavaScript interoperability developed by Ecma TC55. **Forge does not conform yet.** Phase 10 has begun: `DOMException`, `TextEncoder`, `TextDecoder` (UTF-8, UTF-16 and every single-byte encoding), `atob`/`btoa`, `EventTarget` and the event classes, `reportError`, `self` and `navigator` work, in packages too, and an uncaught error or unhandled rejection is first an `error` or `unhandledrejection` event that the program can cancel; the rest of the required APIs arrive in Phases 10 and 11 ([PHASE10_DESIGN.md](PHASE10_DESIGN.md)). The entry-by-entry status is in [WinterTC.md](WinterTC.md).
+Forge targets the [WinterTC Minimum Common Web API](https://min-common-api.proposal.wintertc.org/), the standard for server-side JavaScript interoperability developed by Ecma TC55. **Forge does not conform yet.** Phase 10 has begun: `DOMException`, `TextEncoder`, `TextDecoder` (UTF-8, UTF-16 and every single-byte encoding), `atob`/`btoa`, `EventTarget` and the event classes, `AbortController` and `AbortSignal`, `reportError`, `self` and `navigator` work, in packages too, and an uncaught error or unhandled rejection is first an `error` or `unhandledrejection` event that the program can cancel; the rest of the required APIs arrive in Phases 10 and 11 ([PHASE10_DESIGN.md](PHASE10_DESIGN.md)). The entry-by-entry status is in [WinterTC.md](WinterTC.md).
 
 ---
 

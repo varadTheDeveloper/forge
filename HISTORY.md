@@ -4111,3 +4111,107 @@ the whole property descriptor.
 self-test fix above, all 64 self-tests and all 40 runtime tests (including
 "web events (10.2)", "error events (10.2)", "error events, not cancelled
 (10.2)" and the extended "isolation (9.3)") passed.
+
+## Phase 10.3: AbortController and AbortSignal (2026-11-17)
+
+`AbortController` and `AbortSignal` (`abort`, `timeout`, `any`,
+`aborted`, `reason`, `throwIfAborted`, `onabort`) and the `signal` option
+of `addEventListener`, in `runtime/WebApis.js` as D27 describes.
+PHASE10_DESIGN.md section 6 has the details.
+
+**Abort** follows the DOM Standard's steps: the abort algorithms, then a
+trusted `abort` event; every dependent signal (`AbortSignal.any()`) is
+marked aborted before any abort event fires, and `any()` of a dependent
+signal follows its sources, never the signal itself. `AbortSignal` sets
+its prototype chain by hand rather than `extends EventTarget`, so making a
+signal never calls a constructor user code could have swapped in.
+
+**`addEventListener(..., { signal })`** adds nothing for an aborted signal
+and removes the listener when the signal aborts. Algorithms left behind by
+listeners removed some other way are dropped from time to time, so a
+long-lived signal does not grow without bound.
+
+**Event handlers for any target.** The HTML handler rules of 10.2 are now
+keyed by target and type, shared by the global object's three handlers and
+`onabort`.
+
+**Internal timers.** `AbortSignal.timeout()` uses a new kind of timer in
+forge.cpp (`HostScheduleInternalTimer`, declared in `runtime/WebApis.h`):
+it runs in the signal's realm, does not keep the program running (as in
+Node and Deno), and `clearTimeout()` ignores it, so a guessed timer id
+cannot stop a timeout. The event loop now stops when every pending timer is
+internal (`IoLoop::Count()` against the registry's count of internal
+timers).
+
+**Garbage collection.** A dependent signal and each of its sources share
+a link record. The source reaches the dependent through a `WeakRef`, and
+strongly only while the dependent has `abort` listeners or algorithms, as
+the standard requires; the dependent reaches a source of its own
+compartment through a `WeakRef`. A dependent nobody can observe is
+collected even while its source lives.
+
+**Compartments.** A signal of another compartment is accepted by the
+`signal` option and by `AbortSignal.any()`: three hidden members of the
+forwarding table (`AbortSignal.~status`, `~reason`, `~follow`, on no
+prototype) let its own compartment answer and register an algorithm. A
+dependent that follows a foreign signal aborts before that signal's own
+event (a documented deviation). Two new `kavach/Ops.h` rows, both
+`Permission::None`; `defineInterface` now makes static operations
+enumerable, as WebIDL says.
+
+**Tests.** `tests/web-abort.js` (59 checks: the WPT `dom/abort/` cases
+and all of `AddEventListenerOptions-signal.any.js`, transcribed by hand,
+plus brand checks, member order, argument conversion, the handler rules,
+reported listener errors, `clearTimeout` against a timeout and patched
+built-ins), `tests/web-abort-unref.js` (a pending timeout does not keep the
+program running; `run-runtime-tests.ps1` gained a `MaxSeconds` limit to
+check it), new `webby` checks in the isolation test (signals across
+compartments, both ways), and the abort APIs in `tests/fuzz-natives.js`.
+`types/forge.d.ts` declares everything, with `types/test/usage.ts` checks.
+
+**Hardening of 10.2.** `new ErrorEvent(...)` reaches `Event` through
+`super()`, that is through `ErrorEvent`'s own prototype, which the program
+can change. The events Forge makes itself for an uncaught error or
+rejection are now made with the original parent in place
+(`makeInternalEvent`), so reporting an error never runs user code there.
+
+**Found by the first build** (both failures reproduced on two runs):
+
+- *Timers fired out of order.* `tests/web-abort.js` ("AbortSignal
+  timeouts fire in order", from WPT) got `321` instead of `123`. The cause
+  was older than 10.3: forge-core's `TimerScheduler::PopDue` fired due
+  timers in vector order, and its swap-removal scrambled that order, so
+  `setTimeout` callbacks due together could fire in reverse too. `PopDue`
+  now always fires the earliest due timer next (ties by scheduling order,
+  as HTML and Node do); a repeating timer still fires at most once per
+  call. New: `Test_DueTimersFireInOrder` in `TimerSchedulerTest.cpp` (it
+  fails on the old code) and `tests/timer-order.js`.
+- *The fuzzer rejected `throwIfAborted()`.* `tests/fuzz-natives.js` treats
+  any thrown non-Error as a violation, but `throwIfAborted()` throws the
+  abort reason, which is whatever `abort(reason)` was given. The fuzzer now
+  allows exactly the signal's own reason through, and nothing else.
+
+**Gap noted, not fixed here:** Forge runs no microtask checkpoint between
+two callbacks that fire in the same pass of the event loop (two due
+timers, signal listeners, I/O completions), while HTML runs one after every
+task. A dedicated step will fix every task source at once.
+
+**WPT without running WPT (D29).** The planned WPT runner was dropped:
+it would have run third-party code (WPT's test files and harness) in CI
+and on the build machine. WPT cases stay transcribed by hand, and
+`tests/wpt/coverage.json` now records, for a pinned WPT commit
+(89b51d6635a1), every subtest of each tracked file and the Forge check
+that covers it, or why it does not apply. `tools/wpt-coverage.py --check`
+runs in CI; `--upstream <clone>` reads a WPT clone as text to list what is
+missing or changed. For 10.3 the record covers all of `dom/abort/` and
+`AddEventListenerOptions-signal.any.js`: 46 subtests covered, 4 files that
+need iframes or a browser's GC hook. Writing it found one subtest not yet
+transcribed (an `AbortSignal.abort()` signal never fires `abort`, later
+either) and one identity check missing; both are now in
+`tests/web-abort.js`. WPT's license is in `tests/wpt/LICENSE.md`.
+
+**Verified** on Varad's machine (2026-11-19): the build had no warnings;
+after the fixes above, all 64 self-tests and all 43 runtime tests
+(including "abort signals (10.3)", "timeout signal unref (10.3)",
+"timer-order.js", "fuzz-natives.js" and the extended "isolation (9.3)")
+passed.

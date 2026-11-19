@@ -18,8 +18,8 @@ order of the rest of Phase 10: [PHASE10_DESIGN.md](PHASE10_DESIGN.md).
 | ❌ No | Not implemented yet; the phase that adds it is given |
 
 **Summary (2026-11-17):** of the 25 global functions and properties, 14
-are ✅, 1 is 🟡, 4 are ⚙️ and 6 are ❌. Of the 53 interfaces, 7 are ✅, 1
-is 🟡, 10 are ⚙️ (all WebAssembly) and 35 are ❌. (The Phase 10.1 summary
+are ✅, 1 is 🟡, 4 are ⚙️ and 6 are ❌. Of the 53 interfaces, 9 are ✅, 1
+is 🟡, 10 are ⚙️ (all WebAssembly) and 33 are ❌. (The Phase 10.1 summary
 counted `atob()` and `btoa()` as one entry; they are two.)
 
 ## Global functions and properties (§5.2)
@@ -59,7 +59,7 @@ count 25 entries.
 |---|---|---|
 | WebAssembly | `Global`, `Instance`, `Memory`, `Module`, `Table`, `Tag`, `Exception`, `CompileError`, `LinkError`, `RuntimeError` | ⚙️ Engine |
 | DOM | `Event`, `EventTarget` | ✅ Yes (Phase 10.2) |
-| DOM | `AbortController`, `AbortSignal` | ❌ No (Phase 10.3) |
+| DOM | `AbortController`, `AbortSignal` | ✅ Yes (Phase 10.3): `abort`, `timeout`, `any`, `throwIfAborted`, `onabort`, and the `signal` option of `addEventListener`. WPT: all 46 subtests of `dom/abort/` and `AddEventListenerOptions-signal.any.js` that need no browser feature are covered ([tests/wpt/coverage.json](tests/wpt/coverage.json)) |
 | HTML | `CustomEvent`, `ErrorEvent`, `PromiseRejectionEvent` | ✅ Yes (Phase 10.2) |
 | HTML | `MessageChannel`, `MessageEvent`, `MessagePort` | ❌ No (Phase 10.4) |
 | WebIDL | `DOMException` | ✅ Yes (Phase 10.1) |
@@ -107,8 +107,14 @@ technical or structural reasons, if the deviation is documented. Forge's:
   package's global never receives them (PHASE10_DESIGN.md, D28).
 - **Events across compartments (Phase 10.2).** An `Event` can be
   dispatched only at an `EventTarget` of its own compartment.
-- **`addEventListener` `signal` (Phase 10.2)** arrives with `AbortSignal`
-  in Phase 10.3.
+- **`AbortSignal.timeout()` (Phase 10.3)** does not keep the program
+  running, as in Node and Deno: a program whose only pending work is a
+  timeout ends without it firing. `clearTimeout()` cannot cancel it.
+- **Signals across compartments (Phase 10.3).** A dependent signal
+  (`AbortSignal.any()`) that follows a signal of another compartment is
+  aborted before that source's own `abort` event fires; with a source of
+  its own compartment the order is the standard's (PHASE10_DESIGN.md
+  section 6).
 - **`Event.timeStamp` (Phase 10.2)** has a resolution of 0.1 ms.
 
 ## Forge's own APIs

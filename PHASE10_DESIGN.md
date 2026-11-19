@@ -14,7 +14,7 @@ an entry is ✅ only when tests cover it).
 |---|---|---|
 | 10.1 | `DOMException`, `atob`, `btoa`, `TextEncoder`, `TextDecoder` | The architecture of section 2. Done: see HISTORY.md. |
 | 10.2 | `EventTarget`, `Event`, `CustomEvent`, `ErrorEvent`, `PromiseRejectionEvent`, `reportError`, the global `error` / `unhandledrejection` / `rejectionhandled` events and `on…` properties, `self`, `navigator.userAgent` (`"Forge"`) | Done: section 5. An uncaught error first fires `error` on the program's global; exit code 1 only if no listener cancels it (D28). |
-| 10.3 | `AbortController`, `AbortSignal` (`abort`, `timeout`, `any`), the `signal` option of `addEventListener`; the WPT runner (section 4) | `AbortSignal.timeout` uses Forge's timers, per realm. The runner needs `self` and events, which 10.2 brought. |
+| 10.3 | `AbortController`, `AbortSignal` (`abort`, `timeout`, `any`), the `signal` option of `addEventListener`; WPT coverage (section 4) | Section 6. WPT cases are transcribed and recorded, not run (D29, section 4). |
 | 10.4 | `structuredClone`, `MessageChannel`, `MessagePort`, `MessageEvent` | Clone through the engine's structured clone with Forge's callbacks; transfer of `ArrayBuffer` and `MessagePort`. |
 | 10.5 | `URL`, `URLSearchParams`, `URLPattern` | A WHATWG URL parser in portable C++ (unit-tested and fuzzed like `runtime/Encoding`), with the WPT `urltestdata.json` cases. |
 | 10.6 | `performance` (`now`, `timeOrigin`, marks and measures), `crypto` (`getRandomValues`, `randomUUID`, `subtle`) | `performance.now()` is coarsened (Spectre). Randomness and `SubtleCrypto` on Windows CNG (BCrypt), never a JS implementation. |
@@ -116,14 +116,34 @@ During development the encoders were also compared against Node's
 TextDecoder and atob on random inputs, and every table difference was
 checked against the WHATWG index (each was ICU departing from it).
 
-## 4. Web Platform Tests
+## 4. Web Platform Tests (decision D29)
 
-Until 10.3, WPT cases are transcribed into Forge's own tests. From 10.3, a
-pinned subset of WPT (the test files and `testharness.js`, vendored under
-`third_party/wpt/` with its commit) runs in CI through a small runner that
-reports each file's results; WinterTC.md then cites the pass counts. A
-known failure is listed in an expectations file with its reason, so a
-regression and a fix both show up as a change to that file.
+**D29. Forge checks its web APIs against WPT without running WPT code.**
+Each WPT case is transcribed by hand into Forge's own tests and reviewed
+like the rest of Forge's code; `tests/wpt/coverage.json` records, for one
+pinned WPT commit, every subtest of every tracked WPT file and the Forge
+check that covers it, or why it does not apply.
+
+The first plan was to vendor a pinned subset of WPT (its test files and
+`testharness.js`) and run it in CI through a small runner. It was dropped
+in 10.3 because it would run third-party code, from a repository with
+thousands of contributors, in CI and on the build machine. A harness
+written by Forge would not change that: the test files are code too.
+Transcription costs more effort per API, but what it gives up is small:
+
+- **Exactness is kept.** `tools/wpt-coverage.py --check` (CI, offline)
+  fails if the record names a Forge check that does not exist.
+  `--upstream <clone>` reads a WPT clone as text (never running it) and
+  lists every subtest not yet recorded, every recorded file that changed
+  since the pin, and every file of a tracked directory that the record does
+  not list; a maintainer runs it when moving the pin or adding an API.
+- **WinterTC.md cites the record** (subtests covered, files that do not
+  apply and why) instead of a runner's pass count.
+- **Licensing.** Transcribed cases derive from WPT and stay under its
+  3-Clause BSD License (`tests/wpt/LICENSE.md`).
+
+The cases transcribed in 10.1 and 10.2 predate the record and are to be
+added to it.
 
 ## 5. Phase 10.2
 
@@ -180,9 +200,8 @@ top-level code lets the program go on with its timers and promises.
   compartment: the program cannot dispatch its own `Event` at a package's
   target (a `TypeError`). Listeners and dispatches across compartments
   otherwise work (a listener may belong to any compartment).
-- `addEventListener`'s `signal` option arrives with `AbortSignal` (10.3);
-  until then any value is a `TypeError`, as WebIDL says for a value that is
-  not an `AbortSignal`.
+- `addEventListener`'s `signal` option arrived with `AbortSignal` (10.3,
+  section 6).
 - `Event.timeStamp` counts milliseconds since Forge started, in steps of
   0.1 ms (Spectre), the step browsers use without cross-origin isolation.
 
@@ -194,3 +213,101 @@ rejection handled later), `tests/web-error-unhandled.js` (a listener that
 does not cancel; an exception inside an error listener), the `webby`
 package (a program listener on a package's target; a package's rejection
 seen only by the program), and the event APIs in `tests/fuzz-natives.js`.
+
+## 6. Phase 10.3
+
+**AbortController and AbortSignal** follow the DOM Standard: `abort()`
+(the default reason is an `"AbortError"` DOMException), the static
+`abort()`, `timeout()` and `any()`, `aborted`, `reason`,
+`throwIfAborted()` and the `onabort` event handler. Aborting runs the
+signal's abort algorithms and then fires a trusted `abort` event, and a
+signal made by `AbortSignal.any()` (a dependent signal) is marked aborted
+before any abort event fires, as the standard's "signal abort" steps say.
+`AbortSignal.any()` of a dependent signal follows that signal's sources,
+never the dependent signal itself, so chains stay one level deep.
+
+`AbortSignal` is not written as `class ... extends EventTarget`: `super()`
+would call whatever the class's prototype is at that moment, which user
+code can change, and `timeout()` and `any()` must not run user code there.
+The prototype chain is set by hand instead, and only `WebApis.js` can make
+a signal (`new AbortSignal()` is a `TypeError`, as the standard says). The
+same concern applied to 10.2: the `ErrorEvent` and `PromiseRejectionEvent`
+Forge makes for an uncaught error or rejection reach `Event` through
+`super()`. They are now made with the original parent in place
+(`makeInternalEvent`), so reporting an error never runs user code there.
+
+**The `signal` option of `addEventListener`.** An aborted signal adds
+nothing; otherwise aborting it later removes the listener (one abort
+algorithm per listener). Algorithms whose listener is already gone (after
+`removeEventListener` or `once`) are dropped from time to time, so a
+long-lived signal used for many short-lived listeners does not grow
+without bound. `null` is a `TypeError`, as WebIDL says, since the member
+is not nullable.
+
+**Event handler attributes, for any target.** The handler rules of 10.2
+(the listener is added when the handler is first set to an object and
+keeps its place when replaced) now live in one place, keyed by target and
+event type: the global object's `onerror`, `onunhandledrejection` and
+`onrejectionhandled` and `AbortSignal`'s `onabort` all use it.
+
+**`AbortSignal.timeout()` and internal timers.** The timeout is one of
+Forge's timers in the signal's realm, flagged *internal* (forge.cpp,
+`HostScheduleInternalTimer`): it does not keep the program running, as in
+Node and Deno, and `clearTimeout()` cannot cancel it, so no code in the
+same realm can stop a timeout by guessing its timer id. The event loop
+stops when every pending timer is internal. A program that wants to wait
+for a timeout keeps itself running with an ordinary timer or a promise it
+is awaiting.
+
+**Timer order.** Timeouts that are due together fire in the order they
+were made, as WPT's `timeout.any.js` checks. Writing that test found that
+forge-core's scheduler fired due timers in vector order, which removals
+scrambled; `TimerScheduler::PopDue` now always fires the earliest due
+timer next, ties broken by scheduling order (this also fixes `setTimeout`).
+
+**Garbage collection of dependent signals.** The DOM Standard says a
+source holds its dependent signals weakly, and a dependent signal that has
+`abort` listeners or abort algorithms must stay alive while a source that
+can abort it does. Forge links each dependent to each source with a small
+record that both hold: the record holds the dependent through a `WeakRef`,
+and also strongly while the dependent has listeners or algorithms. The
+dependent holds a source of its own compartment through a `WeakRef`. So a
+dependent that nobody can observe is collected even if its source lives on
+(the usual pattern: a long-lived controller combined with a per-request
+timeout), and one that has a listener lives exactly as long as a source
+that can fire it. Links to dependents that are gone or aborted are dropped
+from time to time.
+
+**Signals across compartments.** A signal of another compartment is
+accepted wherever a signal is (the `signal` option, `AbortSignal.any()`).
+Its own compartment answers through hidden members of the `forward`
+mechanism (`AbortSignal.~status`, `~reason`, `~follow`): they are in the
+members table only, on no prototype, and never throw. Following a foreign
+signal registers an abort algorithm of this compartment's in the signal's
+own compartment; an exception from it is reported, not thrown into the
+other compartment's abort. A dependent holds a foreign source strongly (a
+`WeakRef` to a cross-compartment wrapper would not say whether the signal
+itself is alive).
+
+**Documented deviations (WinterTC.md):**
+
+- A dependent signal that follows a signal of *another* compartment is
+  aborted (algorithms and its `abort` event) while that source runs its
+  abort algorithms, so before the source's own `abort` event; with a source
+  of its own compartment the order is exactly the standard's.
+- A program whose only pending work is an `AbortSignal.timeout()` ends
+  without the timeout firing (as in Node and Deno). Browsers have no such
+  notion.
+
+**Proof.** `tests/web-abort.js` (59 checks: every subtest of WPT's
+`dom/abort/` that a runtime without frames can run, and every case of
+`AddEventListenerOptions-signal.any.js`, transcribed and recorded in
+`tests/wpt/coverage.json` (46 subtests; 4 files need iframes or a browser's
+garbage-collection hook); plus brand checks,
+the members and their order, argument conversion, the handler rules,
+reported listener errors, `clearTimeout` not cancelling a timeout, and
+patched built-ins), `tests/web-abort-unref.js` (a pending timeout does not
+keep the program running; the runner checks the run ends within 20 s), the
+`webby` package (a program signal removing a package's listener and
+followed by a package's `AbortSignal.any()`, and the reverse), and the
+abort APIs in `tests/fuzz-natives.js`.
