@@ -40,5 +40,20 @@ const phase: number = Event.AT_TARGET;
 void delivered; void detail; void ua; void me; void phase;
 // @ts-expect-error  dispatchEvent needs an Event
 target.dispatchEvent({ type: "x" });
+
+// Phase 10.3: AbortController and AbortSignal.
+const controller = new AbortController();
+target.addEventListener("x", () => {}, { signal: controller.signal });
+const combined: AbortSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(1000)]);
+combined.onabort = (ev: Event) => { const why: unknown = combined.reason; void why; void ev; };
+combined.addEventListener("abort", (ev) => { void ev.isTrusted; });
+controller.abort(new Error("stop"));
+const wasAborted: boolean = AbortSignal.abort().aborted;
+void wasAborted;
+controller.signal.throwIfAborted();
+// @ts-expect-error  AbortSignal has no constructor
+new AbortSignal();
+// @ts-expect-error  the signal option takes an AbortSignal
+target.addEventListener("x", () => {}, { signal: controller });
 // @ts-expect-error  PromiseRejectionEvent needs its dictionary
 new PromiseRejectionEvent("x");
