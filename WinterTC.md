@@ -17,9 +17,9 @@ order of the rest of Phase 10: [PHASE10_DESIGN.md](PHASE10_DESIGN.md).
 | ⚙️ Engine | Provided by SpiderMonkey; not yet covered by Forge's tests |
 | ❌ No | Not implemented yet; the phase that adds it is given |
 
-**Summary (2026-11-17):** of the 25 global functions and properties, 14
-are ✅, 1 is 🟡, 4 are ⚙️ and 6 are ❌. Of the 53 interfaces, 9 are ✅, 1
-is 🟡, 10 are ⚙️ (all WebAssembly) and 33 are ❌. (The Phase 10.1 summary
+**Summary (2026-11-19):** of the 25 global functions and properties, 14
+are ✅, 2 are 🟡, 4 are ⚙️ and 5 are ❌. Of the 53 interfaces, 12 are ✅, 1
+is 🟡, 10 are ⚙️ (all WebAssembly) and 30 are ❌. (The Phase 10.1 summary
 counted `atob()` and `btoa()` as one entry; they are two.)
 
 ## Global functions and properties (§5.2)
@@ -40,7 +40,7 @@ counted `atob()` and `btoa()` as one entry; they are two.)
 | `WebAssembly.compileStreaming()` | ❌ No | Needs `Response`; Phase 11 |
 | `WebAssembly.instantiateStreaming()` | ❌ No | Needs `Response`; Phase 11 |
 | `atob()`, `btoa()` | ✅ Yes | Phase 10.1 (forgiving-base64, WebIDL conversions, `InvalidCharacterError`) |
-| `structuredClone()` | ❌ No | Phase 10 |
+| `structuredClone()` | 🟡 Partial | Phase 10.4, on the engine's structured clone: every serializable and transferable type Forge has (including `ArrayBuffer` and `MessagePort` transfer), and a `DataCloneError` for web API objects. Gap: a `DOMException` clones as an `Error` (below). WPT: [tests/wpt/coverage.json](tests/wpt/coverage.json) |
 | `reportError()` | ✅ Yes | Phase 10.2 |
 | `self` | ✅ Yes | Phase 10.2 |
 | `navigator.userAgent` | ✅ Yes | Phase 10.2: `"Forge"` |
@@ -61,7 +61,7 @@ count 25 entries.
 | DOM | `Event`, `EventTarget` | ✅ Yes (Phase 10.2) |
 | DOM | `AbortController`, `AbortSignal` | ✅ Yes (Phase 10.3): `abort`, `timeout`, `any`, `throwIfAborted`, `onabort`, and the `signal` option of `addEventListener`. WPT: all 46 subtests of `dom/abort/` and `AddEventListenerOptions-signal.any.js` that need no browser feature are covered ([tests/wpt/coverage.json](tests/wpt/coverage.json)) |
 | HTML | `CustomEvent`, `ErrorEvent`, `PromiseRejectionEvent` | ✅ Yes (Phase 10.2) |
-| HTML | `MessageChannel`, `MessageEvent`, `MessagePort` | ❌ No (Phase 10.4) |
+| HTML | `MessageChannel`, `MessageEvent`, `MessagePort` | ✅ Yes (Phase 10.4). WPT: every subtest of `webmessaging/message-channels/` and of the `webmessaging/*.any.js` files that needs no Blob, Worker or BroadcastChannel ([tests/wpt/coverage.json](tests/wpt/coverage.json)) |
 | WebIDL | `DOMException` | ✅ Yes (Phase 10.1) |
 | Encoding | `TextEncoder` | ✅ Yes (Phase 10.1) |
 | Encoding | `TextDecoder` | 🟡 Partial (Phase 10.1): UTF-8, UTF-16LE/BE, all 28 single-byte encodings and x-user-defined; the CJK multi-byte encodings throw a `RangeError` for now |
@@ -116,6 +116,17 @@ technical or structural reasons, if the deviation is documented. Forge's:
   its own compartment the order is the standard's (PHASE10_DESIGN.md
   section 6).
 - **`Event.timeStamp` (Phase 10.2)** has a resolution of 0.1 ms.
+- **`DOMException` and `structuredClone` (Phase 10.4).** A `DOMException`
+  is an engine `Error` object in Forge, so the engine clones it as a plain
+  `Error` without its name and message; HTML says it clones as a
+  `DOMException`.
+- **MessagePorts across compartments (Phase 10.4).** Messages and
+  listeners work across compartments, but a port can be transferred only
+  by code of its own compartment (otherwise a `DataCloneError`).
+- **Idle ports (Phase 10.4).** A message waiting to be delivered keeps the
+  program running; a started port with nothing queued does not (in one
+  program only running code can post to it). Node keeps a port with a
+  listener alive until it is closed.
 
 ## Forge's own APIs
 

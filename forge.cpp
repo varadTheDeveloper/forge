@@ -536,9 +536,11 @@ struct JsTimer {
   forge::core::platform::TimerId nativeId{0};
   bool repeat{false};
   // Phase 10.3: a timer Forge scheduled for itself (AbortSignal.timeout,
-  // HostScheduleInternalTimer). It does not keep the program running, and
-  // clearTimeout cannot cancel it.
+  // HostScheduleInternalTimer; Phase 10.4: HostQueueTask). clearTimeout
+  // cannot cancel it.
   bool internal{false};
+  // Phase 10.3: it does not keep the program running (AbortSignal.timeout).
+  bool unref{false};
 
   explicit JsTimer(JSContext* cx) : cx(cx), arguments(cx) {}
 };
@@ -582,8 +584,8 @@ class JsTimerRegistry {
       return -1;
     }
 
-    if (raw->internal) {
-      ++internalCount_;
+    if (raw->unref) {
+      ++unrefCount_;
     }
 
     return jsId;
@@ -607,16 +609,16 @@ class JsTimerRegistry {
   void RemoveFired(int jsId) {
     forge::core::memory::UniquePtr<JsTimer>* found = timers_.Find(jsId);
 
-    if (found != nullptr && (*found)->internal) {
-      --internalCount_;
+    if (found != nullptr && (*found)->unref) {
+      --unrefCount_;
     }
 
     timers_.Erase(jsId);
   }
 
-  // Phase 10.3: how many of the pending timers are internal ones, which do
-  // not keep the event loop running (Runtime::run()).
-  forge::core::Size InternalCount() const { return internalCount_; }
+  // Phase 10.3: how many of the pending timers do not keep the event loop
+  // running (Runtime::run()).
+  forge::core::Size UnrefCount() const { return unrefCount_; }
 
   // Traces every live timer's JS callback so the GC does not collect it
   // out from under a still-pending timer. JS::Heap<T> (unlike
@@ -642,14 +644,14 @@ class JsTimerRegistry {
       loop_.CancelTimer(entry.Value()->nativeId);
     }
     timers_.Clear();
-    internalCount_ = 0;
+    unrefCount_ = 0;
   }
 
  private:
   forge::core::platform::IoLoop& loop_;
   forge::core::HashMap<int, forge::core::memory::UniquePtr<JsTimer>> timers_;
   int nextJsId_{1};
-  forge::core::Size internalCount_{0};
+  forge::core::Size unrefCount_{0};
 };
 
 static void ForgeTimerFired(void* userData) noexcept {
@@ -886,7 +888,7 @@ class Runtime {
 
       // Phase 10.3: internal timers (AbortSignal.timeout) do not count.
       // Every IoLoop timer is a JsTimer, so the loop's count includes them.
-      if (!JS::HasAnyMicroTasks(cx_) && loop_.Count() <= timers_.InternalCount() &&
+      if (!JS::HasAnyMicroTasks(cx_) && loop_.Count() <= timers_.UnrefCount() &&
           pendingAsyncOps_ == 0) {
         break;
       }
@@ -1437,6 +1439,7 @@ bool forge::runtime::HostScheduleInternalTimer(JSContext* cx, JS::HandleObject c
   timer->callback = callback;
   timer->repeat = false;
   timer->internal = true;
+  timer->unref = true;
   timer->realm = JS::GetCurrentRealmOrNull(cx);
 
   // The script passes an integer from 0 to 2^53 - 1; anything else is
@@ -1448,6 +1451,40 @@ bool forge::runtime::HostScheduleInternalTimer(JSContext* cx, JS::HandleObject c
 
   if (runtime->timers().Add(std::move(timer), delay) < 0) {
     JS_ReportErrorASCII(cx, "AbortSignal.timeout: failed to schedule the timer");
+    return false;
+  }
+
+  return true;
+}
+
+// Phase 10.4 (runtime/WebApis.h): a task for MessagePort deliveries, a
+// timer due now that clearTimeout cannot cancel and that keeps the program
+// running. Timers due together fire in the order they were made, so tasks
+// keep their order among themselves and with setTimeout(f, 0).
+bool forge::runtime::HostQueueTask(JSContext* cx, JS::HandleObject callback) {
+  Runtime* runtime = GetRuntime(cx);
+
+  if (runtime == nullptr) {
+    JS_ReportErrorASCII(cx, "Forge: no event loop in this realm");
+    return false;
+  }
+
+  forge::core::Result<forge::core::memory::UniquePtr<JsTimer>> made =
+      forge::core::memory::MakeUnique<JsTimer>(cx);
+
+  if (made.HasError()) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  forge::core::memory::UniquePtr<JsTimer> timer = std::move(made.Value());
+  timer->callback = callback;
+  timer->repeat = false;
+  timer->internal = true;
+  timer->realm = JS::GetCurrentRealmOrNull(cx);
+
+  if (runtime->timers().Add(std::move(timer), 0) < 0) {
+    JS_ReportErrorASCII(cx, "Forge: failed to queue a task");
     return false;
   }
 

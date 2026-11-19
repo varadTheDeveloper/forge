@@ -4244,3 +4244,54 @@ completing while a timer is due runs its reaction first (`io,t3`, was
 **Verified** on Varad's machine (2026-11-19), twice: no build warnings;
 all 64 self-tests and all 44 runtime tests (including
 "microtask-checkpoint.js") passed.
+
+## Phase 10.4: structuredClone, MessageChannel, MessagePort, MessageEvent (2026-11-19)
+
+`structuredClone`, `MessageChannel`, `MessagePort` and `MessageEvent`.
+PHASE10_DESIGN.md section 7 has the details.
+
+**Platform objects.** Every object a web API interface makes is now of a
+class of its own (`kPlatformObjectClass`, `createPlatformObject`), not an
+ordinary object, so structured clone refuses it with a `DataCloneError`
+instead of copying it as `{}` (the gap Node and Deno have). The base
+classes (`Event`, `EventTarget`, `TextEncoder`, `TextDecoder`,
+`AbortSignal`, `AbortController`, ...) moved their state from private
+fields to WeakMaps; subclasses keep their private fields.
+
+**structuredClone** uses the engine's structured clone with Forge's
+callbacks: platform objects and the global object are a `DataCloneError`,
+`ArrayBuffer`s and `MessagePort`s can be transferred, and errors are
+`DataCloneError` DOMExceptions. The serialized data is a C++ object only
+`WebApis.js` holds; its finalizer frees it.
+
+**MessagePort** follows HTML's post-message steps: transfers move a port's
+record (queue included) to a new object and detach the old one; each
+message is a task of its own (new `HostQueueTask` in forge.cpp), one queued
+per port at a time; `close()` keeps queued messages but fires no `close`
+event; a message nobody can receive is dropped after its transfers and its
+ports are disentangled. A queued message keeps the program running, an
+idle port does not. `JsTimer` now separates `internal` (cannot be
+cancelled by `clearTimeout`) from `unref` (does not keep the loop running).
+
+**Deviations** (WinterTC.md): a `DOMException` clones as a plain `Error`;
+a port can be transferred only within its own compartment; idle ports do
+not keep the program running. `structuredClone()` is 🟡 in WinterTC.md
+because of the first.
+
+**Tests.** `tests/web-clone.js` (the WPT structured clone battery under its
+own names, and Forge's checks), `tests/web-messaging.js` (the WPT
+webmessaging and message-channels cases, and Forge's checks),
+`tests/web-messaging-idle.js`, new `webby` checks in the isolation test
+(messaging across compartments), and the new APIs in
+`tests/fuzz-natives.js`. `tests/wpt/coverage.json` now records
+`webmessaging/` and `html/webappapis/structured-clone/` too: 199 subtests
+covered in all (153 new), 42 subtests and 16 files that need a browser
+feature (Blob until 10.7, workers, iframes, documents). The coverage tool
+learned per-file name patterns and name expansions, and finds Forge's
+check names in data tables. Four new `kavach/Ops.h` rows, all
+`Permission::None`.
+
+**Verified** on Varad's machine (2026-11-19), on the first build: no
+build warnings; all 64 self-tests and all 47 runtime tests (including
+"structured clone (10.4)", "messaging (10.4)", "idle ports (10.4)", the
+extended "isolation (9.3)" and "fuzz-natives.js") passed.

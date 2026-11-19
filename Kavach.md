@@ -76,7 +76,8 @@ permission it needs, in `kavach/Ops.h` (rule R2). `forge --self-test` fails
 if a function exists without a row, or a row without a function. The web
 APIs of Phase 10 (`DOMException`, `TextEncoder`, `TextDecoder`, `atob`,
 `btoa`, `EventTarget`, `Event`, `reportError`, `self`, `navigator`, the
-`on…` handlers, `AbortController`, `AbortSignal`, ...) have one row each
+`on…` handlers, `AbortController`, `AbortSignal`, `structuredClone`,
+`MessageChannel`, ...) have one row each
 with no permission: none of them reaches outside the process
 (PHASE10_DESIGN.md).
 

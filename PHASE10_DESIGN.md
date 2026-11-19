@@ -15,7 +15,7 @@ an entry is ✅ only when tests cover it).
 | 10.1 | `DOMException`, `atob`, `btoa`, `TextEncoder`, `TextDecoder` | The architecture of section 2. Done: see HISTORY.md. |
 | 10.2 | `EventTarget`, `Event`, `CustomEvent`, `ErrorEvent`, `PromiseRejectionEvent`, `reportError`, the global `error` / `unhandledrejection` / `rejectionhandled` events and `on…` properties, `self`, `navigator.userAgent` (`"Forge"`) | Done: section 5. An uncaught error first fires `error` on the program's global; exit code 1 only if no listener cancels it (D28). |
 | 10.3 | `AbortController`, `AbortSignal` (`abort`, `timeout`, `any`), the `signal` option of `addEventListener`; WPT coverage (section 4) | Section 6. WPT cases are transcribed and recorded, not run (D29, section 4). |
-| 10.4 | `structuredClone`, `MessageChannel`, `MessagePort`, `MessageEvent` | Clone through the engine's structured clone with Forge's callbacks; transfer of `ArrayBuffer` and `MessagePort`. |
+| 10.4 | `structuredClone`, `MessageChannel`, `MessagePort`, `MessageEvent` | Section 7. Clone through the engine's structured clone with Forge's callbacks; transfer of `ArrayBuffer` and `MessagePort`. |
 | 10.5 | `URL`, `URLSearchParams`, `URLPattern` | A WHATWG URL parser in portable C++ (unit-tested and fuzzed like `runtime/Encoding`), with the WPT `urltestdata.json` cases. |
 | 10.6 | `performance` (`now`, `timeOrigin`, marks and measures), `crypto` (`getRandomValues`, `randomUUID`, `subtle`) | `performance.now()` is coarsened (Spectre). Randomness and `SubtleCrypto` on Windows CNG (BCrypt), never a JS implementation. |
 | 10.7 | `Blob`, `File`, `FormData` | |
@@ -311,3 +311,83 @@ keep the program running; the runner checks the run ends within 20 s), the
 `webby` package (a program signal removing a package's listener and
 followed by a package's `AbortSignal.any()`, and the reverse), and the
 abort APIs in `tests/fuzz-natives.js`.
+
+## 7. Phase 10.4
+
+**Platform objects.** Every object a web API interface makes (an `Event`,
+a `TextDecoder`, an `AbortSignal`, ...) is now of a class of its own
+(`WebApis.cpp`, `kPlatformObjectClass`) instead of an ordinary object, as a
+browser's platform objects are. Without this, the engine's structured
+clone copies such an object as a plain object (usually `{}`), where HTML
+says cloning a platform object that is not serializable is a
+`DataCloneError`; Node and Deno have that gap. The constructors make the
+object with `createPlatformObject(new.target.prototype)` (so subclasses
+work), base classes keep their state in WeakMaps instead of private fields
+(a base class's private fields would land on the discarded `this`), and
+subclasses (`CustomEvent`, `MessageEvent`, ...) keep their private fields,
+which JavaScript adds to whatever `super()` returns.
+
+**structuredClone** is the engine's structured clone (SameProcess scope,
+no shared memory) with Forge's callbacks (`kCloneCallbacks`): an object
+the engine does not know (a platform object, the global object) is a
+`DataCloneError`; a `MessagePort` of the serializing compartment that is
+not detached can be transferred; errors become `DataCloneError`
+DOMExceptions with a message per case. The engine reads the value with
+ordinary `[[Get]]` (getters run once, in property order, as HTML says) and
+creates the copy directly, running no user code. The serialized data lives
+in a C++ object (`kCloneDataClass`) that only `WebApis.js` holds; its
+finalizer frees it, including the contents of an `ArrayBuffer` transferred
+into a message that is never read.
+
+**MessageChannel and MessagePort** follow HTML's "message port post message
+steps". A port's state (its entangled port, its message queue, whether it
+is started, closed or transferred) is a record in `WebApis.js`; a port
+object is a `kMessagePortClass` platform object, so the engine sends it to
+the transfer callbacks. Transferring a port moves the record to a new
+object (`internals.transferPort` / `adoptPort`, called by the callbacks)
+and leaves the old object detached, with its listeners; queued messages
+travel with the record, so order is kept across any number of transfers.
+Each message is dispatched by a task of its own (`HostQueueTask`, a
+zero-delay timer `clearTimeout` cannot cancel), after the previous one's
+microtask checkpoint; a port queues one task at a time, so a burst of
+messages costs one pending task. A message is deserialized in the port's
+realm when it is dispatched (`messageerror` if that fails). `close()` stops
+new messages and transfers but still dispatches the queued ones, and fires
+no `close` event (HTML removed it; WPT checks there is none). A message
+that nobody can receive (no entangled port, or one that transfers its own
+target) is dropped after its transfers, and the ports it carried are
+disentangled so their peers' messages are dropped too instead of piling
+up.
+
+**The event loop.** A queued message keeps the program running until it is
+dispatched; a started port with nothing queued does not, since only code
+of the same program can post to it, and once nothing else is pending none
+will (Node keeps such a port alive until it is closed). `JsTimer` now has
+two flags: `internal` (Forge's own; `clearTimeout` ignores it) and `unref`
+(does not keep the loop running; `AbortSignal.timeout` only).
+
+**Documented deviations (WinterTC.md):**
+
+- A `DOMException` is an engine `Error` object, so it clones as a plain
+  `Error` without its name and message. Fixing it needs DOMException to
+  become a platform object with its own stack handling; noted for later.
+- A port can be transferred only by code of its own compartment; messages
+  and listeners work across compartments (the message is cloned through
+  the wrapper, as a direct read would see it).
+- An idle started port does not keep the program running (above).
+
+**Proof.** `tests/web-clone.js` (the WPT structured clone battery,
+transcribed under its own names, plus argument errors, values that cannot
+be cloned, capability objects, Map/Set identity, getter order, the
+DOMException deviation and patched built-ins), `tests/web-messaging.js`
+(the WPT `webmessaging` and `message-channels` cases, transcribed, plus
+argument handling, 1000 messages in order with a microtask checkpoint
+between each, listeners staying with a transferred port's old object,
+port order in `event.ports`, dropped messages disentangling their ports,
+and patched built-ins), `tests/web-messaging-idle.js` (a queued message is
+delivered, an idle port does not keep the program running), the `webby`
+package (a package posting to the program's port and listening on one, a
+package port that the program cannot transfer, a package cloning program
+data), and the new APIs in `tests/fuzz-natives.js`. `tests/wpt/coverage.json`
+now also records `webmessaging/` (the `.any.js` files and
+`message-channels/`) and `html/webappapis/structured-clone/`.
