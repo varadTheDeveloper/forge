@@ -128,7 +128,9 @@ bool OpAllows(
     X(Navigator, "navigator", None)                              \
     X(OnError, "onerror", None)                                  \
     X(OnUnhandledRejection, "onunhandledrejection", None)        \
-    X(OnRejectionHandled, "onrejectionhandled", None)
+    X(OnRejectionHandled, "onrejectionhandled", None)            \
+    X(AbortController, "AbortController", None)                  \
+    X(AbortSignal, "AbortSignal", None)
 
 enum class Op : uint16_t
 {
