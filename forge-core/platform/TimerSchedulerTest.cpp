@@ -372,6 +372,73 @@ void Test_ScheduleFromCallbackDuringPopDue()
     CHECK(sched.Count() == 0);
 }
 
+//==============================================================================
+// Test 8 (Phase 10.3): due timers fire in order of due time, and timers due
+// at the same time in the order they were scheduled. Swap-removal used to
+// scramble this: three timers due together, behind one not yet due, fired
+// in reverse (found by tests/web-abort.js, "AbortSignal timeouts fire in
+// order").
+//==============================================================================
+
+struct OrderState
+{
+    char order[16];
+    int count;
+};
+
+template <char Tag>
+void RecordOrder(void* userData) noexcept
+{
+    auto* s = static_cast<OrderState*>(userData);
+    if (s->count < 15)
+    {
+        s->order[s->count++] = Tag;
+        s->order[s->count] = '\0';
+    }
+}
+
+bool SameText(const char* a, const char* b)
+{
+    while (*a != '\0' && *a == *b)
+    {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+void Test_DueTimersFireInOrder()
+{
+    std::printf("Test_DueTimersFireInOrder...\n");
+
+    {
+        TimerScheduler sched;
+        OrderState state{};
+        CHECK(sched.Schedule(0, 1000, false, &RecordOrder<'x'>, &state).HasValue());
+        CHECK(sched.Schedule(0, 5, false, &RecordOrder<'1'>, &state).HasValue());
+        CHECK(sched.Schedule(0, 5, false, &RecordOrder<'2'>, &state).HasValue());
+        CHECK(sched.Schedule(0, 5, false, &RecordOrder<'3'>, &state).HasValue());
+        CHECK(sched.PopDue(10) == 3);
+        CHECK(SameText(state.order, "123"));  // vector order gave "132"
+        CHECK(sched.Count() == 1);
+    }
+
+    {
+        // Earlier due time first, whatever the scheduling order.
+        TimerScheduler sched;
+        OrderState state{};
+        CHECK(sched.Schedule(0, 30, false, &RecordOrder<'c'>, &state).HasValue());
+        CHECK(sched.Schedule(0, 10, false, &RecordOrder<'a'>, &state).HasValue());
+        CHECK(sched.Schedule(0, 20, false, &RecordOrder<'b'>, &state).HasValue());
+        CHECK(sched.Schedule(0, 10, true, &RecordOrder<'r'>, &state).HasValue());
+        // r (repeating, due at 10) fires once here, after a (same due time,
+        // scheduled earlier), even though it is due again at 20 and 30.
+        CHECK(sched.PopDue(50) == 4);
+        CHECK(SameText(state.order, "arbc"));
+        CHECK(sched.Count() == 1);
+    }
+}
+
 } // namespace
 
 int main()
@@ -383,6 +450,7 @@ int main()
     Test_SelfCancelStopsRepeating();
     Test_NextDueDelayAcrossConcurrentTimers();
     Test_ScheduleFromCallbackDuringPopDue();
+    Test_DueTimersFireInOrder();
 
     if (g_failures == 0)
     {
