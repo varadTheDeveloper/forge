@@ -600,6 +600,71 @@ declare global {
     abort(reason?: any): void;
   }
 
+  interface StructuredSerializeOptions {
+    /** Objects to move rather than copy: ArrayBuffers and MessagePorts (of this package). */
+    transfer?: Iterable<object>;
+  }
+
+  /**
+   * A deep copy by the HTML structured clone algorithm. Functions, symbols
+   * and web API objects (Event, AbortSignal, ...) cannot be cloned
+   * (DataCloneError); transferred objects are detached.
+   */
+  function structuredClone<T = any>(value: T, options?: StructuredSerializeOptions): T;
+
+  interface MessageEventInit<T = any> extends EventInit {
+    data?: T;
+    origin?: string;
+    lastEventId?: string;
+    source?: MessagePort | null;
+    ports?: Iterable<MessagePort>;
+  }
+
+  class MessageEvent<T = any> extends Event {
+    constructor(type: string, eventInitDict?: MessageEventInit<T>);
+    readonly data: T;
+    readonly origin: string;
+    readonly lastEventId: string;
+    readonly source: MessagePort | null;
+    /** Frozen. */
+    readonly ports: ReadonlyArray<MessagePort>;
+    initMessageEvent(type: string, bubbles?: boolean, cancelable?: boolean, data?: any,
+                     origin?: string, lastEventId?: string, source?: MessagePort | null,
+                     ports?: Iterable<MessagePort>): void;
+  }
+
+  interface MessagePortEventMap {
+    message: MessageEvent;
+    messageerror: MessageEvent;
+  }
+
+  /**
+   * One end of a MessageChannel. Messages are structured clones, each
+   * delivered as a task of its own once the port is started (start(), or
+   * setting onmessage). A port waiting for messages does not keep the
+   * program running.
+   */
+  class MessagePort extends EventTarget {
+    private constructor();
+    postMessage(message: any, transfer: Iterable<object>): void;
+    postMessage(message: any, options?: StructuredSerializeOptions): void;
+    start(): void;
+    close(): void;
+    onmessage: ((this: MessagePort, event: MessageEvent) => any) | null;
+    onmessageerror: ((this: MessagePort, event: MessageEvent) => any) | null;
+    addEventListener<K extends keyof MessagePortEventMap>(
+      type: K, listener: (this: MessagePort, event: MessagePortEventMap[K]) => any,
+      options?: AddEventListenerOptions | boolean): void;
+    addEventListener(type: string, callback: EventListenerOrEventListenerObject | null,
+                     options?: AddEventListenerOptions | boolean): void;
+  }
+
+  class MessageChannel {
+    constructor();
+    readonly port1: MessagePort;
+    readonly port2: MessagePort;
+  }
+
   /**
    * The global object's events. "error" (an uncaught exception) and
    * "unhandledrejection" are cancellable: a listener that cancels one keeps
