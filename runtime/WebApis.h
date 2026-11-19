@@ -113,6 +113,16 @@ bool HostScheduleInternalTimer(
     JS::HandleObject callback,
     double delayMs);
 
+/// Implemented by forge.cpp (Phase 10.4, for MessagePort): runs `callback`
+/// with no arguments as a task of the event loop, in the current realm,
+/// after the current task. Like setTimeout(callback, 0), it keeps the
+/// program running until it has run, and script cannot cancel it. Fails
+/// (with an exception pending) only if it could not be queued.
+[[nodiscard]]
+bool HostQueueTask(
+    JSContext* cx,
+    JS::HandleObject callback);
+
 /// For console output (runtime/Inspect.cpp): if `obj`, an object of the
 /// current realm, is a DOMException, sets `*found` and its name and message.
 /// Runs no script.

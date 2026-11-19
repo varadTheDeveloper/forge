@@ -76,6 +76,8 @@ R"FORGEJS(// Forge's web-standard APIs, the WebIDL layer (Phase 10, PHASE10_DESI
   const SymbolIterator = Symbol.iterator;
   const WeakRefCtor = WeakRef;
   const WeakRefDeref = uncurryThis(WeakRef.prototype.deref);
+  // Phase 10.4
+  const MapDelete = uncurryThis(Map.prototype.delete);
 
   const {
     makeError,
@@ -91,6 +93,10 @@ R"FORGEJS(// Forge's web-standard APIs, the WebIDL layer (Phase 10, PHASE10_DESI
     now,
     reportException,
     scheduleTimeout,
+    createPlatformObject,
+    serialize: nativeSerialize,
+    deserialize: nativeDeserialize,
+    queueTask,
   } = natives;
 
   // makeError kinds. The stack of an error made by makeError starts at the
@@ -203,14 +209,14 @@ R"FORGEJS(// Forge's web-standard APIs, the WebIDL layer (Phase 10, PHASE10_DESI
     if (exposed) {
       ObjectDefineProperty(global, name, {
         value: ctor, writable: true, enumerable: false, configurable: true,
-      });
+)FORGEJS",
+R"FORGEJS(      });
     }
   }
 
   // WebIDL "unsigned long": ToNumber, then modulo 2^32 (NaN and the
   // infinities are 0). A BigInt or Symbol throws, as ToNumber does.
-)FORGEJS",
-R"FORGEJS(  function toUnsignedLong(value) {
+  function toUnsignedLong(value) {
     return (+value) >>> 0;
   }
 
@@ -222,6 +228,22 @@ R"FORGEJS(  function toUnsignedLong(value) {
   // WebIDL callback interface or callback function arguments: any object.
   function isObject(value) {
     return value !== null && (typeof value === 'object' || typeof value === 'function');
+  }
+
+  // Phase 10.4: a new platform object for an interface's constructor. It is
+  // of a class of its own (WebApis.cpp, kPlatformObjectClass), not an
+  // ordinary object, so structured clone refuses it with a DataCloneError
+  // instead of copying it as a plain object. Its prototype comes from
+  // new.target, as WebIDL's "create a new object implementing the
+  // interface" says (so subclasses work), else the interface's own. Base
+  // classes keep their state in WeakMaps; subclasses may use private
+  // fields, which are added to the object super() returns.
+  const kPlatformObject = 0;
+  const kMessagePortObject = 1;
+
+  function platformObject(newTarget, fallbackProto, kind = kPlatformObject) {
+    const proto = newTarget === undefined ? fallbackProto : newTarget.prototype;
+    return createPlatformObject(isObject(proto) ? proto : fallbackProto, kind);
   }
 
   // ------------------------------------------------------------------
@@ -316,12 +338,17 @@ R"FORGEJS(  function toUnsignedLong(value) {
   // TextEncoder (Encoding Standard)
   // ------------------------------------------------------------------
 
-  class TextEncoder {
-    #brand = true;
+  const textEncoders = new WeakSetCtor();
 
+  class TextEncoder {
     static #is(value) {
-      return value !== null && (typeof value === 'object' || typeof value === 'function') &&
-             #brand in value;
+      return WeakSetHas(textEncoders, value);
+    }
+
+    constructor() {
+      const self = platformObject(new.target, TextEncoder.prototype);
+      WeakSetAdd(textEncoders, self);
+      return self;
     }
 
     get encoding() {
@@ -363,20 +390,12 @@ R"FORGEJS(  function toUnsignedLong(value) {
   const kLabelUnknown = -1;
   const kLabelReplacement = -2;
 
-  class TextDecoder {
-    #encoding;
-    #name;
-    #fatal;
-    #ignoreBOM;
-    #stripBOM;  // UTF-8 or UTF-16, and ignoreBOM is false
-    #doNotFlush = false;
-    #bomSeen = false;
-    #pending = undefined;  // bytes of an incomplete sequence (Uint8Array)
+  // TextDecoder -> { encoding, name, fatal, ignoreBOM, stripBOM (UTF-8 or
+  // UTF-16, and ignoreBOM is false), doNotFlush, bomSeen, pending (bytes of
+  // an incomplete sequence, a Uint8Array) }.
+  const textDecoders = new WeakMapCtor();
 
-    static #is(value) {
-      return value !== null && (typeof value === 'object' || typeof value === 'function') &&
-             #encoding in value;
-    }
+  class TextDecoder {
 
     constructor(label = undefined, options = undefined) {
       label = label === undefined ? 'utf-8' : `${label}`;
@@ -394,39 +413,41 @@ R"FORGEJS(  function toUnsignedLong(value) {
       }
 
       const name = encodingName(encoding);
-      this.#encoding = encoding;
-      this.#name = name;
-      this.#fatal = fatal;
-      this.#ignoreBOM = ignoreBOM;
-      this.#stripBOM = !ignoreBOM && (name === 'utf-8' || name === 'utf-16le' || name === 'utf-16be');
+      const self = platformObject(new.target, TextDecoder.prototype);
+      WeakMapSet(textDecoders, self, {
+        __proto__: null,
+        encoding,
+        name,
+        fatal,
+        ignoreBOM,
+        stripBOM: !ignoreBOM && (name === 'utf-8' || name === 'utf-16le' || name === 'utf-16be'),
+        doNotFlush: false,
+)FORGEJS",
+R"FORGEJS(        bomSeen: false,
+        pending: undefined,
+      });
+      return self;
     }
 
     get encoding() {
-      if (!TextDecoder.#is(this)) {
-        return notBranded('TextDecoder', 'encoding', this, arguments);
-      }
-
-      return this.#name;
+      const state = WeakMapGet(textDecoders, this);
+      return state !== undefined ? state.name : notBranded('TextDecoder', 'encoding', this, arguments);
     }
 
     get fatal() {
-      if (!TextDecoder.#is(this)) {
-        return notBranded('TextDecoder', 'fatal', this, arguments);
-      }
-
-      return this.#fatal;
+      const state = WeakMapGet(textDecoders, this);
+      return state !== undefined ? state.fatal : notBranded('TextDecoder', 'fatal', this, arguments);
     }
 
     get ignoreBOM() {
-      if (!TextDecoder.#is(this)) {
-        return notBranded('TextDecoder', 'ignoreBOM', this, arguments);
-      }
-
-      return this.#ignoreBOM;
+      const state = WeakMapGet(textDecoders, this);
+      return state !== undefined ? state.ignoreBOM : notBranded('TextDecoder', 'ignoreBOM', this, arguments);
     }
 
     decode(input = undefined, options = undefined) {
-      if (!TextDecoder.#is(this)) {
+      const state = WeakMapGet(textDecoders, this);
+
+      if (state === undefined) {
         return notBranded('TextDecoder', 'decode', this, arguments);
       }
 
@@ -438,28 +459,27 @@ R"FORGEJS(  function toUnsignedLong(value) {
       const dictionary = toDictionary(options, 'TextDecoder.decode');
       const stream = dictionary === undefined ? false : !!dictionary.stream;
 
-      if (!this.#doNotFlush) {
-        this.#pending = undefined;
-)FORGEJS",
-R"FORGEJS(        this.#bomSeen = false;
+      if (!state.doNotFlush) {
+        state.pending = undefined;
+        state.bomSeen = false;
       }
 
-      this.#doNotFlush = stream;
-      const result = nativeDecode(this.#encoding, this.#pending, input, this.#fatal, !stream);
+      state.doNotFlush = stream;
+      const result = nativeDecode(state.encoding, state.pending, input, state.fatal, !stream);
 
       if (result === null) {
         // A fatal error ends the stream: the next call starts afresh.
-        this.#pending = undefined;
-        this.#doNotFlush = false;
-        this.#bomSeen = false;
-        throw typeError(`TextDecoder.decode: the data is not valid ${this.#name}.`);
+        state.pending = undefined;
+        state.doNotFlush = false;
+        state.bomSeen = false;
+        throw typeError(`TextDecoder.decode: the data is not valid ${state.name}.`);
       }
 
-      this.#pending = result[1];
+      state.pending = result[1];
       let text = result[0];
 
-      if (this.#stripBOM && !this.#bomSeen && text.length > 0) {
-        this.#bomSeen = true;
+      if (state.stripBOM && !state.bomSeen && text.length > 0) {
+        state.bomSeen = true;
 
         if (text[0] === '\uFEFF') {
           text = StringPrototypeSlice(text, 1);
@@ -545,13 +565,11 @@ R"FORGEJS(        this.#bomSeen = false;
   }, 'isTrusted').get;
   members['Event.isTrusted'] = isTrustedGetter;
 
+  // Event -> its internal record.
+  const eventStates = new WeakMapCtor();
+  eventStateOf = (value) => WeakMapGet(eventStates, value);
+
   class Event {
-    #state;
-
-    static {
-      eventStateOf = (value) => (isObject(value) && #state in value ? value.#state : undefined);
-    }
-
     constructor(type, eventInitDict = undefined) {
       requireArguments(arguments.length, 1, 'Event constructor');
       type = `${type}`;
@@ -559,7 +577,8 @@ R"FORGEJS(        this.#bomSeen = false;
       const bubbles = init === undefined ? false : !!init.bubbles;
       const cancelable = init === undefined ? false : !!init.cancelable;
       const composed = init === undefined ? false : !!init.composed;
-      this.#state = {
+      const self = platformObject(new.target, Event.prototype);
+      WeakMapSet(eventStates, self, {
         __proto__: null,
         type,
         bubbles,
@@ -575,10 +594,11 @@ R"FORGEJS(        this.#bomSeen = false;
         dispatching: false,
         isTrusted: false,
         timeStamp: now(),
-      };
-      ObjectDefineProperty(this, 'isTrusted', {
+      });
+      ObjectDefineProperty(self, 'isTrusted', {
         get: isTrustedGetter, set: undefined, enumerable: true, configurable: false,
       });
+      return self;
     }
 
     get type() {
@@ -654,7 +674,8 @@ R"FORGEJS(        this.#bomSeen = false;
       }
 
       state.stopPropagation = true;
-      state.stopImmediatePropagation = true;
+)FORGEJS",
+R"FORGEJS(      state.stopImmediatePropagation = true;
     }
 
     get bubbles() {
@@ -702,8 +723,7 @@ R"FORGEJS(        this.#bomSeen = false;
 
     get composed() {
       const state = eventStateOf(this);
-)FORGEJS",
-R"FORGEJS(      return state !== undefined ? state.composed : notBranded('Event', 'composed', this, arguments);
+      return state !== undefined ? state.composed : notBranded('Event', 'composed', this, arguments);
     }
 
     get timeStamp() {
@@ -906,7 +926,8 @@ R"FORGEJS(      return state !== undefined ? state.composed : notBranded('Event'
   // private field, so the global object can be an EventTarget too.
   const eventTargets = new WeakMapCtor();
 
-  // Lists are null-prototype array-likes: appending to one can never reach
+)FORGEJS",
+R"FORGEJS(  // Lists are null-prototype array-likes: appending to one can never reach
   // a setter that user code put on Array.prototype or Object.prototype.
   function newList() {
     return { __proto__: null, length: 0 };
@@ -953,8 +974,7 @@ R"FORGEJS(      return state !== undefined ? state.composed : notBranded('Event'
       return flat;
     }
 
-)FORGEJS",
-R"FORGEJS(    if (!isObject(options)) {
+    if (!isObject(options)) {
       flat.capture = !!options;
       return flat;
     }
@@ -1110,7 +1130,9 @@ R"FORGEJS(    if (!isObject(options)) {
 
   class EventTarget {
     constructor() {
-      WeakMapSet(eventTargets, this, new MapCtor());
+      const self = platformObject(new.target, EventTarget.prototype);
+      WeakMapSet(eventTargets, self, new MapCtor());
+      return self;
     }
 
     // WebIDL: an operation called with an undefined or null `this` acts on
@@ -1170,7 +1192,8 @@ R"FORGEJS(    if (!isObject(options)) {
       const self = this === undefined || this === null ? global : this;
       const map = targetListeners(self);
 
-      if (map === undefined) {
+)FORGEJS",
+R"FORGEJS(      if (map === undefined) {
         return notBranded('EventTarget', 'dispatchEvent', this, arguments);
       }
 
@@ -1205,8 +1228,7 @@ R"FORGEJS(    if (!isObject(options)) {
   // target: the global object's onerror, onunhandledrejection and
   // onrejectionhandled, and AbortSignal's onabort (10.3). Setting one to an
   // object adds a listener the first time; setting it to anything else
-)FORGEJS",
-R"FORGEJS(  // removes that listener. Setting it again keeps the listener's place.
+  // removes that listener. Setting it again keeps the listener's place.
   //
   // target -> null-prototype { type -> { value, listener } }
   const eventHandlers = new WeakMapCtor();
@@ -1307,7 +1329,7 @@ R"FORGEJS(  // removes that listener. Setting it again keeps the listener's plac
   defineInterface(Navigator, 'Navigator', undefined, false);
   // One per realm, frozen: in a package compartment it is shared by every
   // package there, so no package may change it.
-  const navigatorObject = ObjectFreeze(ObjectCreate(Navigator.prototype));
+  const navigatorObject = ObjectFreeze(createPlatformObject(Navigator.prototype, kPlatformObject));
 
   const globalAttributes = {
     get self() {
@@ -1407,7 +1429,8 @@ R"FORGEJS(  // removes that listener. Setting it again keeps the listener's plac
   }
 
   // The abort reason of a signal of another compartment that is aborted.
-  function foreignSignalReason(signal) {
+)FORGEJS",
+R"FORGEJS(  function foreignSignalReason(signal) {
     return foreignSignalCall('reason', signal, noArguments);
   }
 
@@ -1446,8 +1469,7 @@ R"FORGEJS(  // removes that listener. Setting it again keeps the listener's plac
 
       algorithms = kept;
       state.algorithms = kept;
-)FORGEJS",
-R"FORGEJS(      state.algorithmsPruneAt = kept.length * 2 > 32 ? kept.length * 2 : 32;
+      state.algorithmsPruneAt = kept.length * 2 > 32 ? kept.length * 2 : 32;
     }
 
     listAppend(algorithms, { __proto__: null, run: algorithm, listener });
@@ -1684,26 +1706,26 @@ R"FORGEJS(      state.algorithmsPruneAt = kept.length * 2 > 32 ? kept.length * 2
     return new AbortSignal(signalToken);
   }
 
-  // Not `extends EventTarget`: `super()` would call whatever the
+)FORGEJS",
+R"FORGEJS(  // Not `extends EventTarget`: `super()` would call whatever the
   // constructor's prototype is at that moment, which user code can change,
   // and AbortSignal.timeout and AbortSignal.any must not run user code
   // there. The prototype chain is set below instead.
+  // AbortSignal -> its internal record.
+  const signalStates = new WeakMapCtor();
+  signalStateOf = (value) => WeakMapGet(signalStates, value);
+
   class AbortSignal {
-    #state;
-
-    static {
-      signalStateOf = (value) => (isObject(value) && #state in value ? value.#state : undefined);
-    }
-
     constructor(token = undefined) {
       if (token !== signalToken) {
         throw typeError('Illegal constructor.');
       }
 
-      WeakMapSet(eventTargets, this, new MapCtor());
-      this.#state = {
+      const self = platformObject(new.target, AbortSignal.prototype);
+      WeakMapSet(eventTargets, self, new MapCtor());
+      WeakMapSet(signalStates, self, {
         __proto__: null,
-        signal: this,
+        signal: self,
         aborted: false,
         reason: undefined,
         algorithms: newList(),
@@ -1715,22 +1737,22 @@ R"FORGEJS(      state.algorithmsPruneAt = kept.length * 2 > 32 ? kept.length * 2
         dependent: false,
         links: newList(),
         retained: false,
-      };
+      });
+      return self;
     }
 
     static abort(reason = undefined) {
       const signal = createSignal();
-      signalAbort(signal.#state, reason);
+      signalAbort(signalStateOf(signal), reason);
       return signal;
     }
 
     // The timer does not keep the program running (as in Node and Deno).
     static timeout(milliseconds) {
-)FORGEJS",
-R"FORGEJS(      requireArguments(arguments.length, 1, 'AbortSignal.timeout');
+      requireArguments(arguments.length, 1, 'AbortSignal.timeout');
       const delay = toEnforcedUnsignedLongLong(milliseconds, 'AbortSignal.timeout');
       const signal = createSignal();
-      const state = signal.#state;
+      const state = signalStateOf(signal);
       scheduleTimeout(() => signalAbort(state, new DOMException('signal timed out', 'TimeoutError')),
                       delay);
       return signal;
@@ -1741,7 +1763,7 @@ R"FORGEJS(      requireArguments(arguments.length, 1, 'AbortSignal.timeout');
       requireArguments(arguments.length, 1, 'AbortSignal.any');
       const inputs = toSignalSequence(signals, 'AbortSignal.any');
       const result = createSignal();
-      const state = result.#state;
+      const state = signalStateOf(result);
 
       for (let i = 0; i < inputs.length; i++) {
         const input = signalStateOf(inputs[i]);
@@ -1849,32 +1871,622 @@ R"FORGEJS(      requireArguments(arguments.length, 1, 'AbortSignal.timeout');
     }
   };
 
+  // AbortController -> its signal.
+  const controllerSignals = new WeakMapCtor();
+
   class AbortController {
-    #signal;
-
-    static #is(value) {
-      return isObject(value) && #signal in value;
-    }
-
     constructor() {
-      this.#signal = createSignal();
+      const self = platformObject(new.target, AbortController.prototype);
+      WeakMapSet(controllerSignals, self, createSignal());
+      return self;
     }
 
     get signal() {
-      return AbortController.#is(this) ? this.#signal
-                                       : notBranded('AbortController', 'signal', this, arguments);
+      const signal = WeakMapGet(controllerSignals, this);
+      return signal !== undefined ? signal : notBranded('AbortController', 'signal', this, arguments);
     }
 
     abort(reason = undefined) {
-      if (!AbortController.#is(this)) {
+      const signal = WeakMapGet(controllerSignals, this);
+
+      if (signal === undefined) {
         return notBranded('AbortController', 'abort', this, arguments);
       }
 
-      signalAbort(signalStateOf(this.#signal), reason);
+      signalAbort(signalStateOf(signal), reason);
     }
   }
 
   defineInterface(AbortController, 'AbortController', undefined);
+
+  // ------------------------------------------------------------------
+  // structuredClone, MessageEvent, MessageChannel, MessagePort (HTML
+  // Standard), Phase 10.4
+  // ------------------------------------------------------------------
+
+  function dataCloneError(message) {
+    return new DOMException(message, 'DataCloneError');
+  }
+
+  // A frozen array of `list`'s items (FrozenArray<T>), made without the
+  // array iterator or any setter user code can put on Array.prototype.
+  function frozenArray(list) {
+    const array = [];
+
+    for (let i = 0; i < list.length; i++) {
+      ObjectDefineProperty(array, i, {
+        value: list[i], writable: true, enumerable: true, configurable: true,
+      });
+    }
+
+    return ObjectFreeze(array);
+  }
+
+  const emptyPorts = frozenArray(newList());
+
+  // WebIDL sequence<object>, from an iterable whose @@iterator method the
+  // caller already read (overload resolution reads it once).
+  function toObjectSequence(value, method, where) {
+    const iterator = ReflectApply(method, value, []);
+
+    if (!isObject(iterator)) {
+      throw typeError(`${where}: the iterator is not an object.`);
+    }
+
+    const next = iterator.next;
+    const items = newList();
+
+    for (;;) {
+      const result = ReflectApply(next, iterator, []);
+
+      if (!isObject(result)) {
+        throw typeError(`${where}: the iterator result is not an object.`);
+      }
+
+      if (result.done) {
+        return items;
+      }
+
+      const item = result.value;
+
+      if (!isObject(item)) {
+        throw typeError(`${where}: element ${items.length} of the transfer list is not an object.`);
+      }
+
+      listAppend(items, item);
+    }
+  }
+
+  function iteratorMethodOf(value, where) {
+    const method = value[SymbolIterator];
+
+)FORGEJS",
+R"FORGEJS(    if (method !== undefined && method !== null && typeof method !== 'function') {
+      throw typeError(`${where}: the value's Symbol.iterator is not a function.`);
+    }
+
+    return method === null ? undefined : method;
+  }
+
+  // StructuredSerializeOptions: { sequence<object> transfer = [] }.
+  function transferFromOptions(options, where) {
+    const dictionary = toDictionary(options, where);
+
+    if (dictionary === undefined) {
+      return newList();
+    }
+
+    const transfer = dictionary.transfer;
+
+    if (transfer === undefined) {
+      return newList();
+    }
+
+    if (!isObject(transfer)) {
+      throw typeError(`${where}: the 'transfer' option is not a sequence.`);
+    }
+
+    const method = iteratorMethodOf(transfer, where);
+
+    if (method === undefined) {
+      throw typeError(`${where}: the 'transfer' option is not iterable.`);
+    }
+
+    return toObjectSequence(transfer, method, where);
+  }
+
+  // The MessagePort records a serialization in progress transfers, and the
+  // ones a deserialization in progress adopts (WebApis.cpp calls
+  // internals.transferPort and internals.adoptPort from the engine's
+  // transfer callbacks, synchronously, inside nativeSerialize and
+  // nativeDeserialize).
+  let transferringPorts = newList();
+  let adoptingPorts = newList();
+  let adoptedPorts = newList();
+
+  // StructuredSerializeWithTransfer: { handle, ports }.
+  function serializeMessage(value, transfer, where) {
+    const saved = transferringPorts;
+    transferringPorts = newList();
+
+    try {
+      const handle = nativeSerialize(value, transfer, where);
+      return { __proto__: null, handle, ports: transferringPorts };
+    } finally {
+      transferringPorts = saved;
+    }
+  }
+
+  // StructuredDeserializeWithTransfer: the value, and the new MessagePorts
+  // (in transfer order) in `out.ports`.
+  function deserializeMessage(message, where, out) {
+    const savedAdopting = adoptingPorts;
+    const savedAdopted = adoptedPorts;
+    adoptingPorts = message.ports;
+    adoptedPorts = newList();
+
+    try {
+      const value = nativeDeserialize(message.handle, where);
+      out.ports = adoptedPorts;
+      return value;
+    } finally {
+      adoptingPorts = savedAdopting;
+      adoptedPorts = savedAdopted;
+    }
+  }
+
+  // A message nobody will read: the ports it carries are disentangled, so
+  // their peers' later messages are dropped instead of piling up.
+  function discardMessage(message) {
+    for (let i = 0; i < message.ports.length; i++) {
+      disentangle(message.ports[i]);
+    }
+  }
+
+  // structuredClone (HTML Standard).
+  const cloneOperations = {
+    structuredClone(value, options = undefined) {
+      requireArguments(arguments.length, 1, 'structuredClone');
+      const transfer = transferFromOptions(options, 'structuredClone');
+      const message = serializeMessage(value, transfer, 'structuredClone');
+      return deserializeMessage(message, 'structuredClone', { __proto__: null, ports: undefined });
+    },
+  };
+
+  ObjectDefineProperty(global, 'structuredClone', {
+    value: cloneOperations.structuredClone, writable: true, enumerable: true, configurable: true,
+  });
+
+  // MessageEvent -> setter of its fields, for events Forge makes itself.
+  let setMessageEventFields;
+
+  class MessageEvent extends Event {
+    #data;
+    #origin;
+    #lastEventId;
+    #source;
+    #ports;
+
+    static #is(value) {
+      return isObject(value) && #data in value;
+    }
+
+    static {
+      setMessageEventFields = (event, data, ports) => {
+        event.#data = data;
+        event.#ports = ports;
+      };
+    }
+
+    constructor(type, eventInitDict = undefined) {
+      requireArguments(arguments.length, 1, 'MessageEvent constructor');
+      super(type, eventInitDict);
+      const init = toDictionary(eventInitDict, 'MessageEvent constructor');
+      let data = null;
+      let lastEventId = '';
+      let origin = '';
+      let ports = emptyPorts;
+      let source = null;
+
+      // MessageEventInit's own members, in lexicographic order.
+      if (init !== undefined) {
+        const dataValue = init.data;
+        data = dataValue === undefined ? null : dataValue;
+        const lastEventIdValue = init.lastEventId;
+        lastEventId = lastEventIdValue === undefined ? '' : `${lastEventIdValue}`;
+        const originValue = init.origin;
+        origin = originValue === undefined ? '' : toUSVString(originValue);
+        const portsValue = init.ports;
+        ports = portsValue === undefined ? emptyPorts
+                                         : frozenArray(toPortSequence(portsValue, 'MessageEvent constructor'));
+        source = toMessageEventSource(init.source, 'MessageEvent constructor');
+      }
+
+      this.#data = data;
+      this.#origin = origin;
+      this.#lastEventId = lastEventId;
+      this.#source = source;
+      this.#ports = ports;
+    }
+
+    get data() {
+      return MessageEvent.#is(this) ? this.#data : notBranded('MessageEvent', 'data', this, arguments);
+    }
+
+    get origin() {
+      return MessageEvent.#is(this) ? this.#origin : notBranded('MessageEvent', 'origin', this, arguments);
+    }
+
+    get lastEventId() {
+      return MessageEvent.#is(this) ? this.#lastEventId
+                                    : notBranded('MessageEvent', 'lastEventId', this, arguments);
+    }
+
+    get source() {
+      return MessageEvent.#is(this) ? this.#source : notBranded('MessageEvent', 'source', this, arguments);
+    }
+
+    get ports() {
+      return MessageEvent.#is(this) ? this.#ports : notBranded('MessageEvent', 'ports', this, arguments);
+    }
+
+    initMessageEvent(type, bubbles = false, cancelable = false, data = null, origin = '',
+                     lastEventId = '', source = null, ports = undefined) {
+      if (!MessageEvent.#is(this)) {
+        return notBranded('MessageEvent', 'initMessageEvent', this, arguments);
+      }
+
+      requireArguments(arguments.length, 1, 'MessageEvent.initMessageEvent');
+      type = `${type}`;
+      bubbles = !!bubbles;
+      cancelable = !!cancelable;
+      origin = toUSVString(origin);
+      lastEventId = `${lastEventId}`;
+      source = toMessageEventSource(source, 'MessageEvent.initMessageEvent');
+      const portList = ports === undefined ? emptyPorts
+                                           : frozenArray(toPortSequence(ports, 'MessageEvent.initMessageEvent'));
+      const state = eventStateOf(this);
+
+      if (!state.dispatching) {
+        initializeEvent(state, type, bubbles, cancelable);
+        this.#data = data;
+        this.#origin = origin;
+        this.#lastEventId = lastEventId;
+        this.#source = source;
+        this.#ports = portList;
+      }
+    }
+  }
+
+  defineInterface(MessageEvent, 'MessageEvent', undefined);
+
+  // MessageEventSource? in Forge: a MessagePort of this compartment, or null.
+  function toMessageEventSource(value, where) {
+    if (value === undefined || value === null) {
+      return null;
+    }
+
+    if (portStateOf(value) === undefined) {
+      throw typeError(`${where}: 'source' is not a MessagePort.`);
+    }
+
+    return value;
+  }
+
+  // sequence<MessagePort>.
+  function toPortSequence(value, where) {
+    if (!isObject(value)) {
+      throw typeError(`${where}: 'ports' is not a sequence.`);
+    }
+
+    const method = iteratorMethodOf(value, where);
+
+    if (method === undefined) {
+      throw typeError(`${where}: 'ports' is not iterable.`);
+    }
+
+    const iterator = ReflectApply(method, value, []);
+
+    if (!isObject(iterator)) {
+      throw typeError(`${where}: the iterator is not an object.`);
+    }
+
+    const next = iterator.next;
+    const items = newList();
+
+    for (;;) {
+      const result = ReflectApply(next, iterator, []);
+
+      if (!isObject(result)) {
+        throw typeError(`${where}: the iterator result is not an object.`);
+      }
+
+      if (result.done) {
+        return items;
+      }
+
+      const item = result.value;
+
+      if (portStateOf(item) === undefined) {
+        throw typeError(`${where}: element ${items.length} of 'ports' is not a MessagePort.`);
+      }
+
+)FORGEJS",
+R"FORGEJS(      listAppend(items, item);
+    }
+  }
+
+  // MessagePort -> its record: { port (the object that owns the record
+  // now; undefined while it travels in a message), entangled (the other
+  // port's record, or null), queue and head (the port message queue: the
+  // serialized messages not yet dispatched), enabled (start() was called),
+  // detached (closed or transferred), scheduled (a delivery task is
+  // queued) }. Transferring a port moves its record to a new object and
+  // leaves the old one a detached record of its own.
+  const portStates = new WeakMapCtor();
+
+  function portStateOf(value) {
+    return WeakMapGet(portStates, value);
+  }
+
+  function newPortRecord() {
+    return {
+      __proto__: null,
+      port: undefined,
+      entangled: null,
+      queue: newList(),
+      head: 0,
+      enabled: false,
+      detached: false,
+      scheduled: false,
+    };
+  }
+
+  function makePort(record) {
+    const port = createPlatformObject(MessagePort.prototype, kMessagePortObject);
+    WeakMapSet(eventTargets, port, new MapCtor());
+    WeakMapSet(portStates, port, record);
+    record.port = port;
+    return port;
+  }
+
+  function disentangle(record) {
+    const other = record.entangled;
+
+    if (other !== null) {
+      other.entangled = null;
+      record.entangled = null;
+    }
+  }
+
+  internals.newDOMException = (message, name) => new DOMException(message, name);
+
+  internals.canTransferPort = (port) => {
+    const record = portStateOf(port);
+    return record !== undefined && !record.detached;
+  };
+
+  internals.transferPort = (port) => {
+    const record = portStateOf(port);
+    const left = newPortRecord();
+    left.port = port;
+    left.detached = true;
+    WeakMapSet(portStates, port, left);
+    record.port = undefined;
+    record.enabled = false;
+    listAppend(transferringPorts, record);
+    return transferringPorts.length - 1;
+  };
+
+  internals.adoptPort = (index) => {
+    const port = makePort(adoptingPorts[index]);
+    listAppend(adoptedPorts, port);
+    return port;
+  };
+
+  function enqueueMessage(record, message) {
+    listAppend(record.queue, message);
+    scheduleDelivery(record);
+  }
+
+  // Each message is dispatched by a task of its own. One task is queued
+  // at a time per port, so a burst of messages costs one pending task.
+  function scheduleDelivery(record) {
+    if (record.enabled && !record.scheduled && record.head < record.queue.length) {
+      record.scheduled = true;
+      queueTask(() => deliverMessage(record));
+    }
+  }
+
+  function deliverMessage(record) {
+    record.scheduled = false;
+    const port = record.port;
+
+    if (!record.enabled || port === undefined || record.head >= record.queue.length) {
+      return;
+    }
+
+    const message = record.queue[record.head];
+    record.queue[record.head] = undefined;
+    record.head++;
+
+    if (record.head === record.queue.length) {
+      record.queue = newList();
+      record.head = 0;
+    }
+
+    // The next message's task is queued before this one's listeners run.
+    scheduleDelivery(record);
+    const out = { __proto__: null, ports: undefined };
+    let data;
+    let type = 'message';
+
+    try {
+      data = deserializeMessage(message, 'MessagePort message', out);
+    } catch (error) {
+      type = 'messageerror';
+      data = null;
+      out.ports = undefined;
+    }
+
+    const event = makeInternalEvent(MessageEvent, type, { __proto__: null });
+    setMessageEventFields(event, data, out.ports === undefined ? emptyPorts : frozenArray(out.ports));
+    const state = eventStateOf(event);
+    state.isTrusted = true;
+    dispatch(port, targetListeners(port), event, state);
+  }
+
+  // postMessage's second argument: sequence<object> transfer, or
+  // StructuredSerializeOptions (WebIDL overload resolution: an object with
+  // a Symbol.iterator method is a sequence).
+  function transferFromArgument(value, where) {
+    if (value === undefined || value === null) {
+      return newList();
+    }
+
+    if (isObject(value)) {
+      const method = iteratorMethodOf(value, where);
+
+      if (method !== undefined) {
+        return toObjectSequence(value, method, where);
+      }
+    }
+
+    return transferFromOptions(value, where);
+  }
+
+  class MessagePort {
+    constructor() {
+      // Only MessageChannel and transfers make ports.
+      throw typeError('Illegal constructor.');
+    }
+
+    // The HTML "message port post message steps".
+    postMessage(message, transfer = undefined) {
+      const record = portStateOf(this);
+
+      if (record === undefined) {
+        return notBranded('MessagePort', 'postMessage', this, arguments);
+      }
+
+      requireArguments(arguments.length, 1, 'MessagePort.postMessage');
+      const list = transferFromArgument(transfer, 'MessagePort.postMessage');
+      const target = record.entangled;
+      let doomed = false;
+
+      for (let i = 0; i < list.length; i++) {
+        if (list[i] === this) {
+          throw dataCloneError('MessagePort.postMessage: the transfer list contains the port ' +
+                               'that sends the message.');
+        }
+
+        if (target !== null && list[i] === target.port) {
+          doomed = true;
+        }
+      }
+
+      const serialized = serializeMessage(message, list, 'MessagePort.postMessage');
+
+      // No entangled port, or the message transfers its own target: the
+      // message is dropped (after transferring, as HTML says).
+      if (target === null || doomed) {
+        discardMessage(serialized);
+        return;
+      }
+
+      enqueueMessage(target, serialized);
+    }
+
+    start() {
+      const record = portStateOf(this);
+
+      if (record === undefined) {
+        return notBranded('MessagePort', 'start', this, arguments);
+      }
+
+      record.enabled = true;
+      scheduleDelivery(record);
+    }
+
+    // Messages already queued are still dispatched; nothing more arrives,
+    // and the port can no longer be transferred. No "close" event (HTML
+    // removed it).
+    close() {
+      const record = portStateOf(this);
+
+      if (record === undefined) {
+        return notBranded('MessagePort', 'close', this, arguments);
+      }
+
+      record.detached = true;
+      disentangle(record);
+    }
+
+    get onmessage() {
+      return portStateOf(this) !== undefined ? getEventHandler(this, 'message')
+                                             : notBranded('MessagePort', 'onmessage', this, arguments);
+    }
+
+    // Setting onmessage also starts the port, as HTML says.
+    set onmessage(value) {
+      const record = portStateOf(this);
+
+      if (record === undefined) {
+        return notBranded('MessagePort', 'onmessage=', this, arguments);
+      }
+
+      setEventHandler(this, 'message', value);
+      record.enabled = true;
+      scheduleDelivery(record);
+    }
+
+    get onmessageerror() {
+      return portStateOf(this) !== undefined ? getEventHandler(this, 'messageerror')
+                                             : notBranded('MessagePort', 'onmessageerror', this, arguments);
+    }
+
+    set onmessageerror(value) {
+      if (portStateOf(this) === undefined) {
+        return notBranded('MessagePort', 'onmessageerror=', this, arguments);
+      }
+
+      setEventHandler(this, 'messageerror', value);
+    }
+  }
+
+  ObjectSetPrototypeOf(MessagePort, EventTarget);
+  ObjectSetPrototypeOf(MessagePort.prototype, EventTarget.prototype);
+  defineInterface(MessagePort, 'MessagePort', undefined);
+
+  // MessageChannel -> { port1, port2 }.
+  const channelPorts = new WeakMapCtor();
+
+  class MessageChannel {
+    constructor() {
+      const self = platformObject(new.target, MessageChannel.prototype);
+      const record1 = newPortRecord();
+      const record2 = newPortRecord();
+      record1.entangled = record2;
+      record2.entangled = record1;
+      WeakMapSet(channelPorts, self, {
+        __proto__: null, port1: makePort(record1), port2: makePort(record2),
+      });
+      return self;
+    }
+
+    get port1() {
+      const ports = WeakMapGet(channelPorts, this);
+)FORGEJS",
+R"FORGEJS(      return ports !== undefined ? ports.port1 : notBranded('MessageChannel', 'port1', this, arguments);
+    }
+
+    get port2() {
+      const ports = WeakMapGet(channelPorts, this);
+      return ports !== undefined ? ports.port2 : notBranded('MessageChannel', 'port2', this, arguments);
+    }
+  }
+
+  defineInterface(MessageChannel, 'MessageChannel', undefined);
 
   // ------------------------------------------------------------------
   // Uncaught errors and rejections, called by C++ (WebApis.cpp) in the

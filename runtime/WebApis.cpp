@@ -22,9 +22,11 @@
 #include "js/Promise.h"
 #include "js/SavedFrameAPI.h"
 #include "js/SourceText.h"
+#include "js/StructuredClone.h"
 #include "js/Stack.h"
 #include "js/String.h"
 #include "js/WeakMap.h"
+#include "js/Utility.h"
 #include "js/Wrapper.h"
 #include "js/experimental/TypedData.h"
 #include "jsapi.h"
@@ -63,6 +65,11 @@ const char* const kWebApiGlobalNames[] = {
     // Phase 10.3
     "AbortController",
     "AbortSignal",
+    // Phase 10.4
+    "MessageChannel",
+    "MessageEvent",
+    "MessagePort",
+    "structuredClone",
 };
 
 const forge::core::Size kWebApiGlobalCount = sizeof(kWebApiGlobalNames) / sizeof(kWebApiGlobalNames[0]);
@@ -946,6 +953,482 @@ bool NativeScheduleTimeout(JSContext* cx, unsigned argc, JS::Value* vp)
     return true;
 }
 
+// -------------------------------------------------------------------------
+// Phase 10.4: platform objects, structured clone, MessagePort, tasks
+// -------------------------------------------------------------------------
+
+bool CallProgramInternal(JSContext* cx, const char* name, const JS::HandleValueArray& argv,
+                         JS::MutableHandleValue rval);
+
+/// Every object a web API interface makes (an Event, a TextDecoder, ...) is
+/// of this class rather than an ordinary object, as a browser's platform
+/// objects are. The engine's structured clone therefore does not copy one
+/// as if it were a plain object: it hands it to WriteClone, which refuses
+/// it with a DataCloneError, as HTML says for an object that is not
+/// serializable. State lives in WebApis.js (WeakMaps and the private
+/// fields of subclasses).
+const JSClass kPlatformObjectClass = {"PlatformObject", 0};
+
+/// MessagePort objects: platform objects that are transferable.
+const JSClass kMessagePortClass = {"MessagePort", 0};
+
+/// The user tag of a MessagePort in a transfer map; its extraData is the
+/// port's index in the serialization's list of ports (WebApis.js keeps the
+/// ports' state, never C++).
+constexpr uint32_t kTransferTagMessagePort = JS_SCTAG_USER_MIN + 1;
+
+/// What a DataCloneError says, by the engine's error id.
+const char* CloneErrorText(uint32_t errorId)
+{
+    switch (errorId)
+    {
+    case JS_SCERR_RECURSION:
+        return "the value is nested too deeply.";
+    case JS_SCERR_TRANSFERABLE:
+        return "an item of the transfer list cannot be transferred.";
+    case JS_SCERR_DUP_TRANSFERABLE:
+        return "the transfer list contains the same object twice.";
+    case JS_SCERR_UNSUPPORTED_TYPE:
+        return "the value cannot be cloned (a function, a symbol or another value that is not "
+               "serializable).";
+    case JS_SCERR_SHMEM_TRANSFERABLE:
+        return "shared memory cannot be transferred.";
+    case JS_SCERR_TYPED_ARRAY_DETACHED:
+        return "an ArrayBuffer is detached or out of bounds.";
+    case JS_SCERR_TRANSFERABLE_TWICE:
+        return "an object was transferred twice.";
+    default:
+        return "the value cannot be cloned.";
+    }
+}
+
+/// One serialized value (StructuredSerializeWithTransfer), owned by a
+/// kCloneDataClass object until it is read or collected.
+struct CloneData
+{
+    // The serializing compartment: only its MessagePorts can be transferred.
+    JS::Compartment* compartment{nullptr};
+    // Set by ReportCloneError, read right after the engine call.
+    uint32_t errorId{0};
+    bool errorReported{false};
+    bool read{false};
+    JSAutoStructuredCloneBuffer buffer;
+
+    CloneData(const JSStructuredCloneCallbacks* callbacks)
+        : buffer(JS::StructuredCloneScope::SameProcess, callbacks, this) {}
+};
+
+void FinalizeCloneData(JS::GCContext* gcx, JSObject* obj);
+
+const JSClassOps kCloneDataClassOps = {
+    nullptr,            // addProperty
+    nullptr,            // delProperty
+    nullptr,            // enumerate
+    nullptr,            // newEnumerate
+    nullptr,            // resolve
+    nullptr,            // mayResolve
+    FinalizeCloneData,  // finalize
+    nullptr,            // call
+    nullptr,            // construct
+    nullptr,            // trace
+};
+
+const JSClass kCloneDataClass = {
+    "ForgeCloneData",
+    JSCLASS_HAS_RESERVED_SLOTS(1) | JSCLASS_FOREGROUND_FINALIZE,
+    &kCloneDataClassOps,
+};
+
+CloneData* CloneDataOf(JSObject* obj)
+{
+    if (JS::GetClass(obj) != &kCloneDataClass)
+    {
+        return nullptr;
+    }
+
+    const JS::Value slot = JS::GetReservedSlot(obj, 0);
+    return slot.isUndefined() ? nullptr : static_cast<CloneData*>(slot.toPrivate());
+}
+
+void FinalizeCloneData(JS::GCContext* gcx, JSObject* obj)
+{
+    (void)gcx;
+    // Frees the data, and the contents of any ArrayBuffer transferred into
+    // it and never read. MessagePorts need nothing here (FreeTransfer).
+    js_delete(CloneDataOf(obj));
+}
+
+/// Throws a DataCloneError DOMException of the current realm.
+bool ThrowDataCloneError(JSContext* cx, const char* where, const char* text)
+{
+    forge::core::String message;
+
+    if (message.Append(forge::core::StringView(where)).HasError() ||
+        message.Append(forge::core::StringView(": ")).HasError() ||
+        message.Append(forge::core::StringView(text)).HasError())
+    {
+        JS_ReportOutOfMemory(cx);
+        return false;
+    }
+
+    JS::RootedString messageStr(cx, JS_NewStringCopyN(cx, message.Data(), message.Size()));
+    JS::RootedString nameStr(cx, JS_NewStringCopyZ(cx, "DataCloneError"));
+
+    if (!messageStr || !nameStr)
+    {
+        return false;
+    }
+
+    JS::RootedValueArray<2> argv(cx);
+    argv[0].setString(messageStr);
+    argv[1].setString(nameStr);
+    JS::RootedValue error(cx);
+
+    if (!CallProgramInternal(cx, "newDOMException", argv, &error))
+    {
+        return false;
+    }
+
+    JS_SetPendingException(cx, error);
+    return false;
+}
+
+void ReportCloneError(JSContext* cx, uint32_t errorId, void* closure, const char* errorMessage)
+{
+    (void)cx;
+    (void)errorMessage;
+    auto* data = static_cast<CloneData*>(closure);
+
+    if (data != nullptr && !data->errorReported)
+    {
+        data->errorReported = true;
+        data->errorId = errorId;
+    }
+}
+
+/// An object the engine does not serialize itself: a platform object (or
+/// the global object), which is not serializable. HTML: DataCloneError.
+bool WriteClone(JSContext* cx, JSStructuredCloneWriter* w, JS::HandleObject obj,
+                bool* sameProcessScopeRequired, void* closure)
+{
+    (void)w;
+    (void)obj;
+    (void)sameProcessScopeRequired;
+    (void)closure;
+    return ThrowDataCloneError(cx, "The value", "it contains an object that cannot be cloned (a web "
+                               "API object such as an Event or AbortSignal, a MessagePort that is "
+                               "not in the transfer list, the global object, a WeakMap, a Proxy, "
+                               "...).");
+}
+
+JSObject* ReadClone(JSContext* cx, JSStructuredCloneReader* r, const JS::CloneDataPolicy& policy,
+                    uint32_t tag, uint32_t data, void* closure)
+{
+    (void)r;
+    (void)policy;
+    (void)tag;
+    (void)data;
+    (void)closure;
+    ThrowDataCloneError(cx, "The value", "the serialized data is not valid.");
+    return nullptr;
+}
+
+/// A MessagePort of the serializing compartment that is not detached
+/// (WebApis.js decides the latter). The engine has entered its realm.
+bool CanTransferClone(JSContext* cx, JS::HandleObject obj, bool* sameProcessScopeRequired,
+                      void* closure)
+{
+    (void)sameProcessScopeRequired;
+    auto* data = static_cast<CloneData*>(closure);
+
+    if (JS::GetClass(obj) != &kMessagePortClass || data == nullptr ||
+        JS::GetCompartment(obj) != data->compartment)
+    {
+        return false;
+    }
+
+    JS::RootedValueArray<1> argv(cx);
+    argv[0].setObject(*obj);
+    JS::RootedValue result(cx);
+
+    if (!CallProgramInternal(cx, "canTransferPort", argv, &result))
+    {
+        JS_ClearPendingException(cx);
+        return false;
+    }
+
+    return result.isTrue();
+}
+
+/// Detaches a MessagePort (WebApis.js moves its state aside and returns
+/// its index among this serialization's ports).
+bool WriteTransferClone(JSContext* cx, JS::HandleObject obj, void* closure, uint32_t* tag,
+                        JS::TransferableOwnership* ownership, void** content, uint64_t* extraData)
+{
+    (void)closure;
+
+    if (JS::GetClass(obj) != &kMessagePortClass)
+    {
+        return ThrowDataCloneError(cx, "The transfer list", "the object cannot be transferred.");
+    }
+
+    JS::RootedValueArray<1> argv(cx);
+    argv[0].setObject(*obj);
+    JS::RootedValue index(cx);
+
+    if (!CallProgramInternal(cx, "transferPort", argv, &index))
+    {
+        return false;
+    }
+
+    if (!index.isInt32() || index.toInt32() < 0)
+    {
+        return Misuse(cx, "transferPort");
+    }
+
+    *tag = kTransferTagMessagePort;
+    *ownership = JS::SCTAG_TMO_CUSTOM;
+    *content = nullptr;
+    *extraData = static_cast<uint64_t>(index.toInt32());
+    return true;
+}
+
+/// Makes the new MessagePort for a transferred one, in the reading realm.
+bool ReadTransferClone(JSContext* cx, JSStructuredCloneReader* r, const JS::CloneDataPolicy& policy,
+                       uint32_t tag, void* content, uint64_t extraData, void* closure,
+                       JS::MutableHandleObject returnObject)
+{
+    (void)r;
+    (void)policy;
+    (void)content;
+    (void)closure;
+
+    if (tag != kTransferTagMessagePort || extraData > 0x7fffffff)
+    {
+        return false;
+    }
+
+    JS::RootedValueArray<1> argv(cx);
+    argv[0].setInt32(static_cast<int32_t>(extraData));
+    JS::RootedValue port(cx);
+
+    if (!CallProgramInternal(cx, "adoptPort", argv, &port))
+    {
+        return false;
+    }
+
+    if (!port.isObject() || JS::GetClass(&port.toObject()) != &kMessagePortClass)
+    {
+        return Misuse(cx, "adoptPort");
+    }
+
+    returnObject.set(&port.toObject());
+    return true;
+}
+
+/// A serialized MessagePort that is never read needs nothing from C++: its
+/// state is in WebApis.js, which drops it with the message.
+void FreeTransferClone(uint32_t tag, JS::TransferableOwnership ownership, void* content,
+                       uint64_t extraData, void* closure)
+{
+    (void)tag;
+    (void)ownership;
+    (void)content;
+    (void)extraData;
+    (void)closure;
+}
+
+const JSStructuredCloneCallbacks kCloneCallbacks = {
+    ReadClone,           // read
+    WriteClone,          // write
+    ReportCloneError,    // reportError
+    ReadTransferClone,   // readTransfer
+    WriteTransferClone,  // writeTransfer
+    FreeTransferClone,   // freeTransfer
+    CanTransferClone,    // canTransfer
+    nullptr,             // sabCloned (SharedArrayBuffer is disabled)
+};
+
+/// createPlatformObject(proto, kind): a new platform object (kind 0) or
+/// MessagePort (kind 1) whose prototype is `proto`.
+bool NativeCreatePlatformObject(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    if (args.length() < 2 || !args[0].isObject() || !args[1].isInt32())
+    {
+        return Misuse(cx, "createPlatformObject");
+    }
+
+    JS::RootedObject proto(cx, &args[0].toObject());
+    const JSClass* clasp = args[1].toInt32() == 1 ? &kMessagePortClass : &kPlatformObjectClass;
+    JSObject* obj = JS_NewObjectWithGivenProto(cx, clasp, proto);
+
+    if (!obj)
+    {
+        return false;
+    }
+
+    args.rval().setObject(*obj);
+    return true;
+}
+
+/// serialize(value, transfer, where): StructuredSerializeWithTransfer in
+/// the current realm. `transfer` is a null-prototype list (WebApis.js
+/// converted the sequence). Returns the serialized data's handle; throws a
+/// DataCloneError (or whatever a getter of the value threw).
+bool NativeSerialize(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    if (args.length() < 3 || !args[1].isObject() || !args[2].isString())
+    {
+        return Misuse(cx, "serialize");
+    }
+
+    JS::RootedString whereStr(cx, args[2].toString());
+    JS::UniqueChars where = JS_EncodeStringToUTF8(cx, whereStr);
+
+    if (!where)
+    {
+        return false;
+    }
+
+    // The transfer list as a dense array the engine reads with GetElement.
+    JS::RootedObject list(cx, &args[1].toObject());
+    JS::RootedValue lengthValue(cx);
+
+    if (!GetOwnData(cx, list, "length", &lengthValue) || !lengthValue.isInt32() ||
+        lengthValue.toInt32() < 0)
+    {
+        return Misuse(cx, "serialize");
+    }
+
+    const uint32_t length = static_cast<uint32_t>(lengthValue.toInt32());
+    JS::RootedValueVector items(cx);
+    JS::RootedValue item(cx);
+
+    for (uint32_t i = 0; i < length; ++i)
+    {
+        JS::RootedId id(cx, JS::PropertyKey::Int(static_cast<int32_t>(i)));
+        JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(cx);
+
+        if (!JS_GetOwnPropertyDescriptorById(cx, list, id, &desc))
+        {
+            return false;
+        }
+
+        item = desc.isSome() && desc->isDataDescriptor() ? desc->value() : JS::UndefinedValue();
+
+        if (!items.append(item))
+        {
+            JS_ReportOutOfMemory(cx);
+            return false;
+        }
+    }
+
+    JS::RootedObject transferArray(cx, JS::NewArrayObject(cx, items));
+
+    if (!transferArray)
+    {
+        return false;
+    }
+
+    CloneData* data = js_new<CloneData>(&kCloneCallbacks);
+
+    if (!data)
+    {
+        JS_ReportOutOfMemory(cx);
+        return false;
+    }
+
+    JS::RootedObject handle(cx, JS_NewObjectWithGivenProto(cx, &kCloneDataClass, nullptr));
+
+    if (!handle)
+    {
+        js_delete(data);
+        return false;
+    }
+
+    JS::SetReservedSlot(handle, 0, JS::PrivateValue(data));
+    data->compartment = JS::GetCompartment(JS::CurrentGlobalOrNull(cx));
+    JS::RootedValue transfer(cx, JS::ObjectValue(*transferArray));
+
+    if (!data->buffer.write(cx, args[0], transfer, JS::CloneDataPolicy(), &kCloneCallbacks, data))
+    {
+        if (!JS_IsExceptionPending(cx) && data->errorReported)
+        {
+            return ThrowDataCloneError(cx, where.get(), CloneErrorText(data->errorId));
+        }
+
+        return false;
+    }
+
+    args.rval().setObject(*handle);
+    return true;
+}
+
+/// deserialize(handle, where): StructuredDeserializeWithTransfer in the
+/// current realm. A handle can be read once.
+bool NativeDeserialize(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    CloneData* data = args.length() >= 2 && args[0].isObject() && args[1].isString()
+                          ? CloneDataOf(&args[0].toObject())
+                          : nullptr;
+
+    if (data == nullptr || data->read)
+    {
+        return Misuse(cx, "deserialize");
+    }
+
+    JS::RootedString whereStr(cx, args[1].toString());
+    JS::UniqueChars where = JS_EncodeStringToUTF8(cx, whereStr);
+
+    if (!where)
+    {
+        return false;
+    }
+
+    data->read = true;
+    data->errorReported = false;
+
+    if (!data->buffer.read(cx, args.rval(), JS::CloneDataPolicy(), &kCloneCallbacks, data))
+    {
+        if (!JS_IsExceptionPending(cx) && data->errorReported)
+        {
+            return ThrowDataCloneError(cx, where.get(), CloneErrorText(data->errorId));
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+/// queueTask(callback): runs `callback` as a task of the event loop (after
+/// the current task and its microtasks), in the current realm. It keeps
+/// the program running until it has run (HostQueueTask).
+bool NativeQueueTask(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    if (args.length() < 1 || !args[0].isObject() || !JS::IsCallable(&args[0].toObject()))
+    {
+        return Misuse(cx, "queueTask");
+    }
+
+    JS::RootedObject callback(cx, &args[0].toObject());
+
+    if (!HostQueueTask(cx, callback))
+    {
+        return false;
+    }
+
+    args.rval().setUndefined();
+    return true;
+}
+
 const JSFunctionSpec kNatives[] = {
     JS_FN("makeError", NativeMakeError, 3, 0),
     JS_FN("forward", NativeForward, 4, 0),
@@ -960,6 +1443,11 @@ const JSFunctionSpec kNatives[] = {
     JS_FN("now", NativeNow, 0, 0),
     JS_FN("reportException", NativeReportException, 2, 0),
     JS_FN("scheduleTimeout", NativeScheduleTimeout, 2, 0),
+    // Phase 10.4
+    JS_FN("createPlatformObject", NativeCreatePlatformObject, 2, 0),
+    JS_FN("serialize", NativeSerialize, 3, 0),
+    JS_FN("deserialize", NativeDeserialize, 2, 0),
+    JS_FN("queueTask", NativeQueueTask, 1, 0),
     JS_FS_END,
 };
 
