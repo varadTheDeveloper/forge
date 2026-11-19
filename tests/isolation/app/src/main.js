@@ -127,6 +127,29 @@ await new Promise((resolve) => setTimeout(resolve, 20));
 log("web package rejection reaches the program: " + seenRejections.join());
 log("web package global saw: " + webby.packageSawRejections());
 
+// Phase 10.3: abort signals across compartments. A signal of one
+// compartment removes listeners of, and is followed by AbortSignal.any in,
+// the other, both ways.
+const appController = new AbortController();
+const pingPackage = webby.listenUntil(appController.signal);
+const pingsBefore = pingPackage();
+const packageFollower = webby.follow(appController.signal);
+appController.abort("app reason");
+log("web app signal removes a package listener: " + pingsBefore + " " + pingPackage());
+log("web package follows an app signal: " + packageFollower());
+log("web aborted app signal in a package: " + webby.alreadyAborted(AbortSignal.abort("early")));
+const packageController = webby.makeController();
+const appDependent = AbortSignal.any([packageController.signal]);
+let appSaw = "";
+appDependent.onabort = () => { appSaw = String(appDependent.reason); };
+const appTarget = new EventTarget();
+let appPings = 0;
+appTarget.addEventListener("ping", () => { appPings++; }, { signal: packageController.signal });
+packageController.abort("package reason");
+appTarget.dispatchEvent(new Event("ping"));
+log("web app follows a package signal: " + appDependent.aborted + " " + appSaw + " " + appPings);
+log("web package rejects a non-signal: " + webby.badSignal());
+
 // Timers and microtasks belong to the realm that made them.
 let appTimerRan = false;
 const appTimer = setTimeout(() => { appTimerRan = true; }, 20);
