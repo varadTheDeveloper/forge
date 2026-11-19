@@ -330,7 +330,10 @@ const WEB = ["atob", "btoa", "TextEncoder.encode", "TextEncoder.encodeInto", "Te
              "new PromiseRejectionEvent",
              // Phase 10.3
              "AbortSignal.abort", "AbortSignal.timeout", "AbortSignal.any",
-             "AbortSignal.throwIfAborted", "AbortController.abort", "new AbortController"];
+             "AbortSignal.throwIfAborted", "AbortController.abort", "new AbortController",
+             // Phase 10.4
+             "structuredClone", "MessagePort.postMessage", "MessagePort.start", "MessagePort.close",
+             "new MessageChannel", "new MessageEvent"];
 natives.push({ name: "atob", fn: atob, self: globalThis });
 natives.push({ name: "btoa", fn: btoa, self: globalThis });
 natives.push({ name: "TextEncoder.encode", fn: TextEncoder.prototype.encode, self: webEncoder });
@@ -371,6 +374,20 @@ for (const controller of webControllers) {
   natives.push({ name: "AbortController.abort", fn: AbortController.prototype.abort, self: controller });
 }
 natives.push({ name: "new AbortController", fn() { return new AbortController(); }, self: undefined });
+// Phase 10.4: structured clone and ports (some started, so messages are
+// delivered to the fuzzer's listeners while it runs).
+const webChannels = [new MessageChannel(), new MessageChannel()];
+const webPorts = [webChannels[0].port1, webChannels[0].port2, webChannels[1].port1, webChannels[1].port2];
+webChannels[0].port2.onmessage = () => {};
+webChannels[1].port2.start();
+natives.push({ name: "structuredClone", fn: structuredClone, self: globalThis });
+for (const port of webPorts) {
+  for (const method of ["postMessage", "start", "close"]) {
+    natives.push({ name: `MessagePort.${method}`, fn: MessagePort.prototype[method], self: port });
+  }
+}
+natives.push({ name: "new MessageChannel", fn() { return new MessageChannel(); }, self: undefined });
+natives.push({ name: "new MessageEvent", fn(...a) { return new MessageEvent(...a); }, self: undefined });
 
 // These may run script code by design (CallSites.md): print converts with
 // ToString and the timer functions convert the delay or id with ToNumber;
@@ -433,6 +450,14 @@ function argumentsFor(native) {
             chance(0.5) ? pick([true, false, { once: true }, { capture: true }, { passive: true },
                                 { signal: pick(webSignals) }, { signal: anyValue(true) }])
                         : anyValue(true)];
+  }
+
+  if (name === "structuredClone" || name === "MessagePort.postMessage") {
+    const value = chance(0.5) ? anyValue(true) : { nested: [anyValue(true), new Map([[1, anyValue(true)]])] };
+    const transfer = chance(0.6) ? undefined
+      : pick([[new ArrayBuffer(4)], { transfer: [new ArrayBuffer(2)] }, [pick(webPorts)],
+              { transfer: [new MessageChannel().port1] }, [anyValue(true)], anyValue(true)]);
+    return transfer === undefined ? [value] : [value, transfer];
   }
 
   if (name === "AbortSignal.any") {

@@ -313,6 +313,11 @@ $cases = @(
              "web aborted app signal in a package: 0 early",
              "web app follows a package signal: true package reason 0",
              "web package rejects a non-signal: TypeError",
+             "webby messaging: function function true 3",
+             'web package posts to an app port: {"from":"webby","list":[1,2]}',
+             'web app posts to a package listener: {"from":"app"}',
+             "web transfer of a package port: DataCloneError",
+             'web package clones app data: cloned {"a":[1,{"b":2}]} | DataCloneError',
              "isolation done");
      Not = @("SHOULD NOT", "[Proxy]") },
   @{ Name = "permissions (9.4)"; File = (Join-Path $gApp "src\main.js"); Exit = 0;
@@ -367,6 +372,12 @@ $cases = @(
      Has = @("abort done:", " 0 failed"); Not = @("ABORT FAIL", "Uncaught") },
   @{ Name = "timeout signal unref (10.3)"; File = "web-abort-unref.js"; Exit = 0; MaxSeconds = 20;
      Has = @("unref start", "ordinary timer ran"); Not = @("SHOULD NOT", "Uncaught") },
+  @{ Name = "structured clone (10.4)"; File = "web-clone.js"; Exit = 0;
+     Has = @("clone done:", " 0 failed"); Not = @("CLONE FAIL", "Uncaught") },
+  @{ Name = "messaging (10.4)"; File = "web-messaging.js"; Exit = 0;
+     Has = @("messaging done:", " 0 failed"); Not = @("MESSAGING FAIL", "Uncaught") },
+  @{ Name = "idle ports (10.4)"; File = "web-messaging-idle.js"; Exit = 0; MaxSeconds = 20;
+     Has = @("idle start", "delivered: last"); Not = @("SHOULD NOT", "Uncaught") },
   @{ Name = "web uncaught (10.1)"; File = "web-uncaught.js"; Exit = 1;
      Has = @("before", "web-uncaught.js:6:", "InvalidCharacterError: atob: the string is not correctly encoded base64.",
              "thrower@");
