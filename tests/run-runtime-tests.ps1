@@ -150,6 +150,8 @@ $cases = @(
   @{ File = "set-timeout-no-delay.js";   Exit = 0; Has = @("fired");                                Not = @() },
   @{ File = "event-order.js";            Exit = 0; Has = @("order: sync,promise,micro1,micro2,timer"); Not = @() },
   @{ File = "timer-order.js";            Exit = 0; Has = @("timer order: 123 abc"); Not = @() },
+  @{ File = "microtask-checkpoint.js";   Exit = 0; Has = @("timers: t1,m1,ur,t2,m2", "io before timer: io,t3");
+     Not = @("Uncaught"); Pre = @("--allow-read=$kGranted"); Args = @($kGranted) },
   @{ File = "handled-rejection.js";      Exit = 0; Has = @("caught: handled");                      Not = @("Uncaught") },
   @{ File = "uncaught-throw.js";         Exit = 1; Has = @("boom from main script", "inner");       Not = @("SHOULD NOT RUN") },
   @{ File = "uncaught-in-timer.js";      Exit = 1; Has = @("boom from timer");                      Not = @("SHOULD NOT RUN") },
