@@ -114,3 +114,30 @@ export function badSignal() {
     return e.name;
   }
 }
+
+// Phase 10.4: structuredClone and messaging inside a package, and ports of
+// another compartment (the program's) used from here.
+log("messaging: " + [typeof structuredClone, typeof MessageChannel, Object.isFrozen(MessagePort.prototype),
+                     structuredClone({ deep: [1, new Map([[2, 3]])] }).deep[1].get(2)].join(" "));
+
+export function postTo(port, value) {
+  port.postMessage(value);
+}
+
+export function listenOn(port) {
+  const seen = [];
+  port.onmessage = (e) => seen.push(JSON.stringify(e.data));
+  return () => seen.join(" ");
+}
+
+export function makeChannel() {
+  return new MessageChannel();
+}
+
+export function cloneHere(value) {
+  try {
+    return "cloned " + JSON.stringify(structuredClone(value));
+  } catch (e) {
+    return e.name;
+  }
+}
