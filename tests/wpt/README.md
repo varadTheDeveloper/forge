@@ -32,4 +32,5 @@ PHASE10_DESIGN.md section 4.
 | Phase | WPT files recorded |
 |---|---|
 | 10.3 | `dom/abort/` (all of it) and `dom/events/AddEventListenerOptions-signal.any.js` |
+| 10.4 | `webmessaging/*.any.js`, `webmessaging/message-channels/` (all of it) and `html/webappapis/structured-clone/` (all of it) |
 | 10.1, 10.2 | Transcribed before this record existed (`tests/web-apis.js`, `tests/web-events.js`); to be added |

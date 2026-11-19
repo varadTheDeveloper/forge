@@ -2,7 +2,9 @@
   "_comment": "Decision D29: which WPT subtests Forge's own tests cover. Forge never runs WPT code; tools/wpt-coverage.py checks this record.",
   "wpt_commit": "89b51d6635a1bb333d65bd022dc2b57b4befdc8a",
   "tracked_directories": [
-    "dom/abort"
+    "dom/abort",
+    "webmessaging/message-channels",
+    "html/webappapis/structured-clone"
   ],
   "not_yet_recorded": "The WPT cases transcribed in Phases 10.1 and 10.2 (tests/web-apis.js, tests/web-events.js) predate this record and are to be added to it.",
   "files": {
@@ -112,6 +114,556 @@
         "Aborting from a nested listener should remove it": "Aborting from a nested listener should remove it",
         "Passing null as the signal should throw": "Passing null as the signal should throw",
         "Passing null as the signal should throw (listener is also null)": "Passing null as the signal should throw"
+      }
+    },
+    "webmessaging/Channel_postMessage_Blob.any.js": {
+      "sha1": "1968cd8424b0c9d1a03fe5f249c1e2e50212081d",
+      "not_applicable": "Needs Blob, which arrives in Phase 10.7; then this file is to be transcribed."
+    },
+    "webmessaging/Channel_postMessage_DataCloneErr.any.js": {
+      "sha1": "a8f354be8bfeb94bce4425668a8e17d78c667cad",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "var description = (\")((?:\\\\.|[^\"\\\\])*)\""
+      ],
+      "subtests": {
+        "Throw a DataCloneError when a host object (e.g. a DOM node) is used with postMessage.": "Throw a DataCloneError when a host object (e.g. a DOM node) is used with postMessage."
+      }
+    },
+    "webmessaging/Channel_postMessage_clone_port.any.js": {
+      "sha1": "d87a37e29307a630e38e56fe8121bb46b7894bb4",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "var description = (\")((?:\\\\.|[^\"\\\\])*)\""
+      ],
+      "subtests": {
+        "Test Description: When the user agent is to clone a port original port, with ": "When the user agent is to clone a port original port, with the clone being owned by owner, it must return a new MessagePort object"
+      }
+    },
+    "webmessaging/Channel_postMessage_clone_port_error.any.js": {
+      "sha1": "aa96b052a13e1cba21e87499f720623106bc4bbe",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "var description = (\")((?:\\\\.|[^\"\\\\])*)\""
+      ],
+      "subtests": {
+        "Test Description: Throw a DataCloneError if transfer array in postMessage contains source port.": "Throw a DataCloneError if transfer array in postMessage contains source port."
+      }
+    },
+    "webmessaging/Channel_postMessage_event_properties.any.js": {
+      "sha1": "3e69ff69e20f6b920796e33da260669581de8573",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "var description = (\")((?:\\\\.|[^\"\\\\])*)\""
+      ],
+      "subtests": {
+        "The postMessage() method - Create an event that uses the MessageEvent interface, ": "The postMessage() method - Create an event that uses the MessageEvent interface, with the name message, which does not bubble and is not cancelable."
+      }
+    },
+    "webmessaging/Channel_postMessage_ports_readonly_array.any.js": {
+      "sha1": "2a577fde3921aa59bb02ea2507573f9ab0e7f1c7",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "var description = (\")((?:\\\\.|[^\"\\\\])*)\""
+      ],
+      "subtests": {
+        "The postMessage() method - Make new ports into a read only array.": "The postMessage() method - Make new ports into a read only array."
+      }
+    },
+    "webmessaging/Channel_postMessage_target_source.any.js": {
+      "sha1": "0b98693205ce1348a3da13d1e065aa7d4d284b05",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "var description = (\")((?:\\\\.|[^\"\\\\])*)\""
+      ],
+      "subtests": {
+        "The postMessage() method - Let target port be the port with which source ": "The postMessage() method - Let target port be the port with which source port is entangled, if any."
+      }
+    },
+    "webmessaging/Channel_postMessage_transfer_target_port.any.js": {
+      "sha1": "c01a978f8300de8f86a28591aae752b83d993893",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "Transferring the entangled target port does not throw": "Transferring the entangled target port does not throw",
+        "Transferring the entangled target port detaches it": "Transferring the entangled target port detaches it",
+        "Transferring the entangled target port via StructuredSerializeOptions detaches it": "Transferring the entangled target port via StructuredSerializeOptions detaches it"
+      }
+    },
+    "webmessaging/Channel_postMessage_with_transfer_entangled.any.js": {
+      "sha1": "defbd81e1b3d629a0eda1c5e1238e4832f8221f5",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "An entangled port transferred to the same origin receives messages in order": "An entangled port transferred to the same origin receives messages in order"
+      }
+    },
+    "webmessaging/Channel_postMessage_with_transfer_incoming_messages.any.js": {
+      "sha1": "1a2578d6c58416bd7143094fd8816a9fadb6e650",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "When transferring a non-enabled port mutiple times,\n    incoming messages sent at various transfer steps are received in order upon enablement.": "When transferring a non-enabled port mutiple times, incoming messages sent at various transfer steps are received in order upon enablement."
+      }
+    },
+    "webmessaging/Channel_postMessage_with_transfer_outgoing_messages.any.js": {
+      "sha1": "e3c2dcd66925ae074d162693679ed6cacdeffffc",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "When transferring a port,\n    outgoing messages sent at each transfer step are received in order by the entangled port.": "When transferring a port, outgoing messages sent at each transfer step are received in order by the entangled port."
+      }
+    },
+    "webmessaging/MessageEvent-trusted.any.js": {
+      "sha1": "259d9625e0c7da9091f706cf77fb5e58612fc2fc",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "With a MessageChannel and its MessagePorts": "With a MessageChannel and its MessagePorts",
+        "With a BroadcastChannel": {
+          "not_applicable": "BroadcastChannel and Worker are not part of Forge (or of the WinterTC Minimum Common API)."
+        }
+      }
+    },
+    "webmessaging/MessageEvent.any.js": {
+      "sha1": "bd39a4af57d23671318c3b6e7713fbd00437a6f4",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "\\}, name \\+ (\")( on the \\w+)\"\\)",
+        "(?m)^\\}\\s*,\\s*(\")((?:\\\\.|[^\"\\\\])*)\"\\s*\\)"
+      ],
+      "expand": {
+        " on the prototype": [
+          "mozInitMessageEvent on the prototype",
+          "msInitMessageEvent on the prototype",
+          "oInitMessageEvent on the prototype",
+          "webkitInitMessageEvent on the prototype"
+        ],
+        " on the instance": [
+          "mozInitMessageEvent on the instance",
+          "msInitMessageEvent on the instance",
+          "oInitMessageEvent on the instance",
+          "webkitInitMessageEvent on the instance"
+        ]
+      },
+      "subtests": {
+        "mozInitMessageEvent on the prototype": "mozInitMessageEvent on the prototype",
+        "mozInitMessageEvent on the instance": "mozInitMessageEvent on the instance",
+        "msInitMessageEvent on the prototype": "msInitMessageEvent on the prototype",
+        "msInitMessageEvent on the instance": "msInitMessageEvent on the instance",
+        "oInitMessageEvent on the prototype": "oInitMessageEvent on the prototype",
+        "oInitMessageEvent on the instance": "oInitMessageEvent on the instance",
+        "webkitInitMessageEvent on the prototype": "webkitInitMessageEvent on the prototype",
+        "webkitInitMessageEvent on the instance": "webkitInitMessageEvent on the instance",
+        "initMessageEvent with no arguments": "initMessageEvent with no arguments"
+      }
+    },
+    "webmessaging/MessagePort_initial_disabled.any.js": {
+      "sha1": "c149022ea765490de97347b9202b22f778550209",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "// META: title=()([^\\n]*)"
+      ],
+      "subtests": {
+        "MessageChannel: port message queue is initially disabled": "MessageChannel: port message queue is initially disabled"
+      }
+    },
+    "webmessaging/MessagePort_onmessage_start.any.js": {
+      "sha1": "bca4c52da759c087b55a8764b65fd11ba8627b3a",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "// META: title=()([^\\n]*)"
+      ],
+      "subtests": {
+        "MessageChannel: port.onmessage enables message queue": "MessageChannel: port.onmessage enables message queue"
+      }
+    },
+    "webmessaging/message-channels/basics.any.js": {
+      "sha1": "02d41da85d7d7333642da8669a44a4c2c9fab4c2",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "// META: title=()([^\\n]*)"
+      ],
+      "subtests": {
+        "basic messagechannel test": "basic messagechannel test"
+      }
+    },
+    "webmessaging/message-channels/close.any.js": {
+      "sha1": "a1e857141d19a67c2b368f1556cf5a76dceeb6d2",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "Message sent to closed port should not arrive.": "Message sent to closed port should not arrive.",
+        "Message sent from closed port should not arrive.": "Message sent from closed port should not arrive.",
+        "Message sent to closed port from transferred port should not arrive.": "Message sent to closed port from transferred port should not arrive.",
+        "Inflight messages should be delivered even when sending port is closed afterwards.": "Inflight messages should be delivered even when sending port is closed afterwards.",
+        "Close in onmessage should not cancel inflight messages.": "Close in onmessage should not cancel inflight messages.",
+        "close() detaches a MessagePort (but not the one its entangled with)": "close() detaches a MessagePort (but not the one its entangled with)"
+      }
+    },
+    "webmessaging/message-channels/cross-document.html": {
+      "sha1": "01af34e08f469e7afef71ec204780938d85eab24",
+      "not_applicable": "Needs iframes (two documents)."
+    },
+    "webmessaging/message-channels/detached-iframe.window.js": {
+      "sha1": "88a736774ea62a0c91df04d2da213332bb4121b0",
+      "not_applicable": "Needs an iframe that is detached."
+    },
+    "webmessaging/message-channels/dictionary-transferrable.any.js": {
+      "sha1": "e4561304c289ff941283044391c041335a202b43",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "// META: title=()([^\\n]*)"
+      ],
+      "subtests": {
+        "basic messagechannel with transfer": "basic messagechannel with transfer"
+      }
+    },
+    "webmessaging/message-channels/historical.any.js": {
+      "sha1": "d7b295be78217957b9ac802ce74b1e0ef554cdff",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "MessagePort should not have an onclose event handler IDL attribute": "MessagePort should not have an onclose event handler IDL attribute",
+        "No close event should be fired when an entangled port is closed": "No close event should be fired when an entangled port is closed",
+        "No close event should be fired on a port when it is closed": "No close event should be fired on a port when it is closed"
+      }
+    },
+    "webmessaging/message-channels/implied-start.any.js": {
+      "sha1": "58949794418262d5a9a46719f2950faf1d2218df",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "// META: title=()([^\\n]*)"
+      ],
+      "subtests": {
+        "onmessage implied start()": "onmessage implied start()"
+      }
+    },
+    "webmessaging/message-channels/messageerror-listener-gc.html": {
+      "sha1": "b908c8088e62881275a2a5fcc86c5868382c3017",
+      "not_applicable": "Needs a document and the browser's garbage-collection test hook."
+    },
+    "webmessaging/message-channels/no-start.any.js": {
+      "sha1": "ec1039fb9ab7836db31ee87812e65b98b54cb1cd",
+      "forge": "tests/web-messaging.js",
+      "name_patterns": [
+        "// META: title=()([^\\n]*)"
+      ],
+      "subtests": {
+        "without start()": "without start()"
+      }
+    },
+    "webmessaging/message-channels/resources/cross-document-1.html": {
+      "sha1": "36e20f27eb9adbbde09e39208a7ccd938734703e",
+      "not_applicable": "A helper file of the browser-only tests above."
+    },
+    "webmessaging/message-channels/resources/cross-document-2.html": {
+      "sha1": "cc10359e48adc9f27123e1ffeb14878e63d9ead4",
+      "not_applicable": "A helper file of the browser-only tests above."
+    },
+    "webmessaging/message-channels/resources/post-wasm-module-sharedworker.js": {
+      "sha1": "3eb29aa60430e95b060bd6f5073e83b75fa88ea1",
+      "not_applicable": "A helper file of the browser-only tests above."
+    },
+    "webmessaging/message-channels/transfer-from-closed-port.any.js": {
+      "sha1": "0409bd9b6a86534981549cebc265187bd1410c40",
+      "forge": "tests/web-messaging.js",
+      "subtests": {
+        "Transferring a port from a closed port detaches it (transfer sequence)": "Transferring a port from a closed port detaches it (transfer sequence)",
+        "Transferring a port from a closed port detaches it (StructuredSerializeOptions)": "Transferring a port from a closed port detaches it (StructuredSerializeOptions)",
+        "Transferring both ports of a channel from a closed port detaches both": "Transferring both ports of a channel from a closed port detaches both",
+        "Transferring a port and an ArrayBuffer from a closed port detaches both": "Transferring a port and an ArrayBuffer from a closed port detaches both",
+        "Transferring the formerly entangled port from a closed port detaches it": "Transferring the formerly entangled port from a closed port detaches it"
+      }
+    },
+    "webmessaging/message-channels/user-activation.tentative.any.js": {
+      "sha1": "1ad23e6dab05b0402221172f9f3cb7cad12a2791",
+      "not_applicable": "User activation (a tentative browser feature); Forge has none."
+    },
+    "webmessaging/message-channels/worker-post-after-close.any.js": {
+      "sha1": "0b79d488c247222657f2a1064b9fa38b791bc7d6",
+      "not_applicable": "Needs Worker, which Forge does not have."
+    },
+    "webmessaging/message-channels/worker.any.js": {
+      "sha1": "ae81bfaec7a01a10db647ac88595e4ec6d7d2f10",
+      "not_applicable": "Needs Worker, which Forge does not have."
+    },
+    "html/webappapis/structured-clone/structured-clone.any.js": {
+      "sha1": "5be3d66f8efd64304b28d94da09893ec3eceea8d",
+      "forge": "tests/web-clone.js",
+      "subtests": {},
+      "note": "Runs the battery files below with structuredClone(); their subtests are recorded there."
+    },
+    "html/webappapis/structured-clone/structured-clone-battery-of-tests-harness.js": {
+      "sha1": "eac5b76a0a0b7eb3d290350e2229f573315d1964",
+      "forge": "tests/web-clone.js",
+      "subtests": {},
+      "note": "The battery's runner; no subtests of its own."
+    },
+    "html/webappapis/structured-clone/structured-clone-cross-realm-method.html": {
+      "sha1": "222e95511a4d721279843ced161832e16a3ea514",
+      "not_applicable": "Needs iframes (another global's structuredClone)."
+    },
+    "html/webappapis/structured-clone/structured-clone-detached-window-crash.html": {
+      "sha1": "3a0f1257addb19f1f4b9d01e30260ca3613a773e",
+      "not_applicable": "A browser crash test with a detached window."
+    },
+    "html/webappapis/structured-clone/structured-clone-battery-of-tests.js": {
+      "sha1": "b7e181c8ee0b6082fee30d7f8a1caac9c88fad94",
+      "forge": "tests/web-clone.js",
+      "name_patterns": [
+        "check\\(\\s*(['\\\"`])((?:\\\\.|(?!\\1).)*)\\1",
+        "description:\\s*(['\\\"`])((?:\\\\.|(?!\\1).)*)\\1"
+      ],
+      "expand": {
+        "${constructor.name} object": [
+          "Error object",
+          "EvalError object",
+          "RangeError object",
+          "ReferenceError object",
+          "SyntaxError object",
+          "TypeError object",
+          "URIError object"
+        ]
+      },
+      "subtests": {
+        "primitive undefined": "primitive undefined",
+        "primitive null": "primitive null",
+        "primitive true": "primitive true",
+        "primitive false": "primitive false",
+        "primitive string, empty string": "primitive string, empty string",
+        "primitive string, lone high surrogate": "primitive string, lone high surrogate",
+        "primitive string, lone low surrogate": "primitive string, lone low surrogate",
+        "primitive string, NUL": "primitive string, NUL",
+        "primitive string, astral character": "primitive string, astral character",
+        "primitive number, 0.2": "primitive number, 0.2",
+        "primitive number, 0": "primitive number, 0",
+        "primitive number, -0": "primitive number, -0",
+        "primitive number, NaN": "primitive number, NaN",
+        "primitive number, Infinity": "primitive number, Infinity",
+        "primitive number, -Infinity": "primitive number, -Infinity",
+        "primitive number, 9007199254740992": "primitive number, 9007199254740992",
+        "primitive number, -9007199254740992": "primitive number, -9007199254740992",
+        "primitive number, 9007199254740994": "primitive number, 9007199254740994",
+        "primitive number, -9007199254740994": "primitive number, -9007199254740994",
+        "primitive BigInt, 0n": "primitive BigInt, 0n",
+        "primitive BigInt, -0n": "primitive BigInt, -0n",
+        "primitive BigInt, -9007199254740994000n": "primitive BigInt, -9007199254740994000n",
+        "primitive BigInt, -9007199254740994000900719925474099400090071992547409940009007199254740994000n": "primitive BigInt, -9007199254740994000900719925474099400090071992547409940009007199254740994000n",
+        "Array primitives": "Array primitives",
+        "Object primitives": "Object primitives",
+        "Boolean true": "Boolean true",
+        "Boolean false": "Boolean false",
+        "Array Boolean objects": "Array Boolean objects",
+        "Object Boolean objects": "Object Boolean objects",
+        "String empty string": "String empty string",
+        "String lone high surrogate": "String lone high surrogate",
+        "String lone low surrogate": "String lone low surrogate",
+        "String NUL": "String NUL",
+        "String astral character": "String astral character",
+        "Array String objects": "Array String objects",
+        "Object String objects": "Object String objects",
+        "Number 0.2": "Number 0.2",
+        "Number 0": "Number 0",
+        "Number -0": "Number -0",
+        "Number NaN": "Number NaN",
+        "Number Infinity": "Number Infinity",
+        "Number -Infinity": "Number -Infinity",
+        "Number 9007199254740992": "Number 9007199254740992",
+        "Number -9007199254740992": "Number -9007199254740992",
+        "Number 9007199254740994": "Number 9007199254740994",
+        "Number -9007199254740994": "Number -9007199254740994",
+        "BigInt -9007199254740994n": "BigInt -9007199254740994n",
+        "Array Number objects": "Array Number objects",
+        "Object Number objects": "Object Number objects",
+        "Date 0": "Date 0",
+        "Date -0": "Date -0",
+        "Date -8.64e15": "Date -8.64e15",
+        "Date 8.64e15": "Date 8.64e15",
+        "Array Date objects": "Array Date objects",
+        "Object Date objects": "Object Date objects",
+        "RegExp flags and lastIndex": "RegExp flags and lastIndex",
+        "RegExp sticky flag": "RegExp sticky flag",
+        "RegExp unicode flag": "RegExp unicode flag",
+        "RegExp empty": "RegExp empty",
+        "RegExp slash": "RegExp slash",
+        "RegExp new line": "RegExp new line",
+        "Array RegExp object, RegExp flags and lastIndex": "Array RegExp object, RegExp flags and lastIndex",
+        "Array RegExp object, RegExp sticky flag": "Array RegExp object, RegExp sticky flag",
+        "Array RegExp object, RegExp unicode flag": "Array RegExp object, RegExp unicode flag",
+        "Array RegExp object, RegExp empty": "Array RegExp object, RegExp empty",
+        "Array RegExp object, RegExp slash": "Array RegExp object, RegExp slash",
+        "Array RegExp object, RegExp new line": "Array RegExp object, RegExp new line",
+        "Object RegExp object, RegExp flags and lastIndex": "Object RegExp object, RegExp flags and lastIndex",
+        "Object RegExp object, RegExp sticky flag": "Object RegExp object, RegExp sticky flag",
+        "Object RegExp object, RegExp unicode flag": "Object RegExp object, RegExp unicode flag",
+        "Object RegExp object, RegExp empty": "Object RegExp object, RegExp empty",
+        "Object RegExp object, RegExp slash": "Object RegExp object, RegExp slash",
+        "Object RegExp object, RegExp new line": "Object RegExp object, RegExp new line",
+        "Empty Error object": "Empty Error object",
+        "Blob basic": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Blob unpaired high surrogate (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Blob unpaired low surrogate (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Blob paired surrogates (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Blob empty": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Blob NUL": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, Blob basic": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, Blob unpaired high surrogate (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, Blob unpaired low surrogate (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, Blob paired surrogates (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, Blob empty": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, Blob NUL": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Array Blob object, two Blobs": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Object Blob object, Blob basic": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Object Blob object, Blob unpaired high surrogate (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Object Blob object, Blob unpaired low surrogate (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Object Blob object, Blob paired surrogates (invalid utf-8)": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Object Blob object, Blob empty": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "Object Blob object, Blob NUL": {
+          "not_applicable": "Needs Blob, which arrives in Phase 10.7."
+        },
+        "File basic": {
+          "not_applicable": "Needs File, which arrives in Phase 10.7."
+        },
+        "FileList empty": {
+          "not_applicable": "Needs a document (FileList)."
+        },
+        "Array FileList object, FileList empty": {
+          "not_applicable": "Needs a document (FileList)."
+        },
+        "Object FileList object, FileList empty": {
+          "not_applicable": "Needs a document (FileList)."
+        },
+        "ImageData 1x1 transparent black": {
+          "not_applicable": "Needs a document (ImageData)."
+        },
+        "ImageData 1x1 non-transparent non-black": {
+          "not_applicable": "Needs a document (ImageData)."
+        },
+        "Array ImageData object, ImageData 1x1 transparent black": {
+          "not_applicable": "Needs a document (ImageData)."
+        },
+        "Array ImageData object, ImageData 1x1 non-transparent non-black": {
+          "not_applicable": "Needs a document (ImageData)."
+        },
+        "Object ImageData object, ImageData 1x1 transparent black": {
+          "not_applicable": "Needs a document (ImageData)."
+        },
+        "Object ImageData object, ImageData 1x1 non-transparent non-black": {
+          "not_applicable": "Needs a document (ImageData)."
+        },
+        "Array sparse": "Array sparse",
+        "Array with non-index property": "Array with non-index property",
+        "Object with index property and length": "Object with index property and length",
+        "Array with circular reference": "Array with circular reference",
+        "Object with circular reference": "Object with circular reference",
+        "Array with identical property values": "Array with identical property values",
+        "Object with identical property values": "Object with identical property values",
+        "Object with property on prototype": "Object with property on prototype",
+        "Object with non-enumerable property": "Object with non-enumerable property",
+        "Object with non-writable property": "Object with non-writable property",
+        "Object with non-configurable property": "Object with non-configurable property",
+        "ObjectPrototype must lose its exotic-ness when cloned": "ObjectPrototype must lose its exotic-ness when cloned",
+        "A subclass instance will deserialize as its closest serializable superclass": {
+          "not_applicable": "Uses a subclass of File, which arrives in Phase 10.7."
+        },
+        "Resizable ArrayBuffer": "Resizable ArrayBuffer",
+        "Length-tracking TypedArray": "Length-tracking TypedArray",
+        "Length-tracking DataView": "Length-tracking DataView",
+        "Object with a getter that throws": "Object with a getter that throws",
+        "ImageBitmap 1x1 transparent black": {
+          "not_applicable": "Needs a document and createImageBitmap."
+        },
+        "ImageBitmap 1x1 non-transparent non-black": {
+          "not_applicable": "Needs a document and createImageBitmap."
+        },
+        "Array ImageBitmap object, ImageBitmap 1x1 transparent black": {
+          "not_applicable": "Needs a document and createImageBitmap."
+        },
+        "Array ImageBitmap object, ImageBitmap 1x1 transparent non-black": {
+          "not_applicable": "Needs a document and createImageBitmap."
+        },
+        "Object ImageBitmap object, ImageBitmap 1x1 transparent black": {
+          "not_applicable": "Needs a document and createImageBitmap."
+        },
+        "Object ImageBitmap object, ImageBitmap 1x1 transparent non-black": {
+          "not_applicable": "Needs a document and createImageBitmap."
+        },
+        "Serializing a non-serializable platform object fails": "Serializing a non-serializable platform object fails",
+        "An object whose interface is deleted from the global must still deserialize": {
+          "not_applicable": "Uses Blob, which arrives in Phase 10.7 (the transferable variant, with MessagePort, is covered)."
+        },
+        "Growable SharedArrayBuffer": {
+          "not_applicable": "SharedArrayBuffer is disabled in Forge (no cross-origin isolation)."
+        },
+        "Serializing OOB TypedArray throws": "Serializing OOB TypedArray throws",
+        "Serializing OOB DataView throws": "Serializing OOB DataView throws",
+        "Error object": "Error object",
+        "EvalError object": "EvalError object",
+        "RangeError object": "RangeError object",
+        "ReferenceError object": "ReferenceError object",
+        "SyntaxError object": "SyntaxError object",
+        "TypeError object": "TypeError object",
+        "URIError object": "URIError object"
+      }
+    },
+    "html/webappapis/structured-clone/structured-clone-battery-of-tests-with-transferables.js": {
+      "sha1": "09d7c3a918a881a954128fea790e6e76cd262ac1",
+      "forge": "tests/web-clone.js",
+      "name_patterns": [
+        "check\\(\\s*(['\\\"`])((?:\\\\.|(?!\\1).)*)\\1",
+        "description:\\s*(['\\\"`])((?:\\\\.|(?!\\1).)*)\\1"
+      ],
+      "subtests": {
+        "ArrayBuffer": "ArrayBuffer",
+        "MessagePort": "MessagePort",
+        "ImageBitmap": {
+          "not_applicable": "Needs OffscreenCanvas and createImageBitmap."
+        },
+        "OffscreenCanvas": {
+          "not_applicable": "Needs OffscreenCanvas."
+        },
+        "A subclass instance will be received as its closest transferable superclass": {
+          "not_applicable": "Uses ReadableStream, which arrives with Streams in Phase 10.8."
+        },
+        "A detached ArrayBuffer cannot be transferred": "A detached ArrayBuffer cannot be transferred",
+        "A detached platform object cannot be transferred": "A detached platform object cannot be transferred",
+        "Transferring a non-transferable platform object fails": "Transferring a non-transferable platform object fails",
+        "An object whose interface is deleted from the global object must still be received": "An object whose interface is deleted from the global object must still be received",
+        "Resizable ArrayBuffer is transferable": "Resizable ArrayBuffer is transferable",
+        "Length-tracking TypedArray is transferable": "Length-tracking TypedArray is transferable",
+        "Length-tracking DataView is transferable": "Length-tracking DataView is transferable",
+        "Transferring OOB TypedArray throws": "Transferring OOB TypedArray throws",
+        "Transferring OOB DataView throws": "Transferring OOB DataView throws"
       }
     }
   }
