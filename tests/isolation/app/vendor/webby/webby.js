@@ -69,3 +69,48 @@ export function makeTarget() {
 export function fire(target, type) {
   return target.dispatchEvent(new Event(type));
 }
+
+// Phase 10.3: abort signals inside a package, and signals of another
+// compartment (the program's) used with this package's own objects.
+log("abort: " + [typeof AbortController, typeof AbortSignal, Object.isFrozen(AbortSignal.prototype),
+                 Object.isFrozen(AbortSignal), AbortSignal.abort("p").reason].join(" "));
+
+export function makeController() {
+  return new AbortController();
+}
+
+// A listener on a package EventTarget, removed by `signal`.
+export function listenUntil(signal) {
+  const target = new EventTarget();
+  let count = 0;
+  target.addEventListener("ping", () => { count++; }, { signal });
+  return () => {
+    target.dispatchEvent(new Event("ping"));
+    return count;
+  };
+}
+
+// A package signal that follows `signal`.
+export function follow(signal) {
+  const dependent = AbortSignal.any([signal]);
+  const seen = [];
+  dependent.onabort = () => { seen.push(String(dependent.reason)); };
+  return () => dependent.aborted + " " + seen.join();
+}
+
+export function alreadyAborted(signal) {
+  const target = new EventTarget();
+  let count = 0;
+  target.addEventListener("ping", () => { count++; }, { signal });
+  target.dispatchEvent(new Event("ping"));
+  return count + " " + AbortSignal.any([signal]).reason;
+}
+
+export function badSignal() {
+  try {
+    new EventTarget().addEventListener("ping", () => {}, { signal: new EventTarget() });
+    return "SHOULD NOT ACCEPT";
+  } catch (e) {
+    return e.name;
+  }
+}
