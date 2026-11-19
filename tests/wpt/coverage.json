@@ -1,0 +1,118 @@
+{
+  "_comment": "Decision D29: which WPT subtests Forge's own tests cover. Forge never runs WPT code; tools/wpt-coverage.py checks this record.",
+  "wpt_commit": "89b51d6635a1bb333d65bd022dc2b57b4befdc8a",
+  "tracked_directories": [
+    "dom/abort"
+  ],
+  "not_yet_recorded": "The WPT cases transcribed in Phases 10.1 and 10.2 (tests/web-apis.js, tests/web-events.js) predate this record and are to be added to it.",
+  "files": {
+    "dom/abort/AbortSignal.any.js": {
+      "sha1": "08350b05a07dd048a1362bacddc8efcd2fb40c7d",
+      "forge": "tests/web-abort.js",
+      "subtests": {
+        "the AbortSignal.abort() static returns an already aborted signal": "AbortSignal.abort()",
+        "signal returned by AbortSignal.abort() should not fire abort event": "signal returned by AbortSignal.abort() should not fire abort event"
+      }
+    },
+    "dom/abort/event.any.js": {
+      "sha1": "96bd6a583db79049c2f5c9571dd25aa157e60f6f",
+      "forge": "tests/web-abort.js",
+      "subtests": {
+        "AbortController abort() should fire event synchronously": "AbortController abort() should fire event synchronously",
+        "controller.signal should always return the same object": "controller.signal should always return the same object",
+        "controller.abort() should do nothing the second time it is called": "controller.abort() should do nothing the second time it is called",
+        "event handler should not be called if added after controller.abort()": "event handler should not be called if added after controller.abort()",
+        "the abort event should have the right properties": "the abort event should have the right properties",
+        "AbortController abort(reason) should set signal.reason": "abort(reason) sets signal.reason; undefined is the default, null is a reason",
+        "aborting AbortController without reason creates an \"AbortError\" DOMException": "AbortController abort() should fire event synchronously",
+        "AbortController abort(undefined) creates an \"AbortError\" DOMException": "abort(reason) sets signal.reason; undefined is the default, null is a reason",
+        "AbortController abort(null) should set signal.reason": "abort(reason) sets signal.reason; undefined is the default, null is a reason",
+        "static aborting signal should have right properties": "AbortSignal.abort()",
+        "static aborting signal with reason should set signal.reason": "AbortSignal.abort()",
+        "throwIfAborted() should throw abort.reason if signal aborted": "throwIfAborted()",
+        "throwIfAborted() should throw primitive abort.reason if signal aborted": "throwIfAborted()",
+        "throwIfAborted() should not throw if signal not aborted": "throwIfAborted()",
+        "AbortSignal.reason returns the same DOMException": "AbortSignal.abort()",
+        "AbortController.signal.reason returns the same DOMException": "AbortController abort() should fire event synchronously"
+      }
+    },
+    "dom/abort/abort-signal-any.any.js": {
+      "sha1": "ac2acb1eb27f3799e71a902387daa82360c03668",
+      "forge": "tests/web-abort.js",
+      "subtests": {},
+      "note": "Calls the functions of resources/abort-signal-any-tests.js; its subtests are recorded there."
+    },
+    "dom/abort/resources/abort-signal-any-tests.js": {
+      "sha1": "8054c7683a1f86bd8d8e18a2441e33999983eef5",
+      "forge": "tests/web-abort.js",
+      "substitutions": {
+        "desc": "AbortSignal.any()",
+        "suffix": "(using AbortController)"
+      },
+      "subtests": {
+        "AbortSignal.any() works with an empty array of signals": "AbortSignal.any() works with an empty array of signals",
+        "AbortSignal.any() follows a single signal (using AbortController)": "AbortSignal.any() follows a single signal",
+        "AbortSignal.any() follows multiple signals (using AbortController)": "AbortSignal.any() follows multiple signals",
+        "AbortSignal.any() returns an aborted signal if passed an aborted signal (using AbortController)": "AbortSignal.any() returns an aborted signal if passed an aborted signal",
+        "AbortSignal.any() can be passed the same signal more than once (using AbortController)": "AbortSignal.any() can be passed the same signal more than once",
+        "AbortSignal.any() uses the first instance of a duplicate signal (using AbortController)": "AbortSignal.any() uses the first instance of a duplicate signal",
+        "AbortSignal.any() signals are composable (using AbortController)": "AbortSignal.any() signals are composable",
+        "AbortSignal.any() works with signals returned by AbortSignal.timeout() (using AbortController)": "AbortSignal.any() works with signals returned by AbortSignal.timeout()",
+        "AbortSignal.any() works with intermediate signals (using AbortController)": "AbortSignal.any() works with intermediate signals",
+        "Abort events for AbortSignal.any() signals fire in the right order (using AbortController)": "Abort events for AbortSignal.any() signals fire in the right order",
+        "Dependent signals for AbortSignal.any() are marked aborted before abort events fire (using AbortController)": "Dependent signals are marked aborted before abort events fire",
+        "Dependent signals for AbortSignal.any() are aborted correctly for reentrant aborts (using AbortController)": "Dependent signals are aborted correctly for reentrant aborts",
+        "Dependent signals for AbortSignal.any() should use the same DOMException instance from the already aborted source signal (using AbortController)": "Dependent signals use the same DOMException instance as their source",
+        "Dependent signals for AbortSignal.any() should use the same DOMException instance from the source signal being aborted later (using AbortController)": "Dependent signals use the same DOMException instance as their source"
+      }
+    },
+    "dom/abort/timeout.any.js": {
+      "sha1": "d1514d7e4abeddf27914507f963a401a224d0135",
+      "forge": "tests/web-abort.js",
+      "subtests": {
+        "AbortSignal.timeout() returns a non-aborted signal": "AbortSignal.timeout() returns a non-aborted signal",
+        "Signal returned by AbortSignal.timeout() times out": "Signal returned by AbortSignal.timeout() times out",
+        "AbortSignal timeouts fire in order": "AbortSignal timeouts fire in order"
+      }
+    },
+    "dom/abort/abort-signal-any-crash.html": {
+      "sha1": "dbec5e4dd32a11bd46a4d0294e51a6559d0bcce2",
+      "not_applicable": "A browser crash test that needs a garbage-collection hook (AbortSignal.any() of a dependent whose source was collected). Forge handles the case by skipping a source whose WeakRef is empty (runtime/WebApis.js, AbortSignal.any)."
+    },
+    "dom/abort/abort-signal-timeout.html": {
+      "sha1": "da4282e4cbe2f58cfedc3c04c4c2ff741541a2a4",
+      "not_applicable": "Needs an iframe that is detached; Forge has no frames."
+    },
+    "dom/abort/reason-constructor.html": {
+      "sha1": "fa5e949fbda0af2c389dc17301c2345ec29f57a1",
+      "not_applicable": "Needs an iframe (a second global); Forge's package compartments map DOMException as an intrinsic instead (PHASE10_DESIGN.md section 2)."
+    },
+    "dom/abort/crashtests/any-on-abort.html": {
+      "sha1": "85c35c91b58ceb79d5ea6671554cff80577ea5ad",
+      "forge": "tests/web-abort.js",
+      "subtests": {},
+      "note": "A crash test with no subtests: AbortSignal.any() of an aborted dependent inside a source's abort listener. Covered by the check 'Dependent signals are marked aborted before abort events fire'."
+    },
+    "dom/abort/crashtests/timeout-close.html": {
+      "sha1": "53baf52de887cb8f44101a637640895fd3f95483",
+      "not_applicable": "Needs an iframe, navigation and synchronous XMLHttpRequest; Forge has none of them."
+    },
+    "dom/events/AddEventListenerOptions-signal.any.js": {
+      "sha1": "e66bd826ddb1ca68c073c0dabf5b4ff7443f6c3e",
+      "forge": "tests/web-abort.js",
+      "subtests": {
+        "Passing an AbortSignal to addEventListener options should allow removing a listener": "Passing an AbortSignal to addEventListener options should allow removing a listener",
+        "Passing an AbortSignal to addEventListener does not prevent removeEventListener": "Passing an AbortSignal to addEventListener does not prevent removeEventListener",
+        "Passing an AbortSignal to addEventListener works with the once flag": "Passing an AbortSignal to addEventListener works with the once flag",
+        "Removing a once listener works with a passed signal": "Removing a once listener works with a passed signal",
+        "Passing an AbortSignal to multiple listeners": "Passing an AbortSignal to multiple listeners",
+        "Passing an AbortSignal to addEventListener works with the capture flag": "Passing an AbortSignal to addEventListener works with the capture flag",
+        "Aborting from a listener does not call future listeners": "Aborting from a listener does not call future listeners",
+        "Adding then aborting a listener in another listener does not call it": "Adding then aborting a listener in another listener does not call it",
+        "Aborting from a nested listener should remove it": "Aborting from a nested listener should remove it",
+        "Passing null as the signal should throw": "Passing null as the signal should throw",
+        "Passing null as the signal should throw (listener is also null)": "Passing null as the signal should throw"
+      }
+    }
+  }
+}
