@@ -130,7 +130,11 @@ bool OpAllows(
     X(OnUnhandledRejection, "onunhandledrejection", None)        \
     X(OnRejectionHandled, "onrejectionhandled", None)            \
     X(AbortController, "AbortController", None)                  \
-    X(AbortSignal, "AbortSignal", None)
+    X(AbortSignal, "AbortSignal", None)                          \
+    X(MessageChannel, "MessageChannel", None)                    \
+    X(MessageEvent, "MessageEvent", None)                        \
+    X(MessagePort, "MessagePort", None)                          \
+    X(StructuredClone, "structuredClone", None)
 
 enum class Op : uint16_t
 {
