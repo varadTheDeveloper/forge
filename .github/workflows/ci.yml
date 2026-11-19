@@ -82,6 +82,9 @@ jobs:
             cp "$f" "$RUNNER_TEMP/check.mjs"
             node --check "$RUNNER_TEMP/check.mjs" || { echo "syntax error in $f"; exit 1; }
           done
+      # Phase 10.3 (D29): the WPT coverage record names only checks that exist.
+      - name: Check the WPT coverage record (tests/wpt/coverage.json)
+        run: python3 tools/wpt-coverage.py --check
 
   forge-core-windows-msvc:
     runs-on: windows-2022
