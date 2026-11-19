@@ -53,6 +53,22 @@ void wasAborted;
 controller.signal.throwIfAborted();
 // @ts-expect-error  AbortSignal has no constructor
 new AbortSignal();
+// Phase 10.4: structuredClone and messaging.
+const copy: { n: number } = structuredClone({ n: 1 });
+const moved = new ArrayBuffer(8);
+structuredClone(moved, { transfer: [moved] });
+const channel = new MessageChannel();
+channel.port2.onmessage = (ev: MessageEvent) => { const d: unknown = ev.data; void d; void ev.ports[0]; };
+channel.port2.addEventListener("message", (ev) => { void ev.data; });
+channel.port1.postMessage({ copy }, [moved]);
+channel.port1.postMessage("x", { transfer: [] });
+channel.port1.start();
+channel.port1.close();
+const made: MessageEvent<string> = new MessageEvent("message", { data: "d", ports: [channel.port1] });
+void made.source;
+// @ts-expect-error  MessagePort has no constructor
+new MessagePort();
+
 // @ts-expect-error  the signal option takes an AbortSignal
 target.addEventListener("x", () => {}, { signal: controller });
 // @ts-expect-error  PromiseRejectionEvent needs its dictionary
