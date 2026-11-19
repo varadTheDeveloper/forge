@@ -60,6 +60,9 @@ const char* const kWebApiGlobalNames[] = {
     "onunhandledrejection",
     "reportError",
     "self",
+    // Phase 10.3
+    "AbortController",
+    "AbortSignal",
 };
 
 const forge::core::Size kWebApiGlobalCount = sizeof(kWebApiGlobalNames) / sizeof(kWebApiGlobalNames[0]);
@@ -919,6 +922,30 @@ bool NativeReportException(JSContext* cx, unsigned argc, JS::Value* vp)
     return true;
 }
 
+/// scheduleTimeout(callback, milliseconds): AbortSignal.timeout's timer
+/// (HostScheduleInternalTimer). `milliseconds` is an integer from 0 to
+/// 2^53 - 1, already converted by the script.
+bool NativeScheduleTimeout(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    if (args.length() < 2 || !args[0].isObject() || !JS::IsCallable(&args[0].toObject()) ||
+        !args[1].isNumber())
+    {
+        return Misuse(cx, "scheduleTimeout");
+    }
+
+    JS::RootedObject callback(cx, &args[0].toObject());
+
+    if (!HostScheduleInternalTimer(cx, callback, args[1].toNumber()))
+    {
+        return false;
+    }
+
+    args.rval().setUndefined();
+    return true;
+}
+
 const JSFunctionSpec kNatives[] = {
     JS_FN("makeError", NativeMakeError, 3, 0),
     JS_FN("forward", NativeForward, 4, 0),
@@ -932,6 +959,7 @@ const JSFunctionSpec kNatives[] = {
     JS_FN("btoa", NativeBtoa, 1, 0),
     JS_FN("now", NativeNow, 0, 0),
     JS_FN("reportException", NativeReportException, 2, 0),
+    JS_FN("scheduleTimeout", NativeScheduleTimeout, 2, 0),
     JS_FS_END,
 };
 

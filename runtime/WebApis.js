@@ -66,6 +66,11 @@
   const WeakSetAdd = uncurryThis(WeakSet.prototype.add);
   const WeakSetHas = uncurryThis(WeakSet.prototype.has);
   const WeakSetDelete = uncurryThis(WeakSet.prototype.delete);
+  // Phase 10.3
+  const MathTrunc = Math.trunc;
+  const SymbolIterator = Symbol.iterator;
+  const WeakRefCtor = WeakRef;
+  const WeakRefDeref = uncurryThis(WeakRef.prototype.deref);
 
   const {
     makeError,
@@ -80,6 +85,7 @@
     btoa: nativeBtoa,
     now,
     reportException,
+    scheduleTimeout,
   } = natives;
 
   // makeError kinds. The stack of an error made by makeError starts at the
@@ -163,6 +169,19 @@
 
       if (desc.set !== undefined) {
         members[`${name}.${key}=`] = desc.set;
+      }
+    }
+
+    // Static operations are enumerable too (AbortSignal.abort, ...).
+    const statics = ObjectGetOwnPropertyNames(ctor);
+
+    for (let i = 0; i < statics.length; i++) {
+      const key = statics[i];
+
+      if (key !== 'length' && key !== 'name' && key !== 'prototype') {
+        const desc = ObjectGetOwnPropertyDescriptor(ctor, key);
+        desc.enumerable = true;
+        ObjectDefineProperty(ctor, key, desc);
       }
     }
 
@@ -498,6 +517,9 @@
   // An ErrorEvent's [message, filename, lineno, colno, error], or
   // undefined. Set by ErrorEvent's static block.
   let errorEventFields;
+  // An AbortSignal's internal record, or undefined if `value` is not an
+  // AbortSignal of this realm. Set by AbortSignal's static block (10.3).
+  let signalStateOf;
 
   function setCanceled(state) {
     if (state.cancelable && !state.inPassiveListener) {
@@ -917,7 +939,7 @@
   // (capture) or a dictionary, read in WebIDL order: capture, then once,
   // passive and signal.
   function flattenOptions(options, add, where) {
-    const flat = { __proto__: null, capture: false, once: false, passive: false };
+    const flat = { __proto__: null, capture: false, once: false, passive: false, signal: undefined };
 
     if (options === undefined || options === null) {
       return flat;
@@ -935,9 +957,16 @@
       const passive = options.passive;
       flat.passive = passive === undefined ? false : !!passive;
 
-      // AbortSignal arrives in Phase 10.3; until then no value is one.
-      if (options.signal !== undefined) {
-        throw typeError(`${where}: the 'signal' option is not an AbortSignal.`);
+      const signal = options.signal;
+
+      // `AbortSignal signal` is not nullable: null is a TypeError too. A
+      // signal of another compartment is accepted (signalStatus).
+      if (signal !== undefined) {
+        if (signalStatus(signal) === kNotASignal) {
+          throw typeError(`${where}: the 'signal' option is not an AbortSignal.`);
+        }
+
+        flat.signal = signal;
       }
     }
 
@@ -950,7 +979,9 @@
     return WeakMapGet(eventTargets, target);
   }
 
-  function addListener(map, type, callback, flat) {
+  // Appends a listener to `target`'s list (`map`) and returns its record,
+  // or returns undefined if an equal one is already there.
+  function addListener(target, map, type, callback, flat) {
     let list = MapGet(map, type);
 
     if (list === undefined) {
@@ -960,11 +991,11 @@
 
     for (let i = 0; i < list.length; i++) {
       if (list[i].callback === callback && list[i].capture === flat.capture) {
-        return;
+        return undefined;
       }
     }
 
-    listAppend(list, {
+    const listener = {
       __proto__: null,
       type,
       callback,
@@ -972,15 +1003,22 @@
       once: flat.once,
       passive: flat.passive,
       removed: false,
-    });
+    };
+
+    listAppend(list, listener);
+    listenersChanged(target, type);
+    return listener;
   }
 
-  function removeListener(map, listener) {
+  // The DOM "remove an event listener" steps. Removing a listener that is
+  // no longer in the list does nothing more.
+  function removeListener(target, map, listener) {
     const list = MapGet(map, listener.type);
     listener.removed = true;
 
     if (list !== undefined) {
       MapSet(map, listener.type, listCopy(list, listener));
+      listenersChanged(target, listener.type);
     }
   }
 
@@ -1028,7 +1066,7 @@
       }
 
       if (listener.once) {
-        removeListener(map, listener);
+        removeListener(target, map, listener);
       }
 
       if (listener.passive) {
@@ -1082,8 +1120,18 @@
       callback = toListener(callback, 'EventTarget.addEventListener');
       const flat = flattenOptions(options, true, 'EventTarget.addEventListener');
 
-      if (callback !== null) {
-        addListener(map, type, callback, flat);
+      // The DOM "add an event listener" steps: nothing is added with a
+      // signal that is already aborted; aborting it later removes the
+      // listener.
+      if ((flat.signal !== undefined && signalStatus(flat.signal) === kSignalAborted) ||
+          callback === null) {
+        return;
+      }
+
+      const listener = addListener(self, map, type, callback, flat);
+
+      if (listener !== undefined && flat.signal !== undefined) {
+        signalFollow(flat.signal, () => removeListener(self, map, listener), listener);
       }
     }
 
@@ -1103,7 +1151,7 @@
 
       for (let i = 0; list !== undefined && i < list.length; i++) {
         if (list[i].callback === callback && list[i].capture === flat.capture) {
-          removeListener(map, list[i]);
+          removeListener(self, map, list[i]);
           return;
         }
       }
@@ -1144,27 +1192,38 @@
   // The global object's attributes (HTML Standard), Phase 10.2
   // ------------------------------------------------------------------
 
-  // Event handlers (onerror, onunhandledrejection, onrejectionhandled).
-  // Setting one to an object adds a listener the first time; setting it to
-  // anything else removes that listener (the HTML "event handler" rules).
-  const handlerValues = { __proto__: null, error: null, unhandledrejection: null, rejectionhandled: null };
-  const handlerListeners = { __proto__: null };
+  // Event handler attributes (the HTML "event handler" rules), for any
+  // target: the global object's onerror, onunhandledrejection and
+  // onrejectionhandled, and AbortSignal's onabort (10.3). Setting one to an
+  // object adds a listener the first time; setting it to anything else
+  // removes that listener. Setting it again keeps the listener's place.
+  //
+  // target -> null-prototype { type -> { value, listener } }
+  const eventHandlers = new WeakMapCtor();
+  const handlerOptions = { __proto__: null, capture: false, once: false, passive: false, signal: undefined };
 
-  function runEventHandler(name, event) {
-    const callback = handlerValues[name];
+  function getEventHandler(target, type) {
+    const handlers = WeakMapGet(eventHandlers, target);
+    const handler = handlers === undefined ? undefined : handlers[type];
+    return handler === undefined ? null : handler.value;
+  }
+
+  // The HTML "event handler processing algorithm". `special`: the global
+  // object's onerror (OnErrorEventHandler), which gets five arguments and
+  // cancels the event by returning true.
+  function runEventHandler(handler, special, event) {
+    const callback = handler.value;
 
     if (callback === null) {
       return;
     }
 
     const state = eventStateOf(event);
-    const fields = name === 'error' ? errorEventFields(event) : undefined;
+    const fields = special ? errorEventFields(event) : undefined;
 
     // A non-callable object makes ReflectApply throw a TypeError, which
     // callListener reports like any listener's exception.
     if (fields !== undefined && state.type === 'error') {
-      // OnErrorEventHandler: (message, source, lineno, colno, error); true
-      // cancels the event.
       if (ReflectApply(callback, state.currentTarget, fields) === true) {
         setCanceled(state);
       }
@@ -1173,32 +1232,48 @@
     }
   }
 
-  function setEventHandler(name, value) {
+  function setEventHandler(target, type, value) {
     const callback = isObject(value) ? value : null;
-    handlerValues[name] = callback;
-    const map = targetListeners(global);
-    const listener = handlerListeners[name];
+    let handlers = WeakMapGet(eventHandlers, target);
+
+    if (handlers === undefined) {
+      if (callback === null) {
+        return;
+      }
+
+      handlers = { __proto__: null };
+      WeakMapSet(eventHandlers, target, handlers);
+    }
+
+    let handler = handlers[type];
+
+    if (handler === undefined) {
+      if (callback === null) {
+        return;
+      }
+
+      handler = { __proto__: null, value: null, listener: undefined };
+      handlers[type] = handler;
+    }
+
+    handler.value = callback;
+    const map = targetListeners(target);
 
     if (callback === null) {
-      if (listener !== undefined) {
-        handlerListeners[name] = undefined;
-        const list = MapGet(map, name);
-
-        for (let i = 0; list !== undefined && i < list.length; i++) {
-          if (list[i].callback === listener) {
-            removeListener(map, list[i]);
-            break;
-          }
-        }
+      if (handler.listener !== undefined) {
+        const listener = handler.listener;
+        handler.listener = undefined;
+        removeListener(target, map, listener);
       }
 
       return;
     }
 
-    if (listener === undefined) {
-      const added = (event) => runEventHandler(name, event);
-      handlerListeners[name] = added;
-      addListener(map, name, added, { __proto__: null, capture: false, once: false, passive: false });
+    if (handler.listener === undefined) {
+      const special = type === 'error' && target === global;
+      handler.listener = addListener(target, map, type,
+                                     (event) => runEventHandler(handler, special, event),
+                                     handlerOptions);
     }
   }
 
@@ -1242,27 +1317,27 @@
     },
     get onerror() {
       checkGlobal(this);
-      return handlerValues.error;
+      return getEventHandler(global, 'error');
     },
     set onerror(value) {
       checkGlobal(this);
-      setEventHandler('error', value);
+      setEventHandler(global, 'error', value);
     },
     get onunhandledrejection() {
       checkGlobal(this);
-      return handlerValues.unhandledrejection;
+      return getEventHandler(global, 'unhandledrejection');
     },
     set onunhandledrejection(value) {
       checkGlobal(this);
-      setEventHandler('unhandledrejection', value);
+      setEventHandler(global, 'unhandledrejection', value);
     },
     get onrejectionhandled() {
       checkGlobal(this);
-      return handlerValues.rejectionhandled;
+      return getEventHandler(global, 'rejectionhandled');
     },
     set onrejectionhandled(value) {
       checkGlobal(this);
-      setEventHandler('rejectionhandled', value);
+      setEventHandler(global, 'rejectionhandled', value);
     },
   };
 
@@ -1290,9 +1365,529 @@
   });
 
   // ------------------------------------------------------------------
+  // AbortController and AbortSignal (DOM Standard), Phase 10.3
+  // ------------------------------------------------------------------
+
+  // signalStatus results.
+  const kNotASignal = 0;
+  const kSignalNotAborted = 1;
+  const kSignalAborted = 2;
+
+  const noArguments = { __proto__: null, length: 0 };
+
+  // Calls a hidden member ("AbortSignal.~status" and so on, below) of the
+  // compartment that owns `signal`, a wrapper of an object of another
+  // compartment. Undefined if `signal` is not such a wrapper.
+  function foreignSignalCall(member, signal, args) {
+    const box = { __proto__: null, value: undefined };
+    return forward(`AbortSignal.~${member}`, signal, args, box) ? box.value : undefined;
+  }
+
+  // kNotASignal, kSignalNotAborted or kSignalAborted. A signal of another
+  // compartment is a signal too: its own compartment answers.
+  function signalStatus(value) {
+    const state = signalStateOf(value);
+
+    if (state !== undefined) {
+      return state.aborted ? kSignalAborted : kSignalNotAborted;
+    }
+
+    const status = foreignSignalCall('status', value, noArguments);
+    return status === kSignalNotAborted || status === kSignalAborted ? status : kNotASignal;
+  }
+
+  // The abort reason of a signal of another compartment that is aborted.
+  function foreignSignalReason(signal) {
+    return foreignSignalCall('reason', signal, noArguments);
+  }
+
+  // The DOM "add" abort steps: `algorithm` runs when `signal` (a signal,
+  // of this compartment or another, that is not aborted) is aborted.
+  // `listener`: the listener record the algorithm removes, if any; an
+  // algorithm whose listener is gone already may be dropped.
+  function signalFollow(signal, algorithm, listener) {
+    const state = signalStateOf(signal);
+
+    if (state !== undefined) {
+      addAlgorithm(state, algorithm, listener);
+    } else {
+      foreignSignalCall('follow', signal, { __proto__: null, length: 1, 0: algorithm });
+    }
+  }
+
+  function addAlgorithm(state, algorithm, listener) {
+    if (state.aborted) {
+      return;
+    }
+
+    let algorithms = state.algorithms;
+
+    // Listeners removed since (removeEventListener, once) leave dead
+    // algorithms behind; drop them now and then, so a long-lived signal
+    // used for many short-lived listeners does not grow without bound.
+    if (algorithms.length >= state.algorithmsPruneAt) {
+      const kept = newList();
+
+      for (let i = 0; i < algorithms.length; i++) {
+        if (algorithms[i].listener === undefined || !algorithms[i].listener.removed) {
+          listAppend(kept, algorithms[i]);
+        }
+      }
+
+      algorithms = kept;
+      state.algorithms = kept;
+      state.algorithmsPruneAt = kept.length * 2 > 32 ? kept.length * 2 : 32;
+    }
+
+    listAppend(algorithms, { __proto__: null, run: algorithm, listener });
+    updateRetention(state);
+  }
+
+  // A dependent signal (AbortSignal.any) is linked to each of its sources
+  // by a record that both hold. The source holds the dependent weakly
+  // (link.ref), except while the dependent has abort listeners or abort
+  // algorithms (link.strong): then it must stay alive as long as a source
+  // that can abort it does (the DOM Standard's garbage collection rules).
+  // The dependent holds a source of this compartment weakly (link.source)
+  // and one of another compartment strongly (link.foreign).
+  function linkTarget(link) {
+    return link.strong !== undefined ? link.strong : WeakRefDeref(link.ref);
+  }
+
+  function updateRetention(state) {
+    if (!state.dependent) {
+      return;
+    }
+
+    const list = MapGet(targetListeners(state.signal), 'abort');
+    const retain = !state.aborted &&
+                   (state.algorithms.length > 0 || (list !== undefined && list.length > 0));
+
+    if (retain === state.retained) {
+      return;
+    }
+
+    state.retained = retain;
+
+    for (let i = 0; i < state.links.length; i++) {
+      state.links[i].strong = retain ? state : undefined;
+    }
+  }
+
+  // Called when `target`'s listeners for `type` changed.
+  function listenersChanged(target, type) {
+    if (type === 'abort') {
+      const state = signalStateOf(target);
+
+      if (state !== undefined) {
+        updateRetention(state);
+      }
+    }
+  }
+
+  function linkLocal(dependent, source) {
+    for (let i = 0; i < dependent.links.length; i++) {
+      const link = dependent.links[i];
+
+      if (link.source !== undefined && WeakRefDeref(link.source) === source) {
+        return;
+      }
+    }
+
+    const link = {
+      __proto__: null,
+      ref: new WeakRefCtor(dependent),
+      strong: undefined,
+      source: new WeakRefCtor(source),
+      foreign: undefined,
+    };
+
+    listAppend(dependent.links, link);
+    let dependents = source.dependents;
+
+    // Drop links to dependents that are gone or aborted now and then.
+    if (dependents.length >= source.dependentsPruneAt) {
+      const kept = newList();
+
+      for (let i = 0; i < dependents.length; i++) {
+        const target = linkTarget(dependents[i]);
+
+        if (target !== undefined && !target.aborted) {
+          listAppend(kept, dependents[i]);
+        }
+      }
+
+      dependents = kept;
+      source.dependents = kept;
+      source.dependentsPruneAt = kept.length * 2 > 32 ? kept.length * 2 : 32;
+    }
+
+    listAppend(dependents, link);
+  }
+
+  // A source of another compartment: its own compartment runs an
+  // algorithm of ours when it aborts (before its own abort event).
+  function linkForeign(dependent, signal) {
+    for (let i = 0; i < dependent.links.length; i++) {
+      if (dependent.links[i].foreign === signal) {
+        return;
+      }
+    }
+
+    const link = {
+      __proto__: null,
+      ref: new WeakRefCtor(dependent),
+      strong: undefined,
+      source: undefined,
+      foreign: signal,
+    };
+
+    listAppend(dependent.links, link);
+    foreignSignalCall('follow', signal, {
+      __proto__: null,
+      length: 1,
+      0: () => {
+        const target = linkTarget(link);
+
+        if (target !== undefined && !target.aborted) {
+          signalAbort(target, foreignSignalReason(signal));
+        }
+      },
+    });
+  }
+
+  // The DOM "signal abort" steps. Every dependent is marked aborted before
+  // any abort event fires.
+  function signalAbort(state, reason) {
+    if (state.aborted) {
+      return;
+    }
+
+    state.aborted = true;
+    state.reason = reason !== undefined
+      ? reason
+      : new DOMException('signal is aborted without reason', 'AbortError');
+    const dependents = state.dependents;
+    state.dependents = newList();
+    const toAbort = newList();
+
+    for (let i = 0; i < dependents.length; i++) {
+      const dependent = linkTarget(dependents[i]);
+
+      if (dependent !== undefined && !dependent.aborted) {
+        dependent.aborted = true;
+        dependent.reason = state.reason;
+        listAppend(toAbort, dependent);
+      }
+    }
+
+    runAbortSteps(state);
+
+    for (let i = 0; i < toAbort.length; i++) {
+      runAbortSteps(toAbort[i]);
+    }
+  }
+
+  // The DOM "run the abort steps": the abort algorithms, then a trusted
+  // "abort" event.
+  function runAbortSteps(state) {
+    const algorithms = state.algorithms;
+    state.algorithms = newList();
+
+    for (let i = 0; i < algorithms.length; i++) {
+      algorithms[i].run();
+    }
+
+    updateRetention(state);
+    const event = new Event('abort');
+    const eventState = eventStateOf(event);
+    eventState.isTrusted = true;
+    dispatch(state.signal, targetListeners(state.signal), event, eventState);
+  }
+
+  // WebIDL [EnforceRange] unsigned long long.
+  function toEnforcedUnsignedLongLong(value, where) {
+    let x = +value;
+
+    if (x !== x || x === Infinity || x === -Infinity) {
+      throw typeError(`${where}: the value is not a finite number.`);
+    }
+
+    x = MathTrunc(x);
+
+    if (x < 0 || x > 9007199254740991) {
+      throw typeError(`${where}: the value is out of range.`);
+    }
+
+    return x === 0 ? 0 : x;
+  }
+
+  // WebIDL sequence<AbortSignal>: any iterable, read with its own
+  // iterator (the WebIDL "create a sequence from an iterable" steps).
+  function toSignalSequence(value, where) {
+    if (!isObject(value)) {
+      throw typeError(`${where}: parameter 1 is not an iterable object.`);
+    }
+
+    const method = value[SymbolIterator];
+
+    if (typeof method !== 'function') {
+      throw typeError(`${where}: parameter 1 is not an iterable object.`);
+    }
+
+    const iterator = ReflectApply(method, value, []);
+
+    if (!isObject(iterator)) {
+      throw typeError(`${where}: the iterator is not an object.`);
+    }
+
+    const next = iterator.next;
+    const items = newList();
+
+    for (;;) {
+      const result = ReflectApply(next, iterator, []);
+
+      if (!isObject(result)) {
+        throw typeError(`${where}: the iterator result is not an object.`);
+      }
+
+      if (result.done) {
+        return items;
+      }
+
+      const item = result.value;
+
+      if (signalStatus(item) === kNotASignal) {
+        throw typeError(`${where}: element ${items.length} is not an AbortSignal.`);
+      }
+
+      listAppend(items, item);
+    }
+  }
+
+  // Only this file can make an AbortSignal: `new AbortSignal()` is a
+  // TypeError, as the standard says.
+  const signalToken = ObjectFreeze({ __proto__: null });
+
+  function createSignal() {
+    return new AbortSignal(signalToken);
+  }
+
+  // Not `extends EventTarget`: `super()` would call whatever the
+  // constructor's prototype is at that moment, which user code can change,
+  // and AbortSignal.timeout and AbortSignal.any must not run user code
+  // there. The prototype chain is set below instead.
+  class AbortSignal {
+    #state;
+
+    static {
+      signalStateOf = (value) => (isObject(value) && #state in value ? value.#state : undefined);
+    }
+
+    constructor(token = undefined) {
+      if (token !== signalToken) {
+        throw typeError('Illegal constructor.');
+      }
+
+      WeakMapSet(eventTargets, this, new MapCtor());
+      this.#state = {
+        __proto__: null,
+        signal: this,
+        aborted: false,
+        reason: undefined,
+        algorithms: newList(),
+        algorithmsPruneAt: 32,
+        // As a source: links to the signals that depend on this one.
+        dependents: newList(),
+        dependentsPruneAt: 32,
+        // As a dependent (AbortSignal.any): links to its sources.
+        dependent: false,
+        links: newList(),
+        retained: false,
+      };
+    }
+
+    static abort(reason = undefined) {
+      const signal = createSignal();
+      signalAbort(signal.#state, reason);
+      return signal;
+    }
+
+    // The timer does not keep the program running (as in Node and Deno).
+    static timeout(milliseconds) {
+      requireArguments(arguments.length, 1, 'AbortSignal.timeout');
+      const delay = toEnforcedUnsignedLongLong(milliseconds, 'AbortSignal.timeout');
+      const signal = createSignal();
+      const state = signal.#state;
+      scheduleTimeout(() => signalAbort(state, new DOMException('signal timed out', 'TimeoutError')),
+                      delay);
+      return signal;
+    }
+
+    // The DOM "create a dependent abort signal" steps.
+    static any(signals) {
+      requireArguments(arguments.length, 1, 'AbortSignal.any');
+      const inputs = toSignalSequence(signals, 'AbortSignal.any');
+      const result = createSignal();
+      const state = result.#state;
+
+      for (let i = 0; i < inputs.length; i++) {
+        const input = signalStateOf(inputs[i]);
+
+        if (input !== undefined ? input.aborted : signalStatus(inputs[i]) === kSignalAborted) {
+          state.aborted = true;
+          state.reason = input !== undefined ? input.reason : foreignSignalReason(inputs[i]);
+          return result;
+        }
+      }
+
+      state.dependent = true;
+
+      for (let i = 0; i < inputs.length; i++) {
+        const input = signalStateOf(inputs[i]);
+
+        if (input === undefined) {
+          linkForeign(state, inputs[i]);
+        } else if (!input.dependent) {
+          linkLocal(state, input);
+        } else {
+          // A dependent's own sources, never the dependent itself.
+          for (let j = 0; j < input.links.length; j++) {
+            const link = input.links[j];
+
+            if (link.foreign !== undefined) {
+              linkForeign(state, link.foreign);
+            } else {
+              const source = WeakRefDeref(link.source);
+
+              if (source !== undefined) {
+                linkLocal(state, source);
+              }
+            }
+          }
+        }
+      }
+
+      return result;
+    }
+
+    get aborted() {
+      const state = signalStateOf(this);
+      return state !== undefined ? state.aborted : notBranded('AbortSignal', 'aborted', this, arguments);
+    }
+
+    get reason() {
+      const state = signalStateOf(this);
+      return state !== undefined ? state.reason : notBranded('AbortSignal', 'reason', this, arguments);
+    }
+
+    throwIfAborted() {
+      const state = signalStateOf(this);
+
+      if (state === undefined) {
+        return notBranded('AbortSignal', 'throwIfAborted', this, arguments);
+      }
+
+      if (state.aborted) {
+        throw state.reason;
+      }
+    }
+
+    get onabort() {
+      return signalStateOf(this) !== undefined ? getEventHandler(this, 'abort')
+                                               : notBranded('AbortSignal', 'onabort', this, arguments);
+    }
+
+    set onabort(value) {
+      if (signalStateOf(this) === undefined) {
+        return notBranded('AbortSignal', 'onabort=', this, arguments);
+      }
+
+      setEventHandler(this, 'abort', value);
+    }
+  }
+
+  ObjectSetPrototypeOf(AbortSignal, EventTarget);
+  ObjectSetPrototypeOf(AbortSignal.prototype, EventTarget.prototype);
+  defineInterface(AbortSignal, 'AbortSignal', undefined);
+
+  // Hidden members, for the same code in another compartment (signalStatus
+  // and the rest, through `forward`). They never throw.
+  members['AbortSignal.~status'] = function () {
+    const state = signalStateOf(this);
+    return state === undefined ? kNotASignal : state.aborted ? kSignalAborted : kSignalNotAborted;
+  };
+
+  members['AbortSignal.~reason'] = function () {
+    const state = signalStateOf(this);
+    return state === undefined ? undefined : state.reason;
+  };
+
+  members['AbortSignal.~follow'] = function (algorithm) {
+    const state = signalStateOf(this);
+
+    if (state !== undefined && typeof algorithm === 'function') {
+      addAlgorithm(state, () => {
+        try {
+          ReflectApply(algorithm, undefined, []);
+        } catch (error) {
+          reportException(error, 0);
+        }
+      }, undefined);
+    }
+  };
+
+  class AbortController {
+    #signal;
+
+    static #is(value) {
+      return isObject(value) && #signal in value;
+    }
+
+    constructor() {
+      this.#signal = createSignal();
+    }
+
+    get signal() {
+      return AbortController.#is(this) ? this.#signal
+                                       : notBranded('AbortController', 'signal', this, arguments);
+    }
+
+    abort(reason = undefined) {
+      if (!AbortController.#is(this)) {
+        return notBranded('AbortController', 'abort', this, arguments);
+      }
+
+      signalAbort(signalStateOf(this.#signal), reason);
+    }
+  }
+
+  defineInterface(AbortController, 'AbortController', undefined);
+
+  // ------------------------------------------------------------------
   // Uncaught errors and rejections, called by C++ (WebApis.cpp) in the
   // program's realm only: packages never see or cancel these events.
   // ------------------------------------------------------------------
+
+  // `new ErrorEvent(...)` calls Event through `super()`, that is through
+  // ErrorEvent's own prototype, which code in this realm can change. Forge's
+  // own events are made with the original parent in place (no user code
+  // runs while it is), so reporting an error never runs user code here.
+  function makeInternalEvent(ctor, type, init) {
+    const parent = ObjectGetPrototypeOf(ctor);
+
+    if (parent === Event) {
+      return new ctor(type, init);
+    }
+
+    ObjectSetPrototypeOf(ctor, Event);
+
+    try {
+      return new ctor(type, init);
+    } finally {
+      ObjectSetPrototypeOf(ctor, parent);
+    }
+  }
 
   function fireTrusted(event) {
     const state = eventStateOf(event);
@@ -1302,7 +1897,7 @@
 
   // Returns true if no listener cancelled it (the error is then fatal).
   internals.dispatchError = (error, message, filename, lineno, colno) => fireTrusted(
-    new ErrorEvent('error', {
+    makeInternalEvent(ErrorEvent, 'error', {
       __proto__: null, cancelable: true, colno, error, filename, lineno, message,
     }));
 
@@ -1312,7 +1907,7 @@
   const outstandingRejections = new WeakSetCtor();
 
   internals.dispatchUnhandledRejection = (promise, reason) => fireTrusted(
-    new PromiseRejectionEvent('unhandledrejection', {
+    makeInternalEvent(PromiseRejectionEvent, 'unhandledrejection', {
       __proto__: null, cancelable: true, promise, reason,
     }));
 
@@ -1323,7 +1918,7 @@
   internals.dispatchRejectionHandled = (promise, reason) => {
     if (WeakSetHas(outstandingRejections, promise)) {
       WeakSetDelete(outstandingRejections, promise);
-      fireTrusted(new PromiseRejectionEvent('rejectionhandled', {
+      fireTrusted(makeInternalEvent(PromiseRejectionEvent, 'rejectionhandled', {
         __proto__: null, promise, reason,
       }));
     }

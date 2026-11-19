@@ -22,6 +22,9 @@
 // "unhandledrejection" event at the PROGRAM's global object (never a
 // package's: a package must not be able to hide another package's errors,
 // D28). It is fatal only if no listener cancels it.
+//
+// Phase 10.3: AbortController and AbortSignal. AbortSignal.timeout uses an
+// internal timer of forge.cpp's (HostScheduleInternalTimer).
 
 #include "js/Class.h"
 #include "js/Exception.h"
@@ -97,6 +100,18 @@ void HostReportUncaught(
     JSContext* cx,
     const JS::ExceptionStack& exception,
     const char* context);
+
+/// Implemented by forge.cpp, which owns the event loop (Phase 10.3, for
+/// AbortSignal.timeout): calls `callback` with no arguments, in the current
+/// realm, once `delayMs` milliseconds have passed. Unlike setTimeout, the
+/// timer does not keep the program running, and script cannot cancel it
+/// (clearTimeout ignores it). Fails (with an exception pending) only if the
+/// timer could not be scheduled.
+[[nodiscard]]
+bool HostScheduleInternalTimer(
+    JSContext* cx,
+    JS::HandleObject callback,
+    double delayMs);
 
 /// For console output (runtime/Inspect.cpp): if `obj`, an object of the
 /// current realm, is a DOMException, sets `*found` and its name and message.
