@@ -547,7 +547,8 @@ declare global {
     once?: boolean;
     /** A passive listener's preventDefault() does nothing. */
     passive?: boolean;
-    // `signal` arrives with AbortSignal (Phase 10.3).
+    /** Aborting it removes the listener; an aborted one adds nothing. */
+    signal?: AbortSignal;
   }
 
   class EventTarget {
@@ -558,6 +559,45 @@ declare global {
                         options?: EventListenerOptions | boolean): void;
     /** False if a listener cancelled the event. */
     dispatchEvent(event: Event): boolean;
+  }
+
+  interface AbortSignalEventMap {
+    abort: Event;
+  }
+
+  /**
+   * Made by AbortController and the static methods; `new AbortSignal()` is
+   * a TypeError. A signal of another package works here too.
+   */
+  class AbortSignal extends EventTarget {
+    private constructor();
+    /** An already aborted signal (reason: an "AbortError" DOMException by default). */
+    static abort(reason?: any): AbortSignal;
+    /**
+     * Aborts with a "TimeoutError" DOMException after `milliseconds` (an
+     * integer from 0 to 2^53 - 1). Its timer does not keep the program
+     * running.
+     */
+    static timeout(milliseconds: number): AbortSignal;
+    /** Aborts as soon as any of `signals` does, with that signal's reason. */
+    static any(signals: Iterable<AbortSignal>): AbortSignal;
+    readonly aborted: boolean;
+    readonly reason: any;
+    /** Throws `reason` if aborted. */
+    throwIfAborted(): void;
+    onabort: ((this: AbortSignal, event: Event) => any) | null;
+    addEventListener<K extends keyof AbortSignalEventMap>(
+      type: K, listener: (this: AbortSignal, event: AbortSignalEventMap[K]) => any,
+      options?: AddEventListenerOptions | boolean): void;
+    addEventListener(type: string, callback: EventListenerOrEventListenerObject | null,
+                     options?: AddEventListenerOptions | boolean): void;
+  }
+
+  class AbortController {
+    constructor();
+    readonly signal: AbortSignal;
+    /** Aborts `signal` (reason: an "AbortError" DOMException by default). */
+    abort(reason?: any): void;
   }
 
   /**
