@@ -150,6 +150,31 @@ appTarget.dispatchEvent(new Event("ping"));
 log("web app follows a package signal: " + appDependent.aborted + " " + appSaw + " " + appPings);
 log("web package rejects a non-signal: " + webby.badSignal());
 
+// Phase 10.4: messaging across compartments. A package posts to the
+// program's port and listens on another; a port of one compartment cannot
+// be transferred by another (a DataCloneError), and a package's
+// structuredClone copies the program's data (through the wrapper, as a
+// direct read would) but never its functions.
+const appChannel = new MessageChannel();
+const appReceived = [];
+appChannel.port2.onmessage = (e) => appReceived.push(JSON.stringify(e.data));
+webby.postTo(appChannel.port1, { from: "webby", list: [1, 2] });
+const toPackage = new MessageChannel();
+const packageSeen = webby.listenOn(toPackage.port2);
+toPackage.port1.postMessage({ from: "app" });
+await new Promise((resolve) => setTimeout(resolve, 20));
+log("web package posts to an app port: " + appReceived.join(" "));
+log("web app posts to a package listener: " + packageSeen());
+const packageChannel = webby.makeChannel();
+try {
+  appChannel.port1.postMessage("x", [packageChannel.port1]);
+  log("SHOULD NOT TRANSFER a package port");
+} catch (e) {
+  log("web transfer of a package port: " + e.name);
+}
+log("web package clones app data: " + webby.cloneHere({ a: [1, { b: 2 }] }) + " | " +
+  webby.cloneHere({ f() {} }));
+
 // Timers and microtasks belong to the realm that made them.
 let appTimerRan = false;
 const appTimer = setTimeout(() => { appTimerRan = true; }, 20);
