@@ -33,10 +33,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RECORD = os.path.join(ROOT, "tests", "wpt", "coverage.json")
 
 # A testharness subtest: test(...), async_test(...) or promise_test(...)
-# ends with `}, "name");` (the name may use ' " or `, with escapes).
+# ends with `}, "name");` (the name may use ' " or `, with escapes). A file
+# can list other patterns ("name_patterns": group 1 the quote, group 2 the
+# name), for example the structured clone battery's check('name', ...).
 UPSTREAM_NAME = re.compile(r"\}\s*,\s*([\"'`])((?:\\.|(?!\1)[^\\])*)\1\s*\)")
-# A Forge check: test("name", ...) or asyncTest("name", ...).
-FORGE_NAME = re.compile(r"\b(?:test|asyncTest)\(\s*\"((?:\\.|[^\"\\])*)\"")
+# A Forge check's name: any double-quoted string literal of the Forge test
+# file (names also appear in data tables there, not only in test(...)).
+FORGE_STRING = re.compile(r"\"((?:\\.|[^\"\\\n])*)\"")
 
 
 def unescape(text):
@@ -51,7 +54,7 @@ def load_record():
 def forge_names(path, cache):
     if path not in cache:
         with open(os.path.join(ROOT, path), encoding="utf-8") as f:
-            cache[path] = {unescape(n) for n in FORGE_NAME.findall(f.read())}
+            cache[path] = {unescape(n) for n in FORGE_STRING.findall(f.read())}
     return cache[path]
 
 
@@ -87,11 +90,23 @@ def git(clone, *args):
     return subprocess.run(["git", "-C", clone, *args], check=True, capture_output=True).stdout
 
 
-def upstream_subtests(text, substitutions):
+def upstream_subtests(text, entry):
+    substitutions = entry.get("substitutions", {})
+    expand = entry.get("expand", {})
+    patterns = [re.compile(p, re.S) for p in entry.get("name_patterns", [])] or [UPSTREAM_NAME]
+    found = []
+
+    for pattern in patterns:
+        found.extend(pattern.findall(text))
+
     names = []
 
-    for quote, raw in UPSTREAM_NAME.findall(text):
+    for quote, raw in found:
         name = unescape(raw)
+
+        if name in expand:
+            names.extend(expand[name])
+            continue
 
         if quote == "`":
             for key, value in substitutions.items():
@@ -125,7 +140,7 @@ def compare(record, clone, commit):
 
         text = data.decode("utf-8")
 
-        for name in upstream_subtests(text, entry.get("substitutions", {})):
+        for name in upstream_subtests(text, entry):
             if name not in entry["subtests"]:
                 problems.append(f"{wpt_path}: subtest not recorded: '{name}'")
 
